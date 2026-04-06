@@ -213,6 +213,12 @@ class G1Deploy {
     std::shared_ptr<const MotionSequence> current_motion_ = nullptr;
     int current_frame_ = 0;
     int saved_frame_for_observation_window_ = 0; // for observation window
+
+    // For streaming mode: reduce observation window to lower latency.
+    // step5 requires 46 frames, but we clamp it to 10 for ~200ms latency instead of ~920ms.
+    // The extra frames will just repeat the last available frame (safe for streaming).
+    static constexpr int max_streaming_observation_window = 10;  // matches step1
+
     std::mutex current_motion_mutex_; // for current motion and frame synchronization
     
     // =========================================================================
@@ -429,7 +435,7 @@ class G1Deploy {
         std::cerr << "✗ Error: Motion has no bodies - cannot gather root z position" << std::endl;
         return false;
       }
-      saved_frame_for_observation_window_ = std::max(saved_frame_for_observation_window_, (num_frames - 1) * step_size + 1);
+      saved_frame_for_observation_window_ = std::min(std::max(saved_frame_for_observation_window_, (num_frames - 1) * step_size + 1), max_streaming_observation_window);
       // Gather root z position from multiple future frames with step intervals
       for (int frame_idx = 0; frame_idx < num_frames; frame_idx++) {
         // Calculate target frame: if playing, advance through frames; if not playing, hold current frame
@@ -459,7 +465,7 @@ class G1Deploy {
         std::cerr << "✗ Error: Motion has no bodies - cannot gather body positions" << std::endl;
         return false;
       }
-      saved_frame_for_observation_window_ = std::max(saved_frame_for_observation_window_, (num_frames - 1) * step_size + 1);
+      saved_frame_for_observation_window_ = std::min(std::max(saved_frame_for_observation_window_, (num_frames - 1) * step_size + 1), max_streaming_observation_window);
       // Gather positions from multiple future frames with step intervals
       for (int frame_idx = 0; frame_idx < num_frames; frame_idx++) {
         // Calculate target frame: if playing, advance through frames; if not playing, hold current frame
@@ -639,6 +645,23 @@ class G1Deploy {
         auto first_ref_rot = quat_mul_d(apply_delta_heading, first_body_quat[0]);
         ref_first_heading = calc_heading_quat_d(first_ref_rot);
       }
+      if (reinitialize_heading_) {
+        heading_state_buffer_.SetData(HeadingState(base_quat, 0.0));
+        reinitialize_heading_ = false;
+        const auto motion_body_quat_init = current_motion_->BodyQuaternions(current_frame_);
+        init_ref_data_root_rot_array_ = motion_body_quat_init[0];
+        std::cout << "Reset heading state to " << base_quat[0] << ", " << base_quat[1] << ", " << base_quat[2] << ", " << base_quat[3] << std::endl;
+        std::cout << "Reset delta heading to 0" << std::endl;
+        std::cout << "Reset init reference data root rotation to current frame: " << init_ref_data_root_rot_array_[0] << ", " << init_ref_data_root_rot_array_[1] << ", " << init_ref_data_root_rot_array_[2] << ", " << init_ref_data_root_rot_array_[3] << std::endl;
+        std::cout << "Reference motion name: " << current_motion_->name << std::endl;
+      } else if (input_interface_->ContinuousHeadingUpdate()) {
+          heading_state_buffer_.SetData(HeadingState(base_quat, 0.0));
+          const auto motion_body_quat_cf =
+      current_motion_->BodyQuaternions(current_frame_);
+          init_ref_data_root_rot_array_ = motion_body_quat_cf[0];
+      }
+
+      
 
       // Gather orientations from multiple future frames with step intervals
       for (int frame_idx = 0; frame_idx < num_frames; frame_idx++) {
@@ -752,7 +775,7 @@ class G1Deploy {
           return false;
         }
       }
-      saved_frame_for_observation_window_ = std::max(saved_frame_for_observation_window_, (num_frames - 1) * step_size + 1);
+      saved_frame_for_observation_window_ = std::min(std::max(saved_frame_for_observation_window_, (num_frames - 1) * step_size + 1), max_streaming_observation_window);
       // Gather positions from multiple future frames with step intervals
       for (int frame_idx = 0; frame_idx < num_frames; frame_idx++) {
         // Calculate target frame: if playing, advance through frames; if not playing, hold current frame
@@ -831,7 +854,7 @@ class G1Deploy {
           return false;
         }
       }
-      saved_frame_for_observation_window_ = std::max(saved_frame_for_observation_window_, (num_frames - 1) * step_size + 1);
+      saved_frame_for_observation_window_ = std::min(std::max(saved_frame_for_observation_window_, (num_frames - 1) * step_size + 1), max_streaming_observation_window);
       // Gather velocities from multiple future frames with step intervals
       for (int frame_idx = 0; frame_idx < num_frames; frame_idx++) {
         // Calculate frame index (current frame + frame_idx * step_size for future frames)
@@ -922,7 +945,7 @@ class G1Deploy {
           return false;
         }
       }
-      saved_frame_for_observation_window_ = std::max(saved_frame_for_observation_window_, (num_frames - 1) * step_size + 1);
+      saved_frame_for_observation_window_ = std::min(std::max(saved_frame_for_observation_window_, (num_frames - 1) * step_size + 1), max_streaming_observation_window);
       
       // Gather SMPL joints from multiple future frames with step intervals
       for (int frame_idx = 0; frame_idx < num_frames; frame_idx++) {
@@ -982,7 +1005,7 @@ class G1Deploy {
           return false;
         }
       }
-      saved_frame_for_observation_window_ = std::max(saved_frame_for_observation_window_, (num_frames - 1) * step_size + 1);
+      saved_frame_for_observation_window_ = std::min(std::max(saved_frame_for_observation_window_, (num_frames - 1) * step_size + 1), max_streaming_observation_window);
       
       // Gather SMPL poses from multiple future frames with step intervals
       for (int frame_idx = 0; frame_idx < num_frames; frame_idx++) {
@@ -3962,13 +3985,25 @@ class G1Deploy {
           
           auto hand_joint_end_time = std::chrono::steady_clock::now();
 
+          // Read current motor command for publishing (action produced this tick)
+          std::array<double, 29> body_q_action = {};
+          {
+            const auto mc = motor_command_buffer_.GetDataWithTime().data;
+            if (mc) {
+              for (int i = 0; i < 29; i++) {
+                body_q_action[i] = static_cast<double>(mc->q_target.at(i));
+              }
+            }
+          }
+
           // Publish output data (state logger data, robot config, command/motion data) to all output interfaces
           for (auto& output_interface : output_interfaces_) {
             if (output_interface) {
               output_interface->publish(
                 vr_3point_position_buffer_, vr_3point_orientation_buffer_, vr_3point_compliance_buffer_,
                 left_hand_joint_buffer_, right_hand_joint_buffer_, init_ref_data_root_rot_array_,
-                heading_state_buffer_, current_motion_copy, current_frame_copy
+                heading_state_buffer_, current_motion_copy, current_frame_copy,
+                body_q_action
               );
             }
           }
