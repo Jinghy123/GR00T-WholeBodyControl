@@ -26,6 +26,7 @@ from collections import defaultdict, deque
 from enum import Enum, IntEnum
 import os
 import subprocess
+import sys
 import threading
 import time
 
@@ -83,13 +84,23 @@ except ImportError:
     print("Warning: recording_manager not available. Data collection disabled.")
     RecordingManagerThread = None
 
+# Hand control via Manus glove + dex-retargeting (vendored in PSI-Teleop-PICO).
+# The YAMLs referenced by HandType use paths relative to the teleop directory,
+# so we also chdir there when building the retargeting object.
+_MANUS_TELEOP_DIR = "/home/xiawei/hongyi/Unitree_Robotics/PSI-Teleop-PICO/teleop"
+if _MANUS_TELEOP_DIR not in sys.path:
+    sys.path.insert(0, _MANUS_TELEOP_DIR)
 try:
-    from gear_sonic.utils.teleop.solver.hand.g1_gripper_ik_solver import (
-        G1GripperInverseKinematicsSolver,
-    )
-except ImportError:
-    print("Warning: G1GripperInverseKinematicsSolver not available.")
-    G1GripperInverseKinematicsSolver = None
+    from robot_control.hand_retargeting import HandRetargeting, HandType
+except ImportError as _retarget_err:
+    print(f"Warning: HandRetargeting not available: {_retarget_err}")
+    HandRetargeting = None
+    HandType = None
+
+# Frame conversion from Manus/Vuer frame to unitree-hand frame (mirrors vr_pico.py).
+M_to_unitree_hand = np.array(
+    [[0, 1, 0, 0], [0, 0, -1, 0], [1, 0, 0, 0], [0, 0, 0, 1]], dtype=np.float64
+)
 
 try:
     from gear_sonic.utils.teleop.vis.vr3pt_pose_visualizer import VR3PtPoseVisualizer
@@ -495,28 +506,162 @@ def process_smpl_joints(body_pose, global_orient, transl):
     }
 
 
-def generate_finger_data(hand: str, trigger: float, grip: float) -> np.ndarray:
+class ManusSkeletonReceiver:
+    """Pulls Manus skeleton from tcp://localhost:8000 (inlined from vr_pico.py).
+    get_latest() returns (left_xyz, right_xyz), each (25, 3) or (None, None) until both received."""
+
+    def __init__(
+        self,
+        address: str = "tcp://localhost:8000",
+        left_glove_sn: str = "265bba63",
+        right_glove_sn: str = "81d630d4",
+    ):
+        self.left_glove_sn = left_glove_sn
+        self.right_glove_sn = right_glove_sn
+
+        ctx = zmq.Context.instance()
+        self.socket = ctx.socket(zmq.PULL)
+        self.socket.setsockopt(zmq.CONFLATE, 1)
+        self.socket.connect(address)
+
+        self._lock = threading.Lock()
+        self._left_xyz = None   # (25, 3)
+        self._right_xyz = None  # (25, 3)
+        self._running = True
+
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    @staticmethod
+    def _parse_skeleton_176(data_176) -> np.ndarray:
+        floats = list(map(float, data_176[1:]))
+        arr = np.asarray(floats, dtype=np.float32).reshape(25, 7)
+        return arr[:, :3].copy()
+
+    def _loop(self) -> None:
+        while self._running:
+            try:
+                msg = self.socket.recv()
+            except zmq.error.ZMQError:
+                break
+            text = msg.decode("utf-8")
+            parts = text.split(",")
+            with self._lock:
+                if len(parts) == 176:
+                    sn = parts[0]
+                    xyz = self._parse_skeleton_176(parts)
+                    if sn == self.left_glove_sn:
+                        self._left_xyz = xyz
+                    elif sn == self.right_glove_sn:
+                        self._right_xyz = xyz
+                elif len(parts) == 352:
+                    left_parts = parts[0:176]
+                    right_parts = parts[176:352]
+                    left_sn = left_parts[0]
+                    right_sn = right_parts[0]
+                    left_xyz = self._parse_skeleton_176(left_parts)
+                    right_xyz = self._parse_skeleton_176(right_parts)
+                    if left_sn == self.left_glove_sn:
+                        self._left_xyz = left_xyz
+                    elif left_sn == self.right_glove_sn:
+                        self._right_xyz = left_xyz
+                    if right_sn == self.left_glove_sn:
+                        self._left_xyz = right_xyz
+                    elif right_sn == self.right_glove_sn:
+                        self._right_xyz = right_xyz
+
+    def get_latest(self):
+        with self._lock:
+            if self._left_xyz is None or self._right_xyz is None:
+                return None, None
+            return self._left_xyz.copy(), self._right_xyz.copy()
+
+    def stop(self) -> None:
+        self._running = False
+        try:
+            self.socket.close(0)
+        except Exception:
+            pass
+
+
+def init_manus_receiver(
+    address: str = "tcp://localhost:8000",
+    left_glove_sn: str = "265bba63",
+    right_glove_sn: str = "81d630d4",
+):
+    """Start the Manus ZMQ receiver (inlined; no external deps beyond zmq/numpy)."""
+    receiver = ManusSkeletonReceiver(
+        address=address,
+        left_glove_sn=left_glove_sn,
+        right_glove_sn=right_glove_sn,
+    )
+    print(f"[Manus] Receiver connected at {address}")
+    return receiver
+
+
+def init_hand_retargeting():
+    """Build the HandRetargeting (Unitree Dex3). YAMLs in HandType use relative paths,
+    so we chdir to the vendored teleop dir while constructing."""
+    if HandRetargeting is None or HandType is None:
+        return None
+    prev_cwd = os.getcwd()
+    try:
+        os.chdir(_MANUS_TELEOP_DIR)
+        hr = HandRetargeting(HandType.UNITREE_DEX3)
+    finally:
+        os.chdir(prev_cwd)
+    print("[Manus] HandRetargeting (UNITREE_DEX3) initialized")
+    return hr
+
+
+def compute_hand_joints_from_manus(
+    hand_retargeting,
+    manus_receiver,
+) -> tuple[np.ndarray, np.ndarray]:
     """
-    Generate finger position data from Pico controller button states.
-
-    Args:
-        hand: "left" or "right"
-        trigger: Trigger button value (0-1)
-        grip: Grip button value (0-1)
-
-    Returns:
-        Array of shape [25, 4, 4] representing fingertip positions
+    Compute left/right 7-DOF Dex3 hand joints from Manus glove skeletons.
+    Mirrors vr_pico.VuerPreprocessor.process: frame-convert Manus xyz into
+    unitree-hand frame, pick thumb/index/middle tips, feed retargeter, then
+    reorder by right_dex_retargeting_to_hardware (matches vr_pico behavior).
+    Returns two arrays shaped (1, 7). Zero-arrays when data is unavailable.
     """
-    fingertips = np.zeros([25, 4, 4])
+    zero = np.zeros((1, 7), dtype=np.float32)
+    if hand_retargeting is None or manus_receiver is None:
+        return zero, zero.copy()
 
-    thumb = 0
-    middle = 10
-    # Control thumb based on shoulder button state (index 4 is thumb tip)
-    fingertips[4 + thumb, 0, 3] = 1.0  # open thumb
-    if trigger > 0.5:
-        fingertips[4 + middle, 0, 3] = 1.0  # close middle
+    manus_left, manus_right = manus_receiver.get_latest()
+    if manus_left is None or manus_right is None:
+        return zero, zero.copy()
 
-    return fingertips
+    left_homog = np.concatenate(
+        [manus_left.copy().T, np.ones((1, manus_left.shape[0]))], axis=0
+    )
+    right_homog = np.concatenate(
+        [manus_right.copy().T, np.ones((1, manus_right.shape[0]))], axis=0
+    )
+    unitree_left_hand = (M_to_unitree_hand @ left_homog)[0:3, :].T
+    unitree_right_hand = (M_to_unitree_hand @ right_homog)[0:3, :].T
+
+    tip_idx = [24, 5, 10]  # thumb, index, middle (Manus 25-node layout)
+    ref_left = unitree_left_hand[tip_idx].copy()
+    ref_right = unitree_right_hand[tip_idx].copy()
+
+    # Per-tip scaling from vr_pico.py
+    ref_left[0] *= 1.15
+    ref_left[1] *= 1.05
+    ref_left[2] *= 0.95
+    ref_right[0] *= 1.15
+    ref_right[1] *= 1.05
+    ref_right[2] *= 0.95
+
+    # NOTE: vr_pico uses right_dex_retargeting_to_hardware for both hands; mirror that.
+    reorder = hand_retargeting.right_dex_retargeting_to_hardware
+    left_q = hand_retargeting.left_retargeting.retarget(ref_left)[reorder]
+    right_q = hand_retargeting.right_retargeting.retarget(ref_right)[reorder]
+    return (
+        left_q.reshape(1, -1).astype(np.float32),
+        right_q.reshape(1, -1).astype(np.float32),
+    )
 
 
 # Joystick deadzone threshold
@@ -600,17 +745,6 @@ def compute_from_body_poses(parent_indices: list, device, body_poses_np: np.ndar
 #     body_poses = xrt.get_body_joints_pose()
 #     body_poses_np = np.array(body_poses)
 #     return compute_from_body_poses(parent_indices, device, body_poses_np)
-
-
-def init_hand_ik_solvers():
-    """Initialize hand IK solvers if available."""
-    if G1GripperInverseKinematicsSolver is not None:
-        left_solver = G1GripperInverseKinematicsSolver(side="left")
-        right_solver = G1GripperInverseKinematicsSolver(side="right")
-        print("Hand IK solvers initialized")
-        return left_solver, right_solver
-    print("Warning: Hand IK solvers not available")
-    return None, None
 
 
 def get_controller_inputs():
@@ -697,21 +831,6 @@ def get_abxy_buttons():
         return a_pressed, b_pressed, x_pressed, y_pressed
     except Exception:
         return False, False, False, False
-
-
-def compute_hand_joints_from_inputs(
-    left_solver, right_solver, left_trigger, left_grip, right_trigger, right_grip
-) -> tuple[np.ndarray, np.ndarray]:
-    """Compute left/right hand joints using IK solvers, or zeros if unavailable."""
-    if left_solver is not None and right_solver is not None:
-        left_finger_data = generate_finger_data("left", left_trigger, left_grip)
-        right_finger_data = generate_finger_data("right", right_trigger, right_grip)
-        left_hand_joints = left_solver({"position": left_finger_data})
-        right_hand_joints = right_solver({"position": right_finger_data})
-    else:
-        left_hand_joints = np.zeros((1, 7), dtype=np.float32)
-        right_hand_joints = np.zeros((1, 7), dtype=np.float32)
-    return left_hand_joints, right_hand_joints
 
 
 def _quat_lerp_normalized(q0: np.ndarray, q1: np.ndarray, alpha: float) -> np.ndarray:
@@ -847,6 +966,10 @@ def _pose_stream_common(
         log_prefix=log_prefix,
     )
 
+    # Hand control: Manus glove -> dex-retargeting -> 7-DOF Dex3 joints
+    manus_receiver = init_manus_receiver()
+    hand_retargeting = init_hand_retargeting()
+
     streamer = PoseStreamer(
         socket=socket,
         reader=reader,
@@ -857,6 +980,8 @@ def _pose_stream_common(
         record_dir=record_dir,
         record_format=record_format,
         log_prefix=log_prefix,
+        manus_receiver=manus_receiver,
+        hand_retargeting=hand_retargeting,
     )
 
     if stop_event is None:
@@ -871,6 +996,8 @@ def _pose_stream_common(
         # Cleanup resources
         reader.stop()
         three_point.close()
+        if manus_receiver is not None:
+            manus_receiver.stop()
 
 
 class ThreePointPose:
@@ -1183,6 +1310,8 @@ class PoseStreamer:
         record_dir: str,
         record_format: str,
         log_prefix: str = "PoseLoop",
+        manus_receiver=None,
+        hand_retargeting=None,
     ):
         self.socket = socket
         self.reader = reader
@@ -1194,6 +1323,8 @@ class PoseStreamer:
         # Injected dependencies
         self.reader = reader
         self.three_point = three_point
+        self.manus_receiver = manus_receiver
+        self.hand_retargeting = hand_retargeting
 
         self.device = (
             torch.device("cuda") if use_cuda and torch.cuda.is_available() else torch.device("cpu")
@@ -1202,8 +1333,6 @@ class PoseStreamer:
         if record_dir:
             os.makedirs(record_dir, exist_ok=True)
         self.record_idx = 0
-
-        self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
         self.parent_indices = [
             -1,
             0,
@@ -1300,13 +1429,9 @@ class PoseStreamer:
         self.toggle_data_collection_last = toggle_data_collection_tmp
         self.toggle_data_abort_last = toggle_data_abort_tmp
 
-        left_hand_joints, right_hand_joints = compute_hand_joints_from_inputs(
-            self.left_hand_ik_solver,
-            self.right_hand_ik_solver,
-            left_trigger,
-            left_grip,
-            right_trigger,
-            right_grip,
+        left_hand_joints, right_hand_joints = compute_hand_joints_from_manus(
+            self.hand_retargeting,
+            self.manus_receiver,
         )
         smpl_pose_np = (
             latest_data["smpl_pose"].detach().cpu().numpy()[:, :63].reshape(-1, 21, 3)[0]
@@ -1632,6 +1757,8 @@ class PlannerStreamer:
         poll_hz: int = 20,
         zmq_feedback_host: str = "localhost",
         zmq_feedback_port: int = 5557,
+        manus_receiver=None,
+        hand_retargeting=None,
     ):
         self.socket = socket
         self.reader = reader
@@ -1650,8 +1777,9 @@ class PlannerStreamer:
         self.last_send = time.time()
         self.last_xrt_timestamp = None
 
-        # Hand IK solvers for trigger-controlled hand open/close in VR 3PT mode
-        self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
+        # Manus-driven hand retargeting (replaces trigger-based open/close)
+        self.manus_receiver = manus_receiver
+        self.hand_retargeting = hand_retargeting
 
     def reset_yaw(self):
         """Called when entering planner mode. Resets state for fresh start."""
@@ -1758,22 +1886,10 @@ class PlannerStreamer:
                     vr_3pt_position = (vr_3pt_pose[:, :3].flatten()).tolist()
                     vr_3pt_orientation = vr_3pt_pose[:, 3:].flatten().tolist()
 
-                # Compute hand joints from trigger/grip inputs so operator can
-                # control hand open/close while in VR 3PT mode
-                (
-                    left_menu_button,
-                    left_trigger,
-                    right_trigger,
-                    left_grip,
-                    right_grip,
-                ) = get_controller_inputs()
-                lh_joints, rh_joints = compute_hand_joints_from_inputs(
-                    self.left_hand_ik_solver,
-                    self.right_hand_ik_solver,
-                    left_trigger,
-                    left_grip,
-                    right_trigger,
-                    right_grip,
+                # Hand joints come from the Manus glove + dex-retargeting pipeline
+                lh_joints, rh_joints = compute_hand_joints_from_manus(
+                    self.hand_retargeting,
+                    self.manus_receiver,
                 )
                 left_hand_position = lh_joints.reshape(-1).astype(np.float32).tolist()
                 right_hand_position = rh_joints.reshape(-1).astype(np.float32).tolist()
@@ -1865,6 +1981,10 @@ def run_pico_manager(
         log_prefix="PoseLoop",
     )
 
+    # Hand control: Manus glove -> dex-retargeting -> 7-DOF Dex3 joints
+    manus_receiver = init_manus_receiver()
+    hand_retargeting = init_hand_retargeting()
+
     pose_streamer = PoseStreamer(
         socket=socket,
         reader=reader,
@@ -1875,6 +1995,8 @@ def run_pico_manager(
         record_dir=record_dir,
         record_format=record_format,
         log_prefix="PoseLoop",
+        manus_receiver=manus_receiver,
+        hand_retargeting=hand_retargeting,
     )
     planner_streamer = PlannerStreamer(
         socket=socket,
@@ -1883,6 +2005,8 @@ def run_pico_manager(
         poll_hz=20,
         zmq_feedback_host=zmq_feedback_host,
         zmq_feedback_port=zmq_feedback_port,
+        manus_receiver=manus_receiver,
+        hand_retargeting=hand_retargeting,
     )
 
     # State machine diagram:
@@ -2068,6 +2192,8 @@ def run_pico_manager(
         # Stop recording manager
         if rec_manager is not None:
             rec_manager.stop()
+        if manus_receiver is not None:
+            manus_receiver.stop()
         print("[Manager] Shutdown complete")
 
 

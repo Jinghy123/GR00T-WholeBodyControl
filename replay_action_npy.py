@@ -13,7 +13,7 @@ Usage:
 """
 
 # ── Hard-coded defaults ──────────────────────────────────────────────────────
-DEFAULT_NPY_PATH       = "/home/xiawei/data/action_new.npy"
+DEFAULT_NPY_PATH       = "/home/xiawei/data/action.npy"
 DEFAULT_TOKEN_DIM      = 64   # layout: hand_joints(14) + token(64) = 78
 DEFAULT_HAND_DIM       = 14
 DEFAULT_ZMQ_HOST       = "*"

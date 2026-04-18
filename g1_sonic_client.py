@@ -95,7 +95,7 @@ ACTION_DIM = 78
 # Image buffer
 IMAGE_BUFFER_SIZE = 100
 
-TASK_PROMPT = "pick the bottle and turn and pour into cup"
+TASK_PROMPT = "pick up the bottle and place it on the left"
 
 def fsq_quantize(continuous_value, fsq_min=FSQ_MIN, fsq_max=FSQ_MAX, fsq_step=FSQ_STEP):
     clipped = np.clip(continuous_value, fsq_min, fsq_max)
