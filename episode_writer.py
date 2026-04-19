@@ -7,6 +7,18 @@ from queue import Queue, Empty
 from threading import Thread
 
 
+# Maps color-stream keys (passed in by the recorder) to:
+#   (subdirectory under episode_dir, field name in frame_record)
+# The "rgb" → "image" mapping is preserved so existing replay*.py scripts
+# continue to work unchanged.
+_COLOR_STREAMS = {
+    "rgb":         ("color",             "image"),
+    "stereo":      ("color_stereo",      "stereo_image"),
+    "left_wrist":  ("color_left_wrist",  "left_wrist_image"),
+    "right_wrist": ("color_right_wrist", "right_wrist_image"),
+}
+
+
 class EpisodeWriter():
     def __init__(self, task_dir, date, episode_num, task, frequency=30, image_size=[640, 480]):
         """
@@ -47,8 +59,15 @@ class EpisodeWriter():
         self.episode_data = []
         self.timestamps = []
 
-        self.color_dir = os.path.join(self.episode_dir, "color")
-        os.makedirs(self.color_dir, exist_ok=True)
+        # Create one subdir per color stream (ego rgb, ego stereo, wrists).
+        self.color_dirs = {
+            key: os.path.join(self.episode_dir, subdir)
+            for key, (subdir, _) in _COLOR_STREAMS.items()
+        }
+        for d in self.color_dirs.values():
+            os.makedirs(d, exist_ok=True)
+        # Kept for backward compat with any code reading self.color_dir.
+        self.color_dir = self.color_dirs["rgb"]
 
         self.json_path = os.path.join(self.episode_dir, 'data.json')
 
@@ -93,13 +112,16 @@ class EpisodeWriter():
 
         if colors:
             self.timestamps.append(item_data['timestamp'])
-            # Use the first (and typically only) color stream
+            fname = f"frame_{self.frame_id:06d}.jpg"
             for color_key, color in colors.items():
-                fname = f"frame_{self.frame_id:06d}.jpg"
-                fpath = os.path.join(self.color_dir, fname)
+                stream = _COLOR_STREAMS.get(color_key)
+                if stream is None:
+                    print(f"==> Unknown color stream '{color_key}', skipping.")
+                    continue
+                subdir, record_key = stream
+                fpath = os.path.join(self.color_dirs[color_key], fname)
                 cv2.imwrite(fpath, color)
-                frame_record['image'] = f"color/{fname}"
-                break  # only one camera
+                frame_record[record_key] = f"{subdir}/{fname}"
 
         if item_data.get('states') is not None:
             states = item_data['states']

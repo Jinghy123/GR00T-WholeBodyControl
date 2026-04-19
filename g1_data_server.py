@@ -76,7 +76,12 @@ def _quat_mul(q1, q2):
 # ──────────────────────────────────────────────────────────────────────────────
 
 class RealSenseClient:
-    """Fetches JPEG-encoded RGB frames from realsense_server.py on the robot."""
+    """Fetches JPEG-encoded frames from realsense_server.py on the robot.
+
+    Server reply is 4-part multipart:
+      [ego_rgb_jpeg, ego_stereo_jpeg, left_wrist_jpeg, right_wrist_jpeg]
+    Any slot may be b"" when that camera is unavailable.
+    """
 
     def __init__(self, host=REALSENSE_HOST, port=REALSENSE_PORT):
         self._host = host
@@ -93,25 +98,38 @@ class RealSenseClient:
         self._sock.setsockopt(zmq.LINGER, 0)
         self._sock.connect(f"tcp://{self._host}:{self._port}")
 
-    def get_frame(self):
+    @staticmethod
+    def _decode(jpeg_bytes):
+        if not jpeg_bytes:
+            return None
+        arr = np.frombuffer(jpeg_bytes, dtype=np.uint8)
+        return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+    def get_frames(self):
         """
-        Request one frame. Returns BGR uint8 ndarray (H, W, 3) or None.
-        realsense_server sends [rgb_jpeg, ir_jpeg, fake_depth] — we only use rgb.
+        Request one frame. Returns (ego_rgb, ego_stereo, left_wrist, right_wrist)
+        — each BGR uint8 ndarray (H, W, 3) or None if unavailable.
+        On timeout / error, reconnects and returns (None, None, None, None).
         """
         try:
             self._sock.send(b"get_frame")
             parts = self._sock.recv_multipart()
-            if not parts or parts[0] == b"":
-                return None
-            arr = np.frombuffer(parts[0], dtype=np.uint8)
-            return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            # Pad to 4 parts defensively.
+            while len(parts) < 4:
+                parts.append(b"")
+            return (
+                self._decode(parts[0]),
+                self._decode(parts[1]),
+                self._decode(parts[2]),
+                self._decode(parts[3]),
+            )
         except zmq.Again:
             print("[RealSense] Frame timeout — reconnecting...")
             self._connect()
-            return None
+            return (None, None, None, None)
         except Exception as e:
             print(f"[RealSense] Error: {e}")
-            return None
+            return (None, None, None, None)
 
     def close(self):
         self._sock.close()
@@ -452,15 +470,19 @@ class DataCollector:
                         self._discard()
 
                 if self._phase == "RECORDING":
-                    # Fetch frame and state
-                    frame = self._camera.get_frame()
+                    # Fetch frames (ego_rgb, ego_stereo, left_wrist, right_wrist) and state
+                    ego, ego_stereo, lw, rw = self._camera.get_frames()
                     state, action, token = self._state.get_state_and_action()
 
-                    # Record if we have state (with or without RGB frame)
+                    # Record if we have state (with or without camera frames)
                     if state is not None:
-                        colors = {"rgb": frame} if frame is not None else None
+                        colors = {}
+                        if ego is not None:        colors["rgb"]         = ego
+                        if ego_stereo is not None: colors["stereo"]      = ego_stereo
+                        if lw is not None:         colors["left_wrist"]  = lw
+                        if rw is not None:         colors["right_wrist"] = rw
                         self._ep_writer.add_item(
-                            colors=colors,
+                            colors=colors or None,
                             states=state,
                             actions=action,
                             token=token,
@@ -468,7 +490,7 @@ class DataCollector:
                     else:
                         _rprint(f"[Collector] Warning: missing state, skipping frame.")
 
-                    # get_frame() already blocks ~33 ms, so sleep is usually near zero
+                    # get_frames() already blocks ~33 ms, so sleep is usually near zero
                     elapsed = time.perf_counter() - t0
                     sleep_t = self._dt - elapsed
                     if sleep_t > 0:
