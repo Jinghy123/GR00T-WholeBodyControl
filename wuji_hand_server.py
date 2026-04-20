@@ -61,8 +61,9 @@ except ImportError:
 # Constants
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Freshness threshold: discard tracking data older than this
-TRACKING_MAX_AGE_S = 0.5
+# Freshness threshold (seconds) for tracking data.
+# Default is disabled to avoid cross-machine clock skew issues.
+TRACKING_MAX_AGE_S: Optional[float] = None
 
 # 26D → 21D (MediaPipe) joint index mapping
 # MediaPipe: [Wrist, Thumb(4), Index(4), Middle(4), Ring(4), Pinky(4)]
@@ -196,6 +197,7 @@ class WujiHandServer:
         clamp_min: float = -1.5,
         clamp_max: float = 1.5,
         max_delta_per_step: float = 0.08,
+        tracking_max_age_s: Optional[float] = TRACKING_MAX_AGE_S,
         enable_replay_commands: bool = False,
     ):
         self.hand_side = hand_side.lower()
@@ -207,6 +209,7 @@ class WujiHandServer:
         self.clamp_min = clamp_min
         self.clamp_max = clamp_max
         self.max_delta_per_step = max_delta_per_step
+        self.tracking_max_age_s = tracking_max_age_s
 
         # Mode: "follow" | "hold" | "default"
         self._mode = "follow"
@@ -318,9 +321,10 @@ class WujiHandServer:
             msg = msgpack.unpackb(payload, raw=False)
         except Exception:
             return None
-        age = time.time() - float(msg.get("timestamp", 0.0))
-        if age > TRACKING_MAX_AGE_S:
-            return None
+        if self.tracking_max_age_s is not None:
+            age = time.time() - float(msg.get("timestamp", 0.0))
+            if age > self.tracking_max_age_s:
+                return None
         return msg.get(self.hand_side)
 
     def _recv_replay_command(self) -> Optional[np.ndarray]:
@@ -604,6 +608,13 @@ Examples (Wuji on G1, pico_manus on laptop at 192.168.1.10):
         help="Maximum joint angle change per control step (default: 0.08 rad)",
     )
     parser.add_argument(
+        "--tracking_max_age_s", type=float, default=-1.0,
+        help=(
+            "Discard tracking packets older than this (seconds). "
+            "Set < 0 to disable (default: disabled)."
+        ),
+    )
+    parser.add_argument(
         "--enable-replay-commands", action="store_true",
         help="Enable ZMQ command receiver for replay (may add slight latency)",
     )
@@ -622,6 +633,7 @@ Examples (Wuji on G1, pico_manus on laptop at 192.168.1.10):
         clamp_min=args.clamp_min,
         clamp_max=args.clamp_max,
         max_delta_per_step=args.max_delta_per_step,
+        tracking_max_age_s=None if args.tracking_max_age_s < 0 else args.tracking_max_age_s,
         enable_replay_commands=args.enable_replay_commands,
     )
     server.run()
