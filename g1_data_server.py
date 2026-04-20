@@ -50,6 +50,9 @@ WBC_HOST  = "localhost"   # Host running g1_deploy_onnx_ref (often same machine)
 WBC_PORT  = 5557          # deploy ZMQ state publisher port
 WBC_TOPIC = "g1_debug"
 
+WUJI_STATE_HOST = "localhost"  # Host running wuji_hand_server.py
+WUJI_STATE_PORT = 5560         # ZMQ PUB port for wuji measured state / action
+
 DATA_FOLDER = os.path.expanduser("~/data")
 TASK_NAME   = "demonstration"
 FPS         = 30
@@ -258,6 +261,71 @@ class WBCStateReader:
         self._ctx.term()
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Wuji hand state subscriber  (ZMQ SUB ← wuji_hand_server.py port 5560)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class WujiHandStateReader:
+    """
+    Background-thread subscriber to wuji_hand_server.py's state publisher.
+
+    Provides get_wuji_state() → {"left_action": ndarray(20,), "right_action": ndarray(20,),
+                                  "left_state":  ndarray(20,), "right_state":  ndarray(20,)}
+    Returns None if no data has been received yet.
+    """
+
+    def __init__(self, host=WUJI_STATE_HOST, port=WUJI_STATE_PORT):
+        self._ctx  = zmq.Context()
+        self._sock = self._ctx.socket(zmq.SUB)
+        self._sock.setsockopt_string(zmq.SUBSCRIBE, "wuji_state")
+        self._sock.setsockopt(zmq.RCVTIMEO, 200)
+        self._sock.setsockopt(zmq.RCVHWM, 1)
+        self._sock.connect(f"tcp://{host}:{port}")
+
+        self._lock   = threading.Lock()
+        self._latest = {
+            "left_action":  np.zeros(20, dtype=np.float32),
+            "right_action": np.zeros(20, dtype=np.float32),
+            "left_state":   np.zeros(20, dtype=np.float32),
+            "right_state":  np.zeros(20, dtype=np.float32),
+        }
+        self._has_data = False
+        self._stop     = threading.Event()
+        self._thread   = threading.Thread(target=self._recv_loop, daemon=True)
+        self._thread.start()
+        print(f"[WujiState] Subscribed to {host}:{port}")
+
+    def _recv_loop(self):
+        topic_len = len(b"wuji_state")
+        while not self._stop.is_set():
+            try:
+                raw     = self._sock.recv()
+                payload = raw[topic_len:]
+                msg     = msgpack.unpackb(payload, raw=False)
+                side    = str(msg.get("hand_side", "left")).lower()
+                action  = np.array(msg["action"], dtype=np.float32)
+                state   = np.array(msg["state"],  dtype=np.float32)
+                with self._lock:
+                    self._latest[f"{side}_action"] = action
+                    self._latest[f"{side}_state"]  = state
+                    self._has_data = True
+            except zmq.Again:
+                pass
+            except Exception as e:
+                print(f"[WujiState] Recv error: {e}")
+
+    def get_wuji_state(self):
+        """Returns dict with left/right action & state arrays (20-D each), or None."""
+        with self._lock:
+            if not self._has_data:
+                return None
+            return {k: v.copy() for k, v in self._latest.items()}
+
+    def close(self):
+        self._stop.set()
+        self._sock.close()
+        self._ctx.term()
+
+# ──────────────────────────────────────────────────────────────────────────────
 # TCP CommandServer  (localhost:9999, accepts JSON from RecordingManagerThread)
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -358,13 +426,17 @@ class DataCollector:
         data_folder: str = DATA_FOLDER,
         task_name: str   = TASK_NAME,
         frequency: int   = FPS,
+        hand_type: str   = "dex3",
+        wuji_reader: "WujiHandStateReader | None" = None,
     ):
-        self._camera   = camera
-        self._state    = state_reader
-        self._folder   = data_folder
-        self._task     = task_name
-        self._freq     = frequency
-        self._dt       = 1.0 / frequency
+        self._camera      = camera
+        self._state       = state_reader
+        self._folder      = data_folder
+        self._task        = task_name
+        self._freq        = frequency
+        self._dt          = 1.0 / frequency
+        self._hand_type   = hand_type.lower()
+        self._wuji_reader = wuji_reader
 
         self._ep_writer  = None
         self._ep_dir     = None
@@ -474,13 +546,28 @@ class DataCollector:
                     ego, ego_stereo, lw, rw = self._camera.get_frames()
                     state, action, token = self._state.get_state_and_action()
 
-                    # Record if we have state (with or without camera frames)
+                    # Record if we have body state (with or without camera frames)
                     if state is not None:
                         colors = {}
                         if ego is not None:        colors["rgb"]         = ego
                         if ego_stereo is not None: colors["stereo"]      = ego_stereo
                         if lw is not None:         colors["left_wrist"]  = lw
                         if rw is not None:         colors["right_wrist"] = rw
+
+                        if self._hand_type == "wuji" and self._wuji_reader is not None:
+                            # Replace 14-D Dex3 hand_joints with 40-D Wuji hand joints
+                            wuji = self._wuji_reader.get_wuji_state()
+                            if wuji is not None:
+                                state["hand_joints"]  = np.concatenate(
+                                    [wuji["left_state"],  wuji["right_state"]]
+                                )
+                                action["hand_joints"] = np.concatenate(
+                                    [wuji["left_action"], wuji["right_action"]]
+                                )
+                            else:
+                                state["hand_joints"]  = np.zeros(40, dtype=np.float32)
+                                action["hand_joints"] = np.zeros(40, dtype=np.float32)
+
                         self._ep_writer.add_item(
                             colors=colors or None,
                             states=state,
@@ -510,12 +597,34 @@ class DataCollector:
 # ──────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import argparse
+
+    ap = argparse.ArgumentParser(description="G1 data collector")
+    ap.add_argument("--hand-type", type=str, default="dex3", choices=["dex3", "wuji"],
+                    help="Hand type: 'dex3' (default) or 'wuji'")
+    ap.add_argument("--wuji-state-host", type=str, default=WUJI_STATE_HOST,
+                    help=f"Host running wuji_hand_server.py (default: {WUJI_STATE_HOST}; set to G1 IP when Wuji is on robot)")
+    ap.add_argument("--wuji-state-port", type=int, default=WUJI_STATE_PORT,
+                    help=f"ZMQ SUB port for wuji state (default: {WUJI_STATE_PORT})")
+    args = ap.parse_args()
+
     camera       = RealSenseClient()
     state_reader = WBCStateReader()
-    collector    = DataCollector(camera, state_reader)
+    wuji_reader  = None
+    if args.hand_type == "wuji":
+        wuji_reader = WujiHandStateReader(host=args.wuji_state_host, port=args.wuji_state_port)
+
+    collector = DataCollector(
+        camera,
+        state_reader,
+        hand_type   = args.hand_type,
+        wuji_reader = wuji_reader,
+    )
 
     try:
         collector.run()
     finally:
         camera.close()
         state_reader.close()
+        if wuji_reader is not None:
+            wuji_reader.close()

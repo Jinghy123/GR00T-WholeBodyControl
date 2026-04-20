@@ -162,7 +162,6 @@ class EpisodeWriter():
 
     def _save_episode(self):
         """Save episode data to data.json as a list of timestep dicts."""
-        # Save as list of dicts directly
         with open(self.json_path, 'w') as f:
             json.dump(self.episode_data, f, indent=2)
 

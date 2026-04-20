@@ -614,6 +614,57 @@ def init_hand_retargeting():
     return hr
 
 
+# ── Manus → 26-joint tracking dict (for Wuji retargeting) ──────────────────
+
+def _make_tracking_joint(pos: np.ndarray) -> list:
+    """Return [[x,y,z], [qw,qx,qy,qz]] with identity quaternion."""
+    p = np.asarray(pos, dtype=np.float32).reshape(3)
+    return [p.tolist(), [1.0, 0.0, 0.0, 0.0]]
+
+
+def _manus25_to_tracking26(xyz25: np.ndarray, side: str) -> dict:
+    """Convert Manus 25-node XYZ skeleton to wuji-retargeting 26D dict.
+
+    Node index mapping (ManusSkeletonReceiver layout):
+      0        = Wrist/Root
+      1–5      = Index  (Metacarpal, Proximal, Intermediate, Distal, Tip)
+      6–10     = Middle (Metacarpal, Proximal, Intermediate, Distal, Tip)
+      11–15    = Little/Pinky
+      16–20    = Ring
+      21–24    = Thumb (Metacarpal, Proximal, Distal, Tip)
+    """
+    pfx = "Left" if side.lower() == "left" else "Right"
+    pts = xyz25  # (25, 3)
+    out = {}
+    out[f"{pfx}HandWrist"]              = _make_tracking_joint(pts[0])
+    out[f"{pfx}HandPalm"]               = _make_tracking_joint(pts[0])
+    out[f"{pfx}HandThumbMetacarpal"]    = _make_tracking_joint(pts[21])
+    out[f"{pfx}HandThumbProximal"]      = _make_tracking_joint(pts[22])
+    out[f"{pfx}HandThumbDistal"]        = _make_tracking_joint(pts[23])
+    out[f"{pfx}HandThumbTip"]           = _make_tracking_joint(pts[24])
+    out[f"{pfx}HandIndexMetacarpal"]    = _make_tracking_joint(pts[1])
+    out[f"{pfx}HandIndexProximal"]      = _make_tracking_joint(pts[2])
+    out[f"{pfx}HandIndexIntermediate"]  = _make_tracking_joint(pts[3])
+    out[f"{pfx}HandIndexDistal"]        = _make_tracking_joint(pts[4])
+    out[f"{pfx}HandIndexTip"]           = _make_tracking_joint(pts[5])
+    out[f"{pfx}HandMiddleMetacarpal"]   = _make_tracking_joint(pts[6])
+    out[f"{pfx}HandMiddleProximal"]     = _make_tracking_joint(pts[7])
+    out[f"{pfx}HandMiddleIntermediate"] = _make_tracking_joint(pts[8])
+    out[f"{pfx}HandMiddleDistal"]       = _make_tracking_joint(pts[9])
+    out[f"{pfx}HandMiddleTip"]          = _make_tracking_joint(pts[10])
+    out[f"{pfx}HandRingMetacarpal"]     = _make_tracking_joint(pts[16])
+    out[f"{pfx}HandRingProximal"]       = _make_tracking_joint(pts[17])
+    out[f"{pfx}HandRingIntermediate"]   = _make_tracking_joint(pts[18])
+    out[f"{pfx}HandRingDistal"]         = _make_tracking_joint(pts[19])
+    out[f"{pfx}HandRingTip"]            = _make_tracking_joint(pts[20])
+    out[f"{pfx}HandLittleMetacarpal"]   = _make_tracking_joint(pts[11])
+    out[f"{pfx}HandLittleProximal"]     = _make_tracking_joint(pts[12])
+    out[f"{pfx}HandLittleIntermediate"] = _make_tracking_joint(pts[13])
+    out[f"{pfx}HandLittleDistal"]       = _make_tracking_joint(pts[14])
+    out[f"{pfx}HandLittleTip"]          = _make_tracking_joint(pts[15])
+    return out
+
+
 def compute_hand_joints_from_manus(
     hand_retargeting,
     manus_receiver,
@@ -1312,6 +1363,7 @@ class PoseStreamer:
         log_prefix: str = "PoseLoop",
         manus_receiver=None,
         hand_retargeting=None,
+        wuji_hand_pub=None,
     ):
         self.socket = socket
         self.reader = reader
@@ -1325,6 +1377,7 @@ class PoseStreamer:
         self.three_point = three_point
         self.manus_receiver = manus_receiver
         self.hand_retargeting = hand_retargeting
+        self.wuji_hand_pub = wuji_hand_pub  # ZMQ PUB socket for wuji 26D tracking
 
         self.device = (
             torch.device("cuda") if use_cuda and torch.cuda.is_available() else torch.device("cpu")
@@ -1433,6 +1486,18 @@ class PoseStreamer:
             self.hand_retargeting,
             self.manus_receiver,
         )
+
+        # In wuji mode: publish raw 26D hand tracking dict for wuji_hand_server.py
+        if self.wuji_hand_pub is not None and self.manus_receiver is not None:
+            manus_left, manus_right = self.manus_receiver.get_latest()
+            if manus_left is not None and manus_right is not None:
+                tracking_msg = msgpack.packb({
+                    "left": _manus25_to_tracking26(manus_left, "left"),
+                    "right": _manus25_to_tracking26(manus_right, "right"),
+                    "timestamp": time.time(),
+                }, use_bin_type=True)
+                self.wuji_hand_pub.send(b"wuji_hand" + tracking_msg)
+
         smpl_pose_np = (
             latest_data["smpl_pose"].detach().cpu().numpy()[:, :63].reshape(-1, 21, 3)[0]
         ).astype(np.float32)
@@ -1937,6 +2002,8 @@ def run_pico_manager(
     with_g1_robot: bool = True,
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
+    hand_type: str = "manus_dex3",
+    wuji_hand_port: int = 5559,
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
@@ -1981,9 +2048,18 @@ def run_pico_manager(
         log_prefix="PoseLoop",
     )
 
-    # Hand control: Manus glove -> dex-retargeting -> 7-DOF Dex3 joints
+    # Hand control: Manus glove -> retargeting -> hand joints
     manus_receiver = init_manus_receiver()
-    hand_retargeting = init_hand_retargeting()
+    # Dex3 retargeting only needed for manus_dex3 mode
+    hand_retargeting = init_hand_retargeting() if hand_type == "manus_dex3" else None
+
+    # Wuji mode: create a separate PUB socket to stream raw 26D hand tracking
+    # to wuji_hand_server.py (which runs wuji-retargeting + wujihandpy independently)
+    wuji_hand_pub = None
+    if hand_type == "wuji":
+        wuji_hand_pub = context.socket(zmq.PUB)
+        wuji_hand_pub.bind(f"tcp://*:{wuji_hand_port}")
+        print(f"[Manager] Wuji hand tracking PUB bound to port {wuji_hand_port}")
 
     pose_streamer = PoseStreamer(
         socket=socket,
@@ -1997,6 +2073,7 @@ def run_pico_manager(
         log_prefix="PoseLoop",
         manus_receiver=manus_receiver,
         hand_retargeting=hand_retargeting,
+        wuji_hand_pub=wuji_hand_pub,
     )
     planner_streamer = PlannerStreamer(
         socket=socket,
@@ -2188,6 +2265,8 @@ def run_pico_manager(
         reader.stop()
         three_point.close()
         socket.close()
+        if wuji_hand_pub is not None:
+            wuji_hand_pub.close()
         context.term()
         # Stop recording manager
         if rec_manager is not None:
@@ -2281,6 +2360,19 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable SMPL body joint visualization (24 joint spheres) in the VR3pt viewer",
     )
+    parser.add_argument(
+        "--hand_type",
+        type=str,
+        default="manus_dex3",
+        choices=["manus_dex3", "wuji", "none"],
+        help="Hand type: 'manus_dex3' (default Dex3 retargeting), 'wuji' (publish 26D for wuji_hand_server.py), 'none' (no hand control)",
+    )
+    parser.add_argument(
+        "--wuji_hand_port",
+        type=int,
+        default=5559,
+        help="ZMQ PUB port for wuji 26D hand tracking (used when --hand_type wuji, default: 5559)",
+    )
     args = parser.parse_args()
 
     # Standalone VR3Pt test modes (exit after finishing)
@@ -2321,6 +2413,8 @@ if __name__ == "__main__":
             with_g1_robot=with_g1_robot,
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
+            hand_type=args.hand_type,
+            wuji_hand_port=args.wuji_hand_port,
         )
     else:
         # Run legacy single-thread pose streaming
