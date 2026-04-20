@@ -127,16 +127,19 @@ python gear_sonic/scripts/pico_manus_thread_server.py --manager --hand_type wuji
 
 **Terminal 4 — 左手 Wuji 控制（laptop）**
 ```bash
+conda activate humdex
 bash wuji_hand_real.sh left
 ```
 
 **Terminal 5 — 右手 Wuji 控制（laptop）**
 ```bash
+conda activate humdex
 bash wuji_hand_real.sh right
 ```
 
 **Terminal 6 — 数据采集（laptop）**
 ```bash
+source .venv_teleop/bin/activate
 python g1_data_server.py --hand-type wuji
 ```
 
@@ -148,25 +151,29 @@ python g1_data_server.py --hand-type wuji
 
 **Terminal 3 — 身体遥操（laptop，不变）**
 ```bash
+source .venv_teleop/bin/activate
 python gear_sonic/scripts/pico_manus_thread_server.py --manager --hand_type wuji
 # 在 port 5559 绑定 PUB socket，G1 可订阅
 ```
 
 **Terminal 4 — 左手 Wuji 控制（G1 上）**
 
-先编辑 G1 上的 `wuji_hand_real.sh`，将 `TRACKING_HOST` 改为 laptop IP，然后：
+先编辑 G1 上的 `wuji_hand_real.sh`，将 `TRACKING_HOST` 改为 laptop IP 192.168.123.222 ，然后：
 ```bash
+conda activate humdex
 bash wuji_hand_real.sh left
 ```
 
 **Terminal 5 — 右手 Wuji 控制（G1 上）**
 ```bash
+conda activate humdex
 bash wuji_hand_real.sh right
 ```
 
 **Terminal 6 — 数据采集（laptop）**
 ```bash
-python g1_data_server.py --hand-type wuji --wuji-state-host <g1_ip>
+source .venv_teleop/bin/activate
+python g1_data_server.py --hand-type wuji --wuji-state-host 192.168.123.164
 ```
 
 > `wuji_hand_server.py` 将状态 PUB socket 绑定在 `tcp://*:5560`（监听所有网卡），laptop 通过 G1 的 IP 订阅即可。
