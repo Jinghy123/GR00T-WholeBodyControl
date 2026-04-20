@@ -106,11 +106,22 @@ python realsense_server.py
 
 **Terminal 2 — C++ deploy（G1 或 laptop，不变）**
 ```bash
-bash deploy.sh real --input-type zmq_manager
+source .venv_teleop/bin/activate
+python gear_sonic/scripts/run_sim_loop.py
+
+cd gear_sonic_deploy
+source scripts/setup_env.sh
+./deploy.sh --input-type zmq_manager sim
+
+cd gear_sonic_deploy
+source scripts/setup_env.sh
+./deploy.sh --input-type zmq_manager real
+
 ```
 
 **Terminal 3 — 身体遥操（laptop）**
 ```bash
+source .venv_teleop/bin/activate
 python gear_sonic/scripts/pico_manus_thread_server.py --manager --hand_type wuji
 ```
 

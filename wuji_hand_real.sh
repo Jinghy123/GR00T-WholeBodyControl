@@ -9,19 +9,26 @@ tracking_host="localhost"  # IP of machine running pico_manus_thread_server.py
 tracking_port=5559
 state_port=5560
 target_fps=50
-smooth_steps=5
 retarget_config="${SCRIPT_DIR}/wuji-retargeting/example/config/retarget_manus_${hand_side}.yaml"
 
 # Start controller
-python "${SCRIPT_DIR}/wuji_hand_server.py" \
+# Ensure we use the correct Python from conda environment
+if [ -n "$CONDA_PREFIX" ]; then
+    PYTHON_BIN="$CONDA_PREFIX/bin/python"
+else
+    PYTHON_BIN="python"
+fi
+
+echo "Using Python: $PYTHON_BIN"
+$PYTHON_BIN "${SCRIPT_DIR}/wuji_hand_server.py" \
     --hand_side ${hand_side} \
     --config ${retarget_config} \
     --tracking_host ${tracking_host} \
     --tracking_port ${tracking_port} \
     --state_port ${state_port} \
     --target_fps ${target_fps} \
-    --smooth_steps ${smooth_steps} \
+    --no_smooth \
     # --serial_number ${serial_number} \
-    # --no_smooth \
+    # --smooth_steps 5 \
     # --clamp_min -1.5 \
     # --clamp_max 1.5

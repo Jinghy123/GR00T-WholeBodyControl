@@ -536,7 +536,12 @@ class ManusSkeletonReceiver:
     def _parse_skeleton_176(data_176) -> np.ndarray:
         floats = list(map(float, data_176[1:]))
         arr = np.asarray(floats, dtype=np.float32).reshape(25, 7)
-        return arr[:, :3].copy()
+        xyz = arr[:, :3].copy()
+
+        # Apply X-axis flip to match humdex version (critical for correct joint orientation)
+        xyz[:, 0] *= -1.0  # Flip X axis
+
+        return xyz
 
     def _loop(self) -> None:
         while self._running:
@@ -586,8 +591,8 @@ class ManusSkeletonReceiver:
 
 def init_manus_receiver(
     address: str = "tcp://localhost:8000",
-    left_glove_sn: str = "265bba63",
-    right_glove_sn: str = "81d630d4",
+    left_glove_sn: str = "265bba63",  # Actual working left glove SN (from C++ output)
+    right_glove_sn: str = "81d630d4",  # Actual working right glove SN (from C++ output)
 ):
     """Start the Manus ZMQ receiver (inlined; no external deps beyond zmq/numpy)."""
     receiver = ManusSkeletonReceiver(
@@ -1487,17 +1492,6 @@ class PoseStreamer:
             self.manus_receiver,
         )
 
-        # In wuji mode: publish raw 26D hand tracking dict for wuji_hand_server.py
-        if self.wuji_hand_pub is not None and self.manus_receiver is not None:
-            manus_left, manus_right = self.manus_receiver.get_latest()
-            if manus_left is not None and manus_right is not None:
-                tracking_msg = msgpack.packb({
-                    "left": _manus25_to_tracking26(manus_left, "left"),
-                    "right": _manus25_to_tracking26(manus_right, "right"),
-                    "timestamp": time.time(),
-                }, use_bin_type=True)
-                self.wuji_hand_pub.send(b"wuji_hand" + tracking_msg)
-
         smpl_pose_np = (
             latest_data["smpl_pose"].detach().cpu().numpy()[:, :63].reshape(-1, 21, 3)[0]
         ).astype(np.float32)
@@ -2004,6 +1998,7 @@ def run_pico_manager(
     enable_smpl_vis: bool = False,
     hand_type: str = "manus_dex3",
     wuji_hand_port: int = 5559,
+    skip_body_tracking: bool = False,
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
@@ -2017,10 +2012,14 @@ def run_pico_manager(
         )
     subprocess.Popen(["bash", "/opt/apps/roboticsservice/runService.sh"])
     xrt.init()
-    print("Waiting for body tracking data...")
-    while not xrt.is_body_data_available():
-        print("waiting for body data...")
-        time.sleep(1)
+
+    if not skip_body_tracking:
+        print("Waiting for body tracking data...")
+        while not xrt.is_body_data_available():
+            print("waiting for body data...")
+            time.sleep(1)
+    else:
+        print("Skipping body tracking check - running with Manus data only")
 
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
@@ -2105,16 +2104,22 @@ def run_pico_manager(
     print("Data collection: s=start, q=save, d=discard (keyboard input)")
 
     # Start recording manager thread for data collection
+    # NOTE: Disabled - use g1_data_server.py for recording instead
     rec_manager = None
-    if RecordingManagerThread is not None:
-        rec_manager = RecordingManagerThread(g1_ip="localhost")
-        rec_manager.start()
-        print("[Manager] Recording manager started - use s/q/d keys to control recording")
+    # if RecordingManagerThread is not None:
+    #     rec_manager = RecordingManagerThread(g1_ip="localhost")
+    #     rec_manager.start()
+    #     print("[Manager] Recording manager started - use s/q/d keys to control recording")
 
     current_mode = StreamMode.OFF
     # Track which mode VR_3PT was entered from, so left_axis_click returns to it.
     # Will be either PLANNER or PLANNER_FROZEN_UPPER_BODY.
     vr3pt_parent_mode = StreamMode.PLANNER
+
+    # Rate limiting for Wuji hand data publishing (50Hz to match humdex version)
+    last_wuji_publish_time = 0.0
+    wuji_publish_interval = 1.0 / 50.0  # 50Hz
+
     try:
         prev_ax_pressed = False
         prev_by_pressed = False
@@ -2225,6 +2230,24 @@ def run_pico_manager(
                     # Recalibrate VR tracking against the robot's actual current pose
                     # (read via g1_debug feedback + FK) to prevent sudden jumps
                     planner_streamer.recalibrate_for_vr3pt()
+
+            # Publish Wuji hand tracking data in all modes (not just POSE)
+            # Rate limited to 50Hz to match humdex version and prevent hardware jitter
+            current_time = time.time()
+            if pose_streamer.wuji_hand_pub is not None and pose_streamer.manus_receiver is not None:
+                if current_time - last_wuji_publish_time >= wuji_publish_interval:
+                    manus_left, manus_right = pose_streamer.manus_receiver.get_latest()
+                    if manus_left is not None and manus_right is not None:
+                        tracking_msg = msgpack.packb({
+                            "left": _manus25_to_tracking26(manus_left, "left"),
+                            "right": _manus25_to_tracking26(manus_right, "right"),
+                            "timestamp": current_time,
+                        }, use_bin_type=True)
+                        pose_streamer.wuji_hand_pub.send(b"wuji_hand" + tracking_msg)
+                        last_wuji_publish_time = current_time
+                        if not hasattr(pose_streamer, '_wuji_success_printed'):
+                            print(f"[Wuji] Publishing hand tracking data at 50Hz ({len(tracking_msg)} bytes)")
+                            pose_streamer._wuji_success_printed = True
 
             # Run one iteration of the new mode
             if new_mode == StreamMode.POSE:
@@ -2373,6 +2396,11 @@ if __name__ == "__main__":
         default=5559,
         help="ZMQ PUB port for wuji 26D hand tracking (used when --hand_type wuji, default: 5559)",
     )
+    parser.add_argument(
+        "--skip_body_tracking",
+        action="store_true",
+        help="Skip waiting for body tracking data (run with Manus only)",
+    )
     args = parser.parse_args()
 
     # Standalone VR3Pt test modes (exit after finishing)
@@ -2415,6 +2443,7 @@ if __name__ == "__main__":
             enable_smpl_vis=args.vis_smpl,
             hand_type=args.hand_type,
             wuji_hand_port=args.wuji_hand_port,
+            skip_body_tracking=args.skip_body_tracking,
         )
     else:
         # Run legacy single-thread pose streaming

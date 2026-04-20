@@ -10,8 +10,8 @@ import zmq
 from decoupled_wbc.control.teleop.device.SDKClient_Linux import ManusServer
 
 manus_idx = {
-    "left": ["3822396207", "3998055887", "432908014"],
-    "right": ["3762867141", "831307785", "3585023564"],
+    "left": ["265bba63", "2178298068", "3822396207"],  # Working hex SN first
+    "right": ["81d630d4", "643545699", "3762867141"],   # Working hex SN first
 }
 
 

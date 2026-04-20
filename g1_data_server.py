@@ -388,7 +388,8 @@ class CommandServer:
                         cmd = msg.get("cmd", "")
                         mapping = {"start": "s", "save": "q", "discard": "d"}
                         if cmd in mapping:
-                            self._queue.put(mapping[cmd])
+                            # Pass both command and session_id (for start command)
+                            self._queue.put((mapping[cmd], msg.get("session_id", None)))
                     except Exception:
                         pass
         except Exception:
@@ -448,12 +449,16 @@ class DataCollector:
         self._stop      = threading.Event()
         self._cmd_server = CommandServer(self._cmd_queue)
 
-    # ── episode lifecycle ──────────────────────────────────────────────────────
+    # ── episode lifecycle ───────────────────��──────────────────────────────────
 
-    def _start(self):
+    def _start(self, session_id=None):
         if self._phase != "IDLE":
             _rprint("[Collector] Already recording. Press q to save or d to discard first.")
             return
+        # Use provided session_id or generate current timestamp
+        if session_id is None:
+            session_id = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        self._session_id = session_id
         ep_dir = os.path.join(
             self._folder,
             f"{self._task}_{self._session_id}",
@@ -533,9 +538,14 @@ class DataCollector:
 
                 # Process any keyboard commands (executed in main thread, no lock needed)
                 while not self._cmd_queue.empty():
-                    ch = self._cmd_queue.get_nowait()
+                    cmd_item = self._cmd_queue.get_nowait()
+                    # Handle both old format (string) and new format (tuple)
+                    if isinstance(cmd_item, tuple):
+                        ch, session_id = cmd_item
+                    else:
+                        ch, session_id = cmd_item, None
                     if ch == "s":
-                        self._start()
+                        self._start(session_id=session_id)
                     elif ch == "q":
                         self._save()
                     elif ch == "d":
@@ -543,16 +553,28 @@ class DataCollector:
 
                 if self._phase == "RECORDING":
                     # Fetch frames (ego_rgb, ego_stereo, left_wrist, right_wrist) and state
-                    ego, ego_stereo, lw, rw = self._camera.get_frames()
+                    if self._camera is not None:
+                        ego, ego_stereo, lw, rw = self._camera.get_frames()
+                    else:
+                        ego, ego_stereo, lw, rw = None, None, None, None
                     state, action, token = self._state.get_state_and_action()
 
-                    # Record if we have body state (with or without camera frames)
-                    if state is not None:
+                    # Record if we have body state OR if we're recording hand-only data
+                    has_hand_data = (self._hand_type == "wuji" and self._wuji_reader is not None)
+
+                    if state is not None or has_hand_data:
                         colors = {}
                         if ego is not None:        colors["rgb"]         = ego
                         if ego_stereo is not None: colors["stereo"]      = ego_stereo
                         if lw is not None:         colors["left_wrist"]  = lw
                         if rw is not None:         colors["right_wrist"] = rw
+
+                        # If no body state, create minimal state/action with hand data
+                        if state is None:
+                            state = {"qpos": np.zeros(29, dtype=np.float32),
+                                     "quat": np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)}
+                            action = {"qpos": np.zeros(29, dtype=np.float32)}
+                            token = np.array([], dtype=np.float32)
 
                         if self._hand_type == "wuji" and self._wuji_reader is not None:
                             # Replace 14-D Dex3 hand_joints with 40-D Wuji hand joints
@@ -606,9 +628,11 @@ if __name__ == "__main__":
                     help=f"Host running wuji_hand_server.py (default: {WUJI_STATE_HOST}; set to G1 IP when Wuji is on robot)")
     ap.add_argument("--wuji-state-port", type=int, default=WUJI_STATE_PORT,
                     help=f"ZMQ SUB port for wuji state (default: {WUJI_STATE_PORT})")
+    ap.add_argument("--no-camera", action="store_true",
+                    help="Disable camera (useful for hand-only recording)")
     args = ap.parse_args()
 
-    camera       = RealSenseClient()
+    camera       = None if args.no_camera else RealSenseClient()
     state_reader = WBCStateReader()
     wuji_reader  = None
     if args.hand_type == "wuji":

@@ -69,6 +69,41 @@ TRACKING_MAX_AGE_S = 0.5
 # 26D input: [Wrist, Palm, Thumb(4), Index(5), Middle(5), Ring(5), Pinky(5)]
 _MEDIAPIPE_IDX = [1, 2, 3, 4, 5, 7, 8, 9, 10, 12, 13, 14, 15, 17, 18, 19, 20, 22, 23, 24, 25]
 
+# 26D hand joint names (aligned with humdex version)
+HAND_JOINT_NAMES_26 = [
+    "Wrist", "Palm",
+    "ThumbMetacarpal", "ThumbProximal", "ThumbDistal", "ThumbTip",
+    "IndexMetacarpal", "IndexProximal", "IndexIntermediate", "IndexDistal", "IndexTip",
+    "MiddleMetacarpal", "MiddleProximal", "MiddleIntermediate", "MiddleDistal", "MiddleTip",
+    "RingMetacarpal", "RingProximal", "RingIntermediate", "RingDistal", "RingTip",
+    "LittleMetacarpal", "LittleProximal", "LittleIntermediate", "LittleDistal", "LittleTip"
+]
+
+# 26D -> 21D mapping to MediaPipe layout (aligned with humdex version)
+MEDIAPIPE_MAPPING_26_TO_21 = [
+    1,   # 0: Wrist -> Wrist
+    2,   # 1: ThumbMetacarpal -> Thumb CMC
+    3,   # 2: ThumbProximal -> Thumb MCP
+    4,   # 3: ThumbDistal -> Thumb IP
+    5,   # 4: ThumbTip -> Thumb Tip
+    7,   # 5: IndexMetacarpal -> Index MCP
+    8,   # 6: IndexProximal -> Index PIP
+    9,   # 7: IndexIntermediate -> Index DIP
+    10,  # 8: IndexTip -> Index Tip (skip IndexDistal)
+    12,  # 9: MiddleMetacarpal -> Middle MCP
+    13,  # 10: MiddleProximal -> Middle PIP
+    14,  # 11: MiddleIntermediate -> Middle DIP
+    15,  # 12: MiddleTip -> Middle Tip (skip MiddleDistal)
+    17,  # 13: RingMetacarpal -> Ring MCP
+    18,  # 14: RingProximal -> Ring PIP
+    19,  # 15: RingIntermediate -> Ring DIP
+    20,  # 16: RingTip -> Ring Tip (skip RingDistal)
+    22,  # 17: LittleMetacarpal -> Pinky MCP
+    23,  # 18: LittleProximal -> Pinky PIP
+    24,  # 19: LittleIntermediate -> Pinky DIP
+    25,  # 20: LittleTip -> Pinky Tip (skip LittleDistal)
+]
+
 # Joint names from wujihandpy (finger1..5, joint1..4)
 _DESIRED_JOINT_NAMES = [f"finger{i}_joint{j}" for i in range(1, 6) for j in range(1, 5)]
 
@@ -82,35 +117,56 @@ def now_ms() -> int:
 
 def hand_26d_to_mediapipe_21d(hand_dict: dict, hand_side: str) -> np.ndarray:
     """Convert 26D hand dict → (21, 3) MediaPipe-style array."""
-    prefix = "LeftHand" if hand_side.lower() == "left" else "RightHand"
-    joint_names_26 = [
-        "Wrist", "Palm",
-        "ThumbMetacarpal", "ThumbProximal", "ThumbDistal", "ThumbTip",
-        "IndexMetacarpal", "IndexProximal", "IndexIntermediate", "IndexDistal", "IndexTip",
-        "MiddleMetacarpal", "MiddleProximal", "MiddleIntermediate", "MiddleDistal", "MiddleTip",
-        "RingMetacarpal", "RingProximal", "RingIntermediate", "RingDistal", "RingTip",
-        "LittleMetacarpal", "LittleProximal", "LittleIntermediate", "LittleDistal", "LittleTip",
-    ]
-    pts26 = np.zeros((26, 3), dtype=np.float32)
-    for i, name in enumerate(joint_names_26):
-        key = prefix + name
-        val = hand_dict.get(key)
-        if val is not None:
-            pts26[i] = np.asarray(val[0], dtype=np.float32)[:3]
-    return pts26[_MEDIAPIPE_IDX]  # (21, 3)
+    hand_side_prefix = "LeftHand" if hand_side.lower() == "left" else "RightHand"
+
+    # Build 26D position array.
+    joint_positions_26 = np.zeros((26, 3), dtype=np.float32)
+
+    for i, joint_name in enumerate(HAND_JOINT_NAMES_26):
+        key = hand_side_prefix + joint_name
+        if key in hand_dict:
+            pos = hand_dict[key][0]  # [x, y, z]
+            joint_positions_26[i] = pos
+        else:
+            # Fallback to zeros when a joint key is missing.
+            joint_positions_26[i] = [0.0, 0.0, 0.0]
+
+    # Remap to 21D MediaPipe order.
+    mediapipe_21d = joint_positions_26[MEDIAPIPE_MAPPING_26_TO_21]
+
+    # Use wrist as origin.
+    wrist_pos = mediapipe_21d[0].copy()
+    mediapipe_21d = mediapipe_21d - wrist_pos
+
+    # Keep a dedicated scale hook for quick tuning if needed.
+    scale_factor = 1.0
+    mediapipe_21d[1:] = mediapipe_21d[1:] * scale_factor
+
+    return mediapipe_21d
 
 
-def smooth_move(controller, target_qpos: np.ndarray, duration: float, steps: int):
-    """Linearly interpolate from current position to target and send each step."""
-    target = target_qpos.reshape(5, 4).astype(np.float32)
+def smooth_move(hand, controller, target_qpos, duration=0.1, steps=10):
+    """
+    Smoothly interpolate from current qpos to target qpos (5x4).
+
+    Args:
+        hand: wujihandpy.Hand instance (kept for API compatibility)
+        controller: realtime controller object
+        target_qpos: numpy array with shape (5, 4)
+        duration: interpolation duration in seconds
+        steps: number of interpolation steps
+    """
+    target_qpos = target_qpos.reshape(5, 4)
     try:
-        cur = controller.read_joint_actual_position().reshape(5, 4).astype(np.float32)
-    except Exception:
+        # cur = controller.get_joint_actual_position()
+        cur = controller.read_joint_actual_position()
+    except:
         cur = np.zeros((5, 4), dtype=np.float32)
-    dt = duration / max(1, steps)
+
     for t in np.linspace(0, 1, steps):
-        controller.set_joint_target_position(cur * (1.0 - t) + target * t)
-        time.sleep(dt)
+        q = cur * (1 - t) + target_qpos * t
+        controller.set_joint_target_position(q)
+        time.sleep(duration / steps)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Main controller class
@@ -140,6 +196,7 @@ class WujiHandServer:
         clamp_min: float = -1.5,
         clamp_max: float = 1.5,
         max_delta_per_step: float = 0.08,
+        enable_replay_commands: bool = False,
     ):
         self.hand_side = hand_side.lower()
         assert self.hand_side in ("left", "right"), "hand_side must be 'left' or 'right'"
@@ -168,6 +225,22 @@ class WujiHandServer:
         self._pub = self._ctx.socket(zmq.PUB)
         self._pub.bind(f"tcp://*:{state_port}")
         print(f"[WujiHand] State PUB bound to port {state_port}")
+
+        # Command receiver for external replay (optional, port 5561)
+        # NOTE: Disabled by default to avoid blocking control loop
+        # Enable with --enable-replay-commands flag if needed
+        self._cmd_sock = None
+        self._cmd_port = state_port + 1
+        if enable_replay_commands:
+            try:
+                self._cmd_sock = self._ctx.socket(zmq.SUB)
+                self._cmd_sock.setsockopt(zmq.RCVTIMEO, 10)  # Short timeout to avoid blocking
+                self._cmd_sock.setsockopt_string(zmq.SUBSCRIBE, "wuji_replay")
+                self._cmd_sock.bind(f"tcp://*:{self._cmd_port}")
+                print(f"[WujiHand] Command receiver bound to port {self._cmd_port} (for replay)")
+            except Exception as e:
+                print(f"[WujiHand] Warning: could not bind command port {self._cmd_port}: {e}")
+                self._cmd_sock = None
 
         # ── Wuji hardware ────────────────────────────────────────────────────
         print(f"[WujiHand] Initializing hardware ({self.hand_side})...")
@@ -250,20 +323,51 @@ class WujiHandServer:
             return None
         return msg.get(self.hand_side)
 
+    def _recv_replay_command(self) -> Optional[np.ndarray]:
+        """
+        Try to receive a replay command. Returns 20D action array or None.
+        Only processes commands matching self.hand_side.
+        """
+        if self._cmd_sock is None:
+            return None
+        try:
+            raw = self._cmd_sock.recv()
+        except zmq.Again:
+            return None
+        topic_len = len(b"wuji_replay")
+        payload = raw[topic_len:]
+        try:
+            msg = msgpack.unpackb(payload, raw=False)
+        except Exception:
+            return None
+        # Check if command is for this hand
+        if msg.get("hand_side") != self.hand_side:
+            return None
+        action = msg.get("action")
+        if action is not None:
+            return np.asarray(action, dtype=np.float32).reshape(5, 4)
+        return None
+
     # ── safety ────────────────────────────────────────────────────────────────
 
     def _apply_safety(self, qpos: np.ndarray) -> np.ndarray:
-        qpos = np.clip(qpos, self.clamp_min, self.clamp_max)
-        delta = qpos.reshape(-1) - self.last_qpos.reshape(-1)
-        delta = np.clip(delta, -self.max_delta_per_step, self.max_delta_per_step)
-        return (self.last_qpos.reshape(-1) + delta).reshape(5, 4).astype(np.float32)
+        """Apply clamp and per-step delta limit to model output."""
+        q = np.asarray(qpos, dtype=np.float32).reshape(5, 4)
+        if not np.isfinite(q).all():
+            q = np.asarray(self.last_qpos if self.last_qpos is not None else self.zero_pose, dtype=np.float32).reshape(5, 4)
+        q = np.clip(q, self.clamp_min, self.clamp_max)
+        if self.last_qpos is not None and np.asarray(self.last_qpos).shape == q.shape:
+            delta = q - self.last_qpos
+            delta = np.clip(delta, -self.max_delta_per_step, self.max_delta_per_step)
+            q = self.last_qpos + delta
+        return q
 
     # ── hardware send ─────────────────────────────────────────────────────────
 
     def _send(self, target: np.ndarray):
         target = target.reshape(5, 4).astype(np.float32)
         if self.smooth_enabled:
-            smooth_move(self.controller, target, self.control_dt, self.smooth_steps)
+            smooth_move(self.hand, self.controller, target, duration=self.control_dt, steps=self.smooth_steps)
         else:
             self.controller.set_joint_target_position(target)
 
@@ -340,6 +444,17 @@ class WujiHandServer:
                     continue
 
                 # mode == "follow"
+                # Check for replay command first (higher priority than tracking)
+                replay_action = self._recv_replay_command()
+                if replay_action is not None:
+                    # Directly send replay action to hardware
+                    wuji_20d = self._apply_safety(replay_action)
+                    self._send(wuji_20d)
+                    self._publish_state(wuji_20d)
+                    self.last_qpos = wuji_20d.copy()
+                    self._rate_limit(loop_start)
+                    continue
+
                 hand_dict = self._recv_tracking()
                 if hand_dict is None:
                     self._rate_limit(loop_start)
@@ -404,7 +519,7 @@ class WujiHandServer:
         try:
             duration = 0.2 if self._stop_signal == signal.SIGTERM else 1.0
             steps = 10 if self._stop_signal == signal.SIGTERM else 50
-            smooth_move(self.controller, self.zero_pose, duration, steps)
+            smooth_move(self.hand, self.controller, self.zero_pose, duration=duration, steps=steps)
             print("[WujiHand] Returned to zero pose")
         except Exception:
             pass
@@ -488,6 +603,10 @@ Examples (Wuji on G1, pico_manus on laptop at 192.168.1.10):
         "--max_delta_per_step", type=float, default=0.08,
         help="Maximum joint angle change per control step (default: 0.08 rad)",
     )
+    parser.add_argument(
+        "--enable-replay-commands", action="store_true",
+        help="Enable ZMQ command receiver for replay (may add slight latency)",
+    )
     args = parser.parse_args()
 
     server = WujiHandServer(
@@ -503,5 +622,6 @@ Examples (Wuji on G1, pico_manus on laptop at 192.168.1.10):
         clamp_min=args.clamp_min,
         clamp_max=args.clamp_max,
         max_delta_per_step=args.max_delta_per_step,
+        enable_replay_commands=args.enable_replay_commands,
     )
     server.run()
