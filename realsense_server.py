@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import collections
 import io
+import math
 import os
 import signal
 import socket
@@ -67,6 +68,27 @@ RESOLUTION_MAP = {
     "hd1200": sl.RESOLUTION.HD1200,
     "hd2k": sl.RESOLUTION.HD2K,
 }
+
+# Neck-motor configuration — edit these in place to recalibrate.
+NECK_PORT             = "/dev/ttyUSB0"
+NECK_BAUD             = 2_000_000
+NECK_YAW_ID           = 0
+NECK_PITCH_ID         = 1
+NECK_YAW_ZERO_TICK    = 1897
+NECK_PITCH_ZERO_TICK  = 2900
+NECK_YAW_LIMIT_DEG    = 60.0
+NECK_PITCH_LIMIT_DEG  = 45.0
+NECK_SMOOTH_ALPHA     = 0.3    # 0 = frozen, 1 = no smoothing
+NECK_CONTROL_HZ       = 50
+# Headset quaternion → Euler. Calibrate signs/order by watching real motor vs. head.
+NECK_EULER_ORDER      = "yxz"   # scipy convention; returns (yaw, pitch, roll)
+NECK_YAW_SIGN         = -1
+NECK_PITCH_SIGN       = -1
+
+ADDR_TORQUE_ENABLE    = 64
+ADDR_GOAL_POSITION    = 116
+ADDR_HW_ERROR_STATUS  = 70
+TICKS_PER_REV         = 4096
 
 
 def _bgra_to_bgr(bgra: np.ndarray) -> np.ndarray:
@@ -382,6 +404,284 @@ class PicoVideoStreamer:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Neck motor driver (Pico head pose → 2x Dynamixel)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class NeckMotor:
+    """Reads Pico headset pose via xrobotoolkit_sdk and drives 2 Dynamixels.
+
+    Thread model:
+      _loop — CONTROL_HZ: poll xrt.get_headset_pose() → yaw/pitch → clamp →
+              smooth → rad_to_tick → Dynamixel write. Periodic HW-error
+              check + auto-reboot.
+
+    Shutdown via stop(): zero-pose write, sleep 0.5s, torque off, close port.
+    """
+
+    def __init__(
+        self,
+        port: str = NECK_PORT,
+        baud: int = NECK_BAUD,
+        yaw_id: int = NECK_YAW_ID,
+        pitch_id: int = NECK_PITCH_ID,
+        yaw_zero_tick: int = NECK_YAW_ZERO_TICK,
+        pitch_zero_tick: int = NECK_PITCH_ZERO_TICK,
+        yaw_limit_rad: float = math.radians(NECK_YAW_LIMIT_DEG),
+        pitch_limit_rad: float = math.radians(NECK_PITCH_LIMIT_DEG),
+        smooth_alpha: float = NECK_SMOOTH_ALPHA,
+        control_hz: int = NECK_CONTROL_HZ,
+        euler_order: str = NECK_EULER_ORDER,
+        yaw_sign: int = NECK_YAW_SIGN,
+        pitch_sign: int = NECK_PITCH_SIGN,
+    ):
+        self.port_path = port
+        self.baud = baud
+        self.yaw_id = yaw_id
+        self.pitch_id = pitch_id
+        self.yaw_zero_tick = yaw_zero_tick
+        self.pitch_zero_tick = pitch_zero_tick
+        self.yaw_limit_rad = yaw_limit_rad
+        self.pitch_limit_rad = pitch_limit_rad
+        self.smooth_alpha = smooth_alpha
+        self.control_hz = control_hz
+        self.euler_order = euler_order
+        self.yaw_sign = yaw_sign
+        self.pitch_sign = pitch_sign
+
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+        self._port = None
+        self._packet = None
+        self._xrt = None
+        self._R = None
+
+    @staticmethod
+    def _rad_to_tick(rad: float, zero_tick: int) -> int:
+        return zero_tick + int(rad * TICKS_PER_REV / (2 * math.pi))
+
+    @staticmethod
+    def _clamp(x: float, lo: float, hi: float) -> float:
+        return max(lo, min(hi, x))
+
+    def _check_and_reboot(self, motor_id: int) -> bool:
+        hw, _, err = self._packet.read1ByteTxRx(
+            self._port, motor_id, ADDR_HW_ERROR_STATUS
+        )
+        if err == 128 or hw != 0:
+            print(f"[Neck] ID {motor_id} hw_error=0b{hw:08b} -> rebooting")
+            self._packet.reboot(self._port, motor_id)
+            time.sleep(0.5)
+            self._packet.write1ByteTxRx(
+                self._port, motor_id, ADDR_TORQUE_ENABLE, 1
+            )
+            return True
+        return False
+
+    def start(self) -> bool:
+        """Open SDK + serial port, enable torque, spawn loop thread.
+
+        Returns True on success, False on failure (caller should continue
+        without motor control).
+        """
+        try:
+            import xrobotoolkit_sdk as xrt
+            from dynamixel_sdk import PacketHandler, PortHandler
+            from scipy.spatial.transform import Rotation as R
+        except ImportError as e:
+            print(
+                f"\033[91m[Neck] Import failed: {e}. "
+                f"pip install dynamixel-sdk scipy and install xrobotoolkit_sdk.\033[0m"
+            )
+            return False
+
+        self._xrt = xrt
+        self._R = R
+
+        try:
+            xrt.init()
+            print("[Neck] XRoboToolkit SDK initialized.")
+        except Exception as e:
+            print(f"\033[91m[Neck] xrt.init() failed: {e}\033[0m")
+            return False
+
+        self._port = PortHandler(self.port_path)
+        self._packet = PacketHandler(2.0)
+        if not self._port.openPort() or not self._port.setBaudRate(self.baud):
+            print(
+                f"\033[91m[Neck] Could not open {self.port_path} @ {self.baud}\033[0m"
+            )
+            return False
+
+        for i in (self.yaw_id, self.pitch_id):
+            _, res, _ = self._packet.ping(self._port, i)
+            if res != 0:
+                print(f"\033[91m[Neck] Ping ID {i} failed (res={res})\033[0m")
+                self._port.closePort()
+                return False
+            self._check_and_reboot(i)
+            self._packet.write1ByteTxRx(
+                self._port, i, ADDR_TORQUE_ENABLE, 1
+            )
+
+        # Start at zero pose
+        self._packet.write4ByteTxRx(
+            self._port, self.yaw_id, ADDR_GOAL_POSITION,
+            self._rad_to_tick(0.0, self.yaw_zero_tick),
+        )
+        self._packet.write4ByteTxRx(
+            self._port, self.pitch_id, ADDR_GOAL_POSITION,
+            self._rad_to_tick(0.0, self.pitch_zero_tick),
+        )
+        time.sleep(0.3)
+
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+        print(
+            f"\033[92m[Neck] Started: {self.port_path}@{self.baud} "
+            f"IDs {self.yaw_id}/{self.pitch_id} "
+            f"limits yaw±{math.degrees(self.yaw_limit_rad):.0f}° "
+            f"pitch±{math.degrees(self.pitch_limit_rad):.0f}° "
+            f"@ {self.control_hz}Hz\033[0m"
+        )
+        return True
+
+    def _loop(self) -> None:
+        dt = 1.0 / self.control_hz
+        yaw_cmd = 0.0
+        pitch_cmd = 0.0
+        last_hw_check = 0.0
+        last_status_print = 0.0
+        last_warn_print = 0.0
+        pose_valid = False
+        next_tick = time.time()
+
+        while self._running:
+            next_tick += dt
+
+            # Read headset pose
+            yaw_target = yaw_cmd
+            pitch_target = pitch_cmd
+            pose_ok = False
+            try:
+                pose = self._xrt.get_headset_pose()
+                if pose is not None and len(pose) >= 7:
+                    qx, qy, qz, qw = pose[3], pose[4], pose[5], pose[6]
+                    # SDK returns zero-filled quat when no live data has
+                    # arrived yet from the Pico; skip until stream is up.
+                    if (qx * qx + qy * qy + qz * qz + qw * qw) > 1e-6:
+                        euler = self._R.from_quat(
+                            [qx, qy, qz, qw]
+                        ).as_euler(self.euler_order)
+                        yaw_target = float(euler[0]) * self.yaw_sign
+                        pitch_target = float(euler[1]) * self.pitch_sign
+                        pose_ok = True
+            except Exception as e:
+                now = time.time()
+                if now - last_warn_print > 2.0:
+                    print(f"[Neck] headset read error: {e}")
+                    last_warn_print = now
+
+            if not pose_ok:
+                now = time.time()
+                if pose_valid or now - last_warn_print > 5.0:
+                    print(
+                        "[Neck] no headset data yet "
+                        "(Pico not streaming / service down?)"
+                    )
+                    last_warn_print = now
+                pose_valid = False
+                # Hold current cmd — don't snap to zero.
+                yaw_target = yaw_cmd
+                pitch_target = pitch_cmd
+            else:
+                pose_valid = True
+
+            # Clamp
+            yaw_target = self._clamp(
+                yaw_target, -self.yaw_limit_rad, self.yaw_limit_rad
+            )
+            pitch_target = self._clamp(
+                pitch_target, -self.pitch_limit_rad, self.pitch_limit_rad
+            )
+
+            # Low-pass smoothing
+            yaw_cmd += self.smooth_alpha * (yaw_target - yaw_cmd)
+            pitch_cmd += self.smooth_alpha * (pitch_target - pitch_cmd)
+
+            # Write motors
+            yaw_tick = self._rad_to_tick(yaw_cmd, self.yaw_zero_tick)
+            pitch_tick = self._rad_to_tick(pitch_cmd, self.pitch_zero_tick)
+            try:
+                self._packet.write4ByteTxRx(
+                    self._port, self.yaw_id, ADDR_GOAL_POSITION, yaw_tick
+                )
+                self._packet.write4ByteTxRx(
+                    self._port, self.pitch_id, ADDR_GOAL_POSITION, pitch_tick
+                )
+            except Exception as e:
+                print(f"[Neck] write error: {e}")
+
+            now = time.time()
+
+            # Periodic hw-error check every 2s
+            if now - last_hw_check > 2.0:
+                for i in (self.yaw_id, self.pitch_id):
+                    try:
+                        self._check_and_reboot(i)
+                    except Exception as e:
+                        print(f"[Neck] hw check error: {e}")
+                last_hw_check = now
+
+            # Status line every 0.5s
+            if now - last_status_print > 0.5:
+                print(
+                    f"[Neck] yaw {math.degrees(yaw_cmd):+6.1f}° "
+                    f"(tick {yaw_tick:4d})  pitch "
+                    f"{math.degrees(pitch_cmd):+6.1f}° (tick {pitch_tick:4d})"
+                )
+                last_status_print = now
+
+            # Sleep
+            sleep_s = next_tick - time.time()
+            if sleep_s > 0:
+                time.sleep(sleep_s)
+            else:
+                next_tick = time.time()
+
+    def stop(self) -> None:
+        if not self._running and self._port is None:
+            return
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        try:
+            if self._port is not None and self._packet is not None:
+                self._packet.write4ByteTxRx(
+                    self._port, self.yaw_id, ADDR_GOAL_POSITION,
+                    self._rad_to_tick(0.0, self.yaw_zero_tick),
+                )
+                self._packet.write4ByteTxRx(
+                    self._port, self.pitch_id, ADDR_GOAL_POSITION,
+                    self._rad_to_tick(0.0, self.pitch_zero_tick),
+                )
+                time.sleep(0.5)
+                for i in (self.yaw_id, self.pitch_id):
+                    self._packet.write1ByteTxRx(
+                        self._port, i, ADDR_TORQUE_ENABLE, 0
+                    )
+                self._port.closePort()
+                print("[Neck] Shutdown: zeroed, torque off, port closed.")
+        except Exception as e:
+            print(f"[Neck] Shutdown error: {e}")
+        finally:
+            self._port = None
+            self._packet = None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # RealSense device listing
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -413,7 +713,7 @@ def _parse_args() -> argparse.Namespace:
     # ZED
     p.add_argument(
         "--resolution",
-        default=os.environ.get("ZED_RESOLUTION", "hd720"),
+        default=os.environ.get("ZED_RESOLUTION", "vga"),
         choices=sorted(RESOLUTION_MAP.keys()),
         help="ZED resolution preset",
     )
@@ -443,6 +743,18 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--right-wrist-serial", default="218622276849",
         help="Serial of right wrist D405 (empty string to disable)",
+    )
+    p.add_argument(
+        "--zed-only", action="store_true",
+        default=_env_bool("ZED_ONLY", False),
+        help="Use ZED only; disable both RealSense wrist cameras",
+    )
+
+    # Neck motor
+    p.add_argument(
+        "--enable-neck-motor", action="store_true",
+        default=_env_bool("NECK_MOTOR", False),
+        help="Drive the 2-DOF neck (Dynamixel IDs 0=yaw, 1=pitch) from Pico headset pose",
     )
 
     # Network
@@ -488,15 +800,21 @@ def _build_config(ns: argparse.Namespace) -> Any:
     c.enable_pico = ns.enable_pico
     c.pico_ip = ns.pico_ip
     c.pico_port = ns.pico_port
-    c.left_wrist_serial = ns.left_wrist_serial
-    c.right_wrist_serial = ns.right_wrist_serial
+    c.left_wrist_serial = "" if ns.zed_only else ns.left_wrist_serial
+    c.right_wrist_serial = "" if ns.zed_only else ns.right_wrist_serial
+    c.zed_only = ns.zed_only
+    c.enable_neck_motor = ns.enable_neck_motor
     return c
 
 
 def start_server(cfg: Any) -> None:
     global Gst, gi
 
-    list_realsense_devices()
+    if cfg.zed_only:
+        print("[Server] Mode: ZED only (wrist cameras disabled).")
+    else:
+        print("[Server] Mode: ZED + 2x RealSense wrist cameras.")
+        list_realsense_devices()
 
     threading.Thread(
         target=zed_capture_thread, args=(cfg,), daemon=True
@@ -539,13 +857,24 @@ def start_server(cfg: Any) -> None:
         pico_streamer.start()
         print("\033[92m[PicoStreamer] Started ego stereo streaming to Pico\033[0m")
 
+    neck_motor: Optional[NeckMotor] = None
+    if cfg.enable_neck_motor:
+        neck_motor = NeckMotor()
+        if not neck_motor.start():
+            print("\033[91m[Neck] Failed to start; continuing without motor control.\033[0m")
+            neck_motor = None
+
     context = zmq.Context()
     sock = context.socket(zmq.REP)
     sock.bind(cfg.zmq_bind)
     print(f"[ZMQ] REP bound to {cfg.zmq_bind}, waiting for requests...")
 
     def _force_exit(sig, _frame):
-        print(f"\n\033[91m[Server] Signal {sig} received – forcing exit.\033[0m")
+        print(f"\n\033[91m[Server] Signal {sig} received – shutting down.\033[0m")
+        if neck_motor is not None:
+            neck_motor.stop()
+        if pico_streamer is not None:
+            pico_streamer.stop()
         os._exit(0)
 
     signal.signal(signal.SIGINT, _force_exit)
@@ -580,6 +909,8 @@ def start_server(cfg: Any) -> None:
         context.term()
         if pico_streamer is not None:
             pico_streamer.stop()
+        if neck_motor is not None:
+            neck_motor.stop()
 
 
 def main() -> None:

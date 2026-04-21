@@ -448,6 +448,11 @@ def _parse_args() -> argparse.Namespace:
         "--right-wrist-serial", default="218622276849",
         help="Serial of right wrist D405 (empty string to disable)",
     )
+    p.add_argument(
+        "--zed-only", action="store_true",
+        default=_env_bool("ZED_ONLY", False),
+        help="Use ZED only; disable both RealSense wrist cameras",
+    )
 
     # Network
     p.add_argument(
@@ -492,15 +497,20 @@ def _build_config(ns: argparse.Namespace) -> Any:
     c.enable_pico = ns.enable_pico
     c.pico_ip = ns.pico_ip
     c.pico_port = ns.pico_port
-    c.left_wrist_serial = ns.left_wrist_serial
-    c.right_wrist_serial = ns.right_wrist_serial
+    c.left_wrist_serial = "" if ns.zed_only else ns.left_wrist_serial
+    c.right_wrist_serial = "" if ns.zed_only else ns.right_wrist_serial
+    c.zed_only = ns.zed_only
     return c
 
 
 def start_server(cfg: Any) -> None:
     global Gst, gi
 
-    list_realsense_devices()
+    if cfg.zed_only:
+        print("[Server] Mode: ZED only (wrist cameras disabled).")
+    else:
+        print("[Server] Mode: ZED + 2x RealSense wrist cameras.")
+        list_realsense_devices()
 
     # ZED ego capture
     threading.Thread(

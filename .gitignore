@@ -192,3 +192,6 @@ uv.lock
 xrobotoolkit_sdk.cpython-*-*-*.so
 teleop_vids/
 *.code-workspace
+
+# XRoboToolkit installer packages (too large for GitHub)
+*.deb
