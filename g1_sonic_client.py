@@ -274,13 +274,14 @@ class TokenPublisher:
 class PolicyClientManager:
     """Manages communication with autonomous policy server."""
 
-    def __init__(self, host, port, prompt):
+    def __init__(self, host, port, prompt, action_only=False):
         if not POLICY_CLIENT_AVAILABLE:
             raise RuntimeError("Policy client not available!")
 
         self._host = host
         self._port = port
         self._prompt = prompt
+        self._action_only = action_only
         self._client = None
         self._session_id = None
 
@@ -303,6 +304,8 @@ class PolicyClientManager:
         import uuid
         self._session_id = str(uuid.uuid4())
         print(f"[PolicyClient] Session ID: {self._session_id}")
+        if self._action_only:
+            print(f"[PolicyClient] Action-only mode: ON")
         print(f"[PolicyClient] Connected successfully!")
 
     def get_action(self, images, state):
@@ -327,6 +330,9 @@ class PolicyClientManager:
             "prompt": self._prompt,
             "session_id": self._session_id,
         }
+        if self._action_only:
+            obs["action_only_inference"] = True
+            obs["action_attend_to_noisy_video"] = False
 
         # Get action from policy server
         try:
@@ -378,12 +384,13 @@ class TokenPolicyClient:
     def __init__(self, policy_host, policy_port, prompt,
                  zmq_host, zmq_port, zmq_topic,
                  camera_host, camera_port,
-                 wbc_host, wbc_port, wbc_topic):
+                 wbc_host, wbc_port, wbc_topic,
+                 action_only=False):
         # Initialize components
         self._camera = RSCamera(host=camera_host, port=camera_port)
         self._state_reader = WBCStateReader(host=wbc_host, port=wbc_port, topic=wbc_topic)
         self._token_publisher = TokenPublisher(host=zmq_host, port=zmq_port, topic=zmq_topic)
-        self._policy_client = PolicyClientManager(host=policy_host, port=policy_port, prompt=prompt)
+        self._policy_client = PolicyClientManager(host=policy_host, port=policy_port, prompt=prompt, action_only=action_only)
         self._encoder = EncoderClient(ENCODER_MODEL, mode=0)
 
         # Threading components
@@ -650,8 +657,13 @@ def main():
                        help="WBC state publisher port (default: 5557)")
     parser.add_argument("--wbc-topic", type=str, default=WBC_TOPIC,
                        help="WBC state topic (default: g1_debug)")
+    parser.add_argument("--action-only", action="store_true",
+                       help="Enable action-only inference (skip video denoising for faster speed)")
 
     args = parser.parse_args()
+
+    if args.action_only:
+        print("[Main] Action-only mode enabled: video denoising will be skipped")
 
     # Create and start client
     client = TokenPolicyClient(
@@ -666,6 +678,7 @@ def main():
         wbc_host=args.wbc_host,
         wbc_port=args.wbc_port,
         wbc_topic=args.wbc_topic,
+        action_only=args.action_only,
     )
 
     try:
