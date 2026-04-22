@@ -20,6 +20,7 @@ Setup:
 
 import datetime
 import json
+import logging
 import os
 import queue
 import select
@@ -41,6 +42,11 @@ from episode_writer import EpisodeWriter
 # ──────────────────────────────────────────────────────────────────────────────
 # Configuration
 # ──────────────────────────────────────────────────────────────────────────────
+
+def _rprint(msg):
+    """Print with \\r\\n for raw mode terminal."""
+    sys.stdout.write(msg + "\r\n")
+    sys.stdout.flush()
 
 REALSENSE_HOST = "192.168.123.164"  # Robot IP for RealSense server
 REALSENSE_PORT = 5558               # Changed from 5556 to avoid collision
@@ -127,7 +133,7 @@ class RealSenseClient:
                 self._decode(parts[3]),
             )
         except zmq.Again:
-            print("[RealSense] Frame timeout — reconnecting...")
+            sys.stdout.write("[RealSense] Frame timeout — reconnecting...\r\n")
             self._connect()
             return (None, None, None, None)
         except Exception as e:
@@ -405,12 +411,7 @@ class CommandServer:
 
 # ──────────────────────────────────────────────────────────────────────────────
 # DataCollector — main orchestrator
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _rprint(msg):
-    """Print with \r\n so output looks correct while terminal is in raw mode."""
-    sys.stdout.write(msg + "\r\n")
-    sys.stdout.flush()
+# ────────────────────────────────────────────���─────────────────────────────────
 
 class DataCollector:
     """
@@ -455,10 +456,13 @@ class DataCollector:
         if self._phase != "IDLE":
             _rprint("[Collector] Already recording. Press q to save or d to discard first.")
             return
-        # Use provided session_id or generate current timestamp
-        if session_id is None:
-            session_id = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        self._session_id = session_id
+        # Use provided session_id, or generate only on first episode
+        if session_id is not None:
+            self._session_id = session_id
+        elif self._session_id is None:
+            # First episode: generate session_id from current timestamp
+            self._session_id = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        # Subsequent episodes: reuse existing self._session_id
         ep_dir = os.path.join(
             self._folder,
             f"{self._task}_{self._session_id}",

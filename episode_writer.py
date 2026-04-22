@@ -24,7 +24,7 @@ class EpisodeWriter():
         """
         image_size: [width, height]
         """
-        print("==> EpisodeWriter initializing...\n")
+        # print("==> EpisodeWriter initializing...\n")  # Disabled to avoid thread contention
         self.episode_dir = task_dir
         self.frequency = frequency
         self.image_size = image_size
@@ -44,7 +44,7 @@ class EpisodeWriter():
         self.worker_thread = Thread(target=self.process_queue)
         self.worker_thread.start()
 
-        print("==> EpisodeWriter initialized successfully.\n")
+        # print("==> EpisodeWriter initialized successfully.\n")  # Disabled
 
     def create_episode(self):
         """
@@ -72,7 +72,7 @@ class EpisodeWriter():
         self.json_path = os.path.join(self.episode_dir, 'data.json')
 
         self.is_available = False
-        print(f"==> New episode created: {self.episode_dir}")
+        # print(f"==> New episode created: {self.episode_dir}")  # Disabled
         return True
 
     def add_item(self, colors, states=None, actions=None, token=None):
@@ -158,7 +158,7 @@ class EpisodeWriter():
     def save_episode(self):
         """Trigger the save operation."""
         self.need_save = True
-        print(f"==> Episode save triggered...")
+        # print(f"==> Episode save triggered...")  # Disabled
 
     def _save_episode(self):
         """Save episode data to data.json as a list of timestep dicts."""
@@ -167,7 +167,7 @@ class EpisodeWriter():
 
         self.need_save = False
         self.is_available = True
-        print(f"==> Episode saved successfully to {self.json_path} ({len(self.episode_data)} frames)")
+        # print(f"==> Episode saved successfully to {self.json_path} ({len(self.episode_data)} frames)")  # Disabled
 
     def close(self):
         """Stop the worker thread and ensure all tasks are completed."""

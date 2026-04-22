@@ -97,11 +97,19 @@ pip install wujihandpy zmq msgpack numpy
 
 ## 启动流程（Wuji 手在 laptop 上）
 
+1. 记录数据空行逻辑不对，记录episode每次文件夹不一样 //
+2. wuji不动，因为没有manager? //
+3. payload太大，sonic不行？ //
+4. 脖子动的不对，锁住。数据没有记录
+5. 角度不对，重新设计
+6. manus抖动
+7. wuji板载延迟
+
 按顺序依次启动各终端：
 
 **Terminal 1 — 相机流（G1 上）**
 ```bash
-python realsense_server.py
+python realsense_server.py --zed-only     --zmq-bind tcp://0.0.0.0:5558     --enable-pico --pico-ip 192.168.0.114     --enable-neck-motor
 ```
 
 **Terminal 2 — C++ deploy（G1 或 laptop，不变）**
@@ -152,7 +160,7 @@ python g1_data_server.py --hand-type wuji
 **Terminal 3 — 身体遥操（laptop，不变）**
 ```bash
 source .venv_teleop/bin/activate
-python gear_sonic/scripts/pico_manus_thread_server.py --manager --hand_type wuji
+python gear_sonic/scripts/pico_manus_thread_server.py --hand_type wuji
 # 在 port 5559 绑定 PUB socket，G1 可订阅
 ```
 

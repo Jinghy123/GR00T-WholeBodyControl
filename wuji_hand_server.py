@@ -417,10 +417,10 @@ class WujiHandServer:
     # ── main loop ─────────────────────────────────────────────────────────────
 
     def run(self):
-        sys.stdout.write("[WujiHand] Ready.\r\n")
-        sys.stdout.write("  k = toggle follow/default\r\n")
-        sys.stdout.write("  p = toggle follow/hold\r\n")
-        sys.stdout.write("  Ctrl-C = quit\r\n\r\n")
+        sys.stdout.write("[WujiHand] Ready.\n")
+        sys.stdout.write("  k = toggle follow/default\n")
+        sys.stdout.write("  p = toggle follow/hold\n")
+        sys.stdout.write("  Ctrl-C = quit\n\n")
         sys.stdout.flush()
 
         def _sig(signum, _frame):

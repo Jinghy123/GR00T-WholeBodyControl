@@ -1002,6 +1002,8 @@ def _pose_stream_common(
     with_g1_robot: bool = True,
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
+    hand_type: str = "manus_dex3",
+    wuji_hand_port: int = 5559,
 ):
     """Shared pose streaming loop used by run_pico."""
     if xrt is None:
@@ -1024,7 +1026,15 @@ def _pose_stream_common(
 
     # Hand control: Manus glove -> dex-retargeting -> 7-DOF Dex3 joints
     manus_receiver = init_manus_receiver()
-    hand_retargeting = init_hand_retargeting()
+    hand_retargeting = init_hand_retargeting() if hand_type == "manus_dex3" else None
+
+    # Wuji hand: create PUB socket for 26D tracking data
+    wuji_hand_pub = None
+    if hand_type == "wuji":
+        ctx = zmq.Context()
+        wuji_hand_pub = ctx.socket(zmq.PUB)
+        wuji_hand_pub.bind(f"tcp://*:{wuji_hand_port}")
+        print(f"[{log_prefix}] Wuji hand PUB bound to port {wuji_hand_port}")
 
     streamer = PoseStreamer(
         socket=socket,
@@ -1038,6 +1048,7 @@ def _pose_stream_common(
         log_prefix=log_prefix,
         manus_receiver=manus_receiver,
         hand_retargeting=hand_retargeting,
+        wuji_hand_pub=wuji_hand_pub,
     )
 
     if stop_event is None:
@@ -1054,6 +1065,8 @@ def _pose_stream_common(
         three_point.close()
         if manus_receiver is not None:
             manus_receiver.stop()
+        if wuji_hand_pub is not None:
+            wuji_hand_pub.close()
 
 
 class ThreePointPose:
@@ -1462,6 +1475,27 @@ class PoseStreamer:
         """Execute one iteration of the pose streaming loop."""
         sample = self.reader.get_latest()
 
+        # Publish Wuji hand tracking data (rate limited to 50Hz)
+        # Do this BEFORE the sample check so hand data is published even without body tracking
+        current_time = time.time()
+        if self.wuji_hand_pub is not None and self.manus_receiver is not None:
+            if not hasattr(self, '_last_wuji_publish_time'):
+                self._last_wuji_publish_time = 0
+            wuji_publish_interval = 1.0 / 50.0  # 50Hz
+            if current_time - self._last_wuji_publish_time >= wuji_publish_interval:
+                manus_left, manus_right = self.manus_receiver.get_latest()
+                if manus_left is not None and manus_right is not None:
+                    tracking_msg = msgpack.packb({
+                        "left": _manus25_to_tracking26(manus_left, "left"),
+                        "right": _manus25_to_tracking26(manus_right, "right"),
+                        "timestamp": current_time,
+                    }, use_bin_type=True)
+                    self.wuji_hand_pub.send(b"wuji_hand" + tracking_msg)
+                    self._last_wuji_publish_time = current_time
+                    if not hasattr(self, '_wuji_success_printed'):
+                        print(f"[{self.log_prefix}] Publishing Wuji hand tracking at 50Hz")
+                        self._wuji_success_printed = True
+
         if sample is None:
             time.sleep(0.005)
             return
@@ -1677,6 +1711,7 @@ class PoseStreamer:
             print(f"[{self.log_prefix}] FPS: {fps:.2f}, Step: {self.step}")
             self.fps_counter = 0
             self.last_fps_report = current_time
+
         elapsed = time.time() - self.frame_start
         if elapsed < self.frame_time:
             time.sleep(self.frame_time - elapsed)
@@ -1695,6 +1730,9 @@ def run_pico(
     with_g1_robot: bool = True,
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
+    skip_body_tracking: bool = False,  # If True, skip waiting. If False, auto-detect with timeout
+    hand_type: str = "manus_dex3",
+    wuji_hand_port: int = 5559,
 ):
     """Run Pico body tracking with real-time visualization and ZMQ streaming."""
     if xrt is None:
@@ -1703,10 +1741,20 @@ def run_pico(
         )
     subprocess.Popen(["bash", "/opt/apps/roboticsservice/runService.sh"])
     xrt.init()
-    print("Waiting for body tracking data...")
-    while not xrt.is_body_data_available():
-        print("waiting for body data...")
-        time.sleep(1)
+
+    if skip_body_tracking:
+        print("Skipping body tracking check (forced)")
+    else:
+        # Auto-detect: wait up to 3 seconds for body data
+        print("Checking for body tracking data (3s timeout)...")
+        timeout = 3
+        start = time.time()
+        while not xrt.is_body_data_available() and time.time() - start < timeout:
+            time.sleep(0.2)
+        if xrt.is_body_data_available():
+            print("Body tracking data available!")
+        else:
+            print("No body tracking data found, continuing without it")
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
     socket.bind(f"tcp://*:{port}")
@@ -1733,6 +1781,8 @@ def run_pico(
             with_g1_robot=with_g1_robot,
             enable_waist_tracking=enable_waist_tracking,
             enable_smpl_vis=enable_smpl_vis,
+            hand_type=hand_type,
+            wuji_hand_port=wuji_hand_port,
         )
     finally:
         socket.close()
@@ -1998,7 +2048,7 @@ def run_pico_manager(
     enable_smpl_vis: bool = False,
     hand_type: str = "manus_dex3",
     wuji_hand_port: int = 5559,
-    skip_body_tracking: bool = False,
+    skip_body_tracking: bool = False,  # If True, skip waiting. If False, auto-detect with timeout
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
@@ -2013,13 +2063,19 @@ def run_pico_manager(
     subprocess.Popen(["bash", "/opt/apps/roboticsservice/runService.sh"])
     xrt.init()
 
-    if not skip_body_tracking:
-        print("Waiting for body tracking data...")
-        while not xrt.is_body_data_available():
-            print("waiting for body data...")
-            time.sleep(1)
+    if skip_body_tracking:
+        print("[Manager] Skipping body tracking check (forced)")
     else:
-        print("Skipping body tracking check - running with Manus data only")
+        # Auto-detect: wait up to 3 seconds for body data
+        print("[Manager] Checking for body tracking data (3s timeout)...")
+        timeout = 3
+        start = time.time()
+        while not xrt.is_body_data_available() and time.time() - start < timeout:
+            time.sleep(0.2)
+        if xrt.is_body_data_available():
+            print("[Manager] Body tracking data available!")
+        else:
+            print("[Manager] No body tracking data found, continuing without it")
 
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
@@ -2459,4 +2515,7 @@ if __name__ == "__main__":
             with_g1_robot=with_g1_robot,
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
+            skip_body_tracking=args.skip_body_tracking,
+            hand_type=args.hand_type,
+            wuji_hand_port=args.wuji_hand_port,
         )
