@@ -92,6 +92,11 @@ Network: Pico, G1, and Desktop all on the same LAN, able to ping each other.
 
 ### A. G1 onboard PC setup
 
+> **Note for Topology 2 (recommended for Orin):** On the G1 you only need
+> A.1, A.4, A.5, A.6. **Skip A.2 and A.3** — XRoboToolKit is installed on the
+> desktop instead (see section B.2). In Topology 1, do all of A.1 through A.6
+> on the G1.
+
 #### A.1 — Python env
 
 Use the existing `sonic` env (Python 3.10). Add the two packages required by
@@ -99,10 +104,10 @@ the neck driver:
 
 ```bash
 conda activate sonic
-pip install dynamixel-sdk scipy
+pip install dynamixel-sdk scipy pyzmq
 ```
 
-#### A.2 — XRoboToolKit Python SDK
+#### A.2 — XRoboToolKit Python SDK (Topology 1 only — skip for Topology 2)
 
 Before following the steps, check your architecture:
 ```bash
@@ -160,7 +165,7 @@ surgery.)
 python -c "import xrobotoolkit_sdk as xrt; xrt.init(); print('ok')"
 ```
 
-#### A.3 — XRoboToolKit PC Service daemon
+#### A.3 — XRoboToolKit PC Service daemon (Topology 1 only — skip for Topology 2)
 
 Daemon that receives head-pose from the Pico app and publishes it to
 `xrobotoolkit_sdk`.
