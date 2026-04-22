@@ -76,7 +76,8 @@ NECK_BAUD             = 2_000_000
 NECK_YAW_ID           = 0
 NECK_PITCH_ID         = 1
 NECK_YAW_ZERO_TICK    = 1897
-NECK_PITCH_ZERO_TICK  = 2900
+# NECK_PITCH_ZERO_TICK  = 2900
+NECK_PITCH_ZERO_TICK  = 3275
 NECK_YAW_LIMIT_DEG    = 60.0
 NECK_PITCH_LIMIT_DEG  = 45.0
 NECK_SMOOTH_ALPHA     = 0.3    # 0 = frozen, 1 = no smoothing
@@ -659,18 +660,23 @@ class NeckMotor:
             yaw_cmd += self.smooth_alpha * (yaw_target - yaw_cmd)
             pitch_cmd += self.smooth_alpha * (pitch_target - pitch_cmd)
 
-            # Write motors
-            yaw_tick = self._rad_to_tick(yaw_cmd, self.yaw_zero_tick)
-            pitch_tick = self._rad_to_tick(pitch_cmd, self.pitch_zero_tick)
-            try:
-                self._packet.write4ByteTxRx(
-                    self._port, self.yaw_id, ADDR_GOAL_POSITION, yaw_tick
-                )
-                self._packet.write4ByteTxRx(
-                    self._port, self.pitch_id, ADDR_GOAL_POSITION, pitch_tick
-                )
-            except Exception as e:
-                print(f"[Neck] write error: {e}")
+            # Write motors -- DISABLED: motors locked at zero position.
+            # The zero-pose write in start() already parked them at
+            # (yaw_zero_tick, pitch_zero_tick) with torque enabled, so they
+            # will hold there as long as the port stays open.
+            yaw_tick = self.yaw_zero_tick
+            pitch_tick = self.pitch_zero_tick
+            # yaw_tick = self._rad_to_tick(yaw_cmd, self.yaw_zero_tick)
+            # pitch_tick = self._rad_to_tick(pitch_cmd, self.pitch_zero_tick)
+            # try:
+            #     self._packet.write4ByteTxRx(
+            #         self._port, self.yaw_id, ADDR_GOAL_POSITION, yaw_tick
+            #     )
+            #     self._packet.write4ByteTxRx(
+            #         self._port, self.pitch_id, ADDR_GOAL_POSITION, pitch_tick
+            #     )
+            # except Exception as e:
+            #     print(f"[Neck] write error: {e}")
 
             now = time.time()
 
