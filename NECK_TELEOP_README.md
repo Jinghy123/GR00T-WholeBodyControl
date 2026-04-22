@@ -65,11 +65,16 @@ pip install dynamixel-sdk scipy
 
 #### A.2 — XRoboToolKit Python SDK
 
-A pre-built Python 3.10 `.so` is shipped for **x86_64** under
-`external_dependencies/XRoboToolkit-PC-Service-Pybind_X86_and_ARM64/`. On
-**aarch64** (Jetson Orin G1), the `.so` is built on demand by `install_pico.sh`.
+Before following the steps, check your architecture:
+```bash
+uname -m         # x86_64 → follow A.2.x86; aarch64 → follow A.2.aarch64
+```
 
-Put the module on the import path (add to `~/.bashrc` on the G1):
+##### A.2.x86 — x86_64 machines
+
+A pre-built Python 3.10 `.so` is shipped at
+`external_dependencies/XRoboToolkit-PC-Service-Pybind_X86_and_ARM64/xrobotoolkit_sdk.cpython-310-x86_64-linux-gnu.so`.
+Put it on the import path (add to `~/.bashrc`):
 
 ```bash
 export GR00T_ROOT="$HOME/Desktop/GR00T-WholeBodyControl"      # adjust path
@@ -77,22 +82,79 @@ export PYTHONPATH="$GR00T_ROOT/external_dependencies/XRoboToolkit-PC-Service-Pyb
 export LD_LIBRARY_PATH="$GR00T_ROOT/external_dependencies/XRoboToolkit-PC-Service-Pybind_X86_and_ARM64/lib:$LD_LIBRARY_PATH"
 ```
 
-Verify:
+> Skipping `pip install -e …/` deliberately — it triggers a CMake rebuild that
+> fails without cmake/pybind11 in the env. The PYTHONPATH approach reuses the
+> pre-built `.so`.
+
+##### A.2.aarch64 — Jetson Orin (JetPack 6.x / CUDA 12.6)
+
+There is no pre-built Python `.so` for aarch64. You must build it once. The
+aarch64 native library (`libPXREARobotSDK.so`) is already committed under
+`.../lib/aarch64/`, so only the Python binding needs to compile.
+
+```bash
+conda activate sonic          # Python 3.10
+cd $GR00T_ROOT
+pip install cmake pybind11 setuptools
+export CMAKE_PREFIX_PATH="$(python -m pybind11 --cmakedir)"
+pip install --no-build-isolation -e \
+    external_dependencies/XRoboToolkit-PC-Service-Pybind_X86_and_ARM64/
+```
+
+(Or run `bash install_scripts/install_pico.sh` which does the same steps and
+also rebuilds `libPXREARobotSDK.so` from source if the aarch64 copy is
+missing — see
+[install_pico.sh:70-94](install_scripts/install_pico.sh#L70-L94).)
+
+Then set `LD_LIBRARY_PATH` so the binding finds the aarch64 native lib:
+```bash
+export GR00T_ROOT="$HOME/Desktop/GR00T-WholeBodyControl"      # adjust path
+export LD_LIBRARY_PATH="$GR00T_ROOT/external_dependencies/XRoboToolkit-PC-Service-Pybind_X86_and_ARM64/lib/aarch64:$LD_LIBRARY_PATH"
+```
+
+(`pip install -e` makes `xrobotoolkit_sdk` importable without PYTHONPATH
+surgery.)
+
+##### Verify (either architecture)
+
 ```bash
 python -c "import xrobotoolkit_sdk as xrt; xrt.init(); print('ok')"
 ```
-
-> `pip install -e external_dependencies/XRoboToolkit-PC-Service-Pybind_X86_and_ARM64/`
-> triggers a CMake rebuild that fails without cmake/pybind11 in the env.
-> The PYTHONPATH approach reuses the pre-built `.so` and avoids the build.
 
 #### A.3 — XRoboToolKit PC Service daemon
 
 Daemon that receives head-pose from the Pico app and publishes it to
 `xrobotoolkit_sdk`.
 
+##### A.3.x86 — x86_64
+
 ```bash
 sudo dpkg -i XRoboToolkit_PC_Service_1.0.0_ubuntu_24.04_amd64.deb
+```
+
+##### A.3.aarch64 — Jetson Orin
+
+**The shipped `.deb` is amd64-only and will NOT install on Orin.** You need an
+aarch64 build of `RoboticsServiceProcess`. Two options:
+
+1. **Ask XR-Robotics for an aarch64 `.deb`** (same version as the amd64 one).
+2. **Build from source** using the `orin` branch of the upstream repo
+   (which `install_pico.sh` already clones at the binding-build step):
+   ```bash
+   cd /tmp
+   git clone -b orin https://github.com/XR-Robotics/XRoboToolkit-PC-Service.git
+   cd XRoboToolkit-PC-Service
+   # Follow the build instructions in that repo's README.
+   # The resulting binary ecosystem (RoboticsServiceProcess, setting.ini,
+   # support libs) must be installed to /opt/apps/roboticsservice/ so the
+   # rest of this README works unchanged.
+   ```
+
+Without a running service daemon, `xrt.init()` still succeeds but
+`get_headset_pose()` always returns zeros (what we debugged in the x86 setup).
+Verify the install with:
+```bash
+pgrep -fa RoboticsServiceProcess   # should print a PID after launch
 ```
 
 #### A.4 — Firewall
