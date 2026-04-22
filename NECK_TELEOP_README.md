@@ -1,6 +1,10 @@
 # Pico VR → ZED + Neck Motor Teleop
 
-End-to-end VR teleop pipeline with two machines:
+Two deployment topologies are supported. Pick the one that matches your
+hardware — both use the same `realsense_server.py` binary, differentiated by
+the `--pose-zmq` flag.
+
+### Topology 1 — all-on-G1 (requires aarch64 XRoboToolKit daemon)
 
 ```
   Pico VR headset
@@ -22,7 +26,32 @@ End-to-end VR teleop pipeline with two machines:
 └──────────────────────────┘                 └───────────────────────────┘
 ```
 
-Responsibilities:
+### Topology 2 — daemon on desktop, pose over ZMQ (recommended for Orin)
+
+Use this when the G1 is aarch64 and you don't want to build the
+XRoboToolKit daemon for Orin. The daemon + binding run on the desktop; a
+small `pose_publisher.py` forwards headset pose to the G1 over ZMQ.
+
+```
+  Pico VR headset
+        │
+        │  ─── (tracking pose — XRoboToolKit protocol) ───┐
+        │                                                 │
+        │  ◄──────── H.264 stereo (TCP :12345) ─────────────────────┐
+        │                                                 │         │
+                                                          ▼         │
+┌──────────────────────────────┐                 ┌───────────────────────────┐
+│      Desktop PC              │                 │   G1 onboard PC           │
+│                              │                 │                           │
+│  XRoboToolKit service (.deb) │                 │  realsense_server.py      │
+│  pose_publisher.py           │── ZMQ PUB ─────►│    --pose-zmq tcp://…:5559│
+│                              │   (:5559 JSON)  │                           │
+│  test_viewer.py              │◄── ZMQ (:5558) ─┤  ├─ ZED Mini              │
+│                              │   REQ/REP JPEG  │  └─ U2D2 + 2 Dynamixels   │
+└──────────────────────────────┘                 └───────────────────────────┘
+```
+
+Responsibilities (Topology 1):
 - **G1 onboard PC** runs [realsense_server.py](realsense_server.py). It owns the
   ZED, the U2D2 (`/dev/ttyUSB0`), and the XRoboToolKit service that receives
   head-pose from the Pico. It serves ZED frames over ZMQ, streams ZED stereo as
@@ -33,6 +62,16 @@ Responsibilities:
   that talks to the G1's ZMQ endpoint.
 - **Pico VR** headset runs the XRoboToolKit Client app (streams tracking to G1)
   and receives the H.264 video for VR display.
+
+Responsibilities (Topology 2 — recommended for Orin):
+- **Desktop PC** additionally runs the **XRoboToolKit PC Service daemon**
+  (amd64 `.deb`) and [pose_publisher.py](pose_publisher.py), which publishes
+  the Pico headset pose over ZMQ.
+- **G1 onboard PC** does **NOT** need the daemon or the Python binding. It
+  runs `realsense_server.py --pose-zmq tcp://<desktop-ip>:5559`, reads the
+  published pose instead of calling the SDK locally, and drives the motors.
+- The **Pico** app points its tracking target at the **desktop's** IP (not
+  the G1's) in this topology.
 
 ---
 
@@ -197,13 +236,30 @@ After any edit, restart the server — no rebuild needed.
 
 ### B. Desktop PC setup
 
-The desktop only consumes the ZMQ feed — it does **not** need the SDK, the
-daemon, or the motor libraries.
+Two variants depending on topology.
 
+#### B.1 — Viewer-only desktop (Topology 1)
+
+The desktop only consumes the ZMQ feed — no SDK, no daemon, no motor libs.
 ```bash
 conda activate sonic
 pip install pyzmq opencv-python numpy    # likely already present
 ```
+
+#### B.2 — Pose-publisher desktop (Topology 2, recommended for Orin)
+
+The desktop runs the XRoboToolKit PC Service daemon and forwards the Pico
+headset pose to the G1. Follow A.2.x86 and A.3.x86 above on the desktop (the
+amd64 `.deb` installs cleanly here), and also:
+
+```bash
+conda activate sonic
+pip install pyzmq
+sudo ufw disable          # or open port 5559
+```
+
+The publisher itself is shipped as [pose_publisher.py](pose_publisher.py);
+no extra setup.
 
 If you're running downstream teleop clients (e.g. files under
 `gear_sonic/scripts/`), follow their own install instructions — they are
@@ -220,6 +276,60 @@ unaffected by this pipeline.
 ---
 
 ## Running the pipeline
+
+Pick the subsection matching your topology.
+
+### Topology 2 (daemon on desktop, Orin G1) — recommended
+
+**Desktop terminal 1 — XRoboToolKit service daemon:**
+```bash
+sudo ufw disable
+sudo bash /opt/apps/roboticsservice/runService.sh
+```
+
+**Pico headset:** launch XRoboToolkit Client, point its Server IP at the
+**desktop's** IP, start tracking.
+
+**Desktop terminal 2 — pose publisher:**
+```bash
+conda activate sonic
+cd $GR00T_ROOT
+export PYTHONPATH="$GR00T_ROOT/external_dependencies/XRoboToolkit-PC-Service-Pybind_X86_and_ARM64:$PYTHONPATH"
+export LD_LIBRARY_PATH="$GR00T_ROOT/external_dependencies/XRoboToolkit-PC-Service-Pybind_X86_and_ARM64/lib:$LD_LIBRARY_PATH"
+
+python pose_publisher.py --bind tcp://0.0.0.0:5559 --hz 50
+```
+Expected logs: `XRoboToolkit SDK initialized.`, `PUB bound to tcp://0.0.0.0:5559`, then periodic `published N poses @ ~50 Hz`. If it warns `quat is zero`, the Pico→daemon link is not live (see troubleshooting).
+
+**Desktop terminal 3 — optional live ZED viewer** (after launching G1 below):
+```bash
+python test_viewer.py --server <G1_IP> --port 5558 --show-stereo
+```
+
+**G1 terminal — launch the server:**
+```bash
+conda activate sonic
+cd ~/Desktop/GR00T-WholeBodyControl      # adjust path on the robot
+
+python realsense_server.py \
+    --zed-only \
+    --zmq-bind tcp://0.0.0.0:5558 \
+    --enable-pico --pico-ip <PICO_IP> \
+    --enable-neck-motor \
+    --pose-zmq tcp://<DESKTOP_IP>:5559
+```
+
+Expected lines in order:
+- `[ZED] Started: resolution=vga fps=30`
+- `[PicoStreamer] Connected to Pico <PICO_IP>:12345`
+- `[Neck] ZMQ SUB pose source: tcp://<DESKTOP_IP>:5559`
+- `[Neck] Started: /dev/ttyUSB0@2000000 IDs 0/1 ...`
+- Periodic `[Neck] yaw ... pitch ...` that track your head movement.
+
+Ctrl-C on either machine stops cleanly. Motors zero and release torque on
+the G1 side.
+
+### Topology 1 (daemon on G1) — only if you have an aarch64 daemon
 
 ### On the G1
 
@@ -304,6 +414,7 @@ head rotates the physical neck on the robot.
 | `--pico-ip <ip>` | `192.168.0.128` | Pico headset IP. |
 | `--pico-port <port>` | `12345` | Pico TCP video port. |
 | `--enable-neck-motor` | off (env `NECK_MOTOR`) | Drive the 2-DOF neck from Pico head pose. |
+| `--pose-zmq <addr>` | "" (env `POSE_ZMQ`) | Read headset pose from a remote `pose_publisher.py` over ZMQ SUB instead of calling `xrobotoolkit_sdk` in-process. Use on Orin G1 when the daemon runs on the desktop. Example: `tcp://192.168.0.50:5559`. |
 | `--resolution <preset>` | `vga` | `vga`, `hd720`, `hd1080`, `hd1200`, `hd2k`, `auto`. |
 | `--fps <n>` | `30` | ZED FPS. |
 | `--list-devices` | — | Print attached RealSense devices and exit. |
@@ -366,3 +477,15 @@ input: lower `NECK_SMOOTH_ALPHA` (more smoothing) or tighten limits.
 **`/dev/ttyUSB0` fails to open**
 Another process has it. `sudo fuser -v /dev/ttyUSB0` lists holders. Kill any
 stale `realsense_server.py` or legacy `neck_redis_driver.py`.
+
+**(Topology 2) `[Neck] no headset data yet` on the G1**
+The G1 is connected to the publisher but no valid poses are arriving.
+Check on the desktop:
+1. `pgrep -fa RoboticsServiceProcess` prints a PID.
+2. `pose_publisher.py` log shows `published N poses @ ~50 Hz` (not
+   `quat is zero`).
+3. Firewall on the desktop isn't blocking 5559 (`sudo ufw status`).
+4. G1 can reach the desktop: `ping <desktop-ip>` from the G1.
+
+**(Topology 2) `zmq.error.ZMQError: Address already in use` on the desktop**
+An old `pose_publisher.py` is still running: `pkill -f pose_publisher.py`.

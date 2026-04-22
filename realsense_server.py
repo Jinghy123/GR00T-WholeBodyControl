@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import collections
 import io
+import json
 import math
 import os
 import signal
@@ -434,6 +435,7 @@ class NeckMotor:
         euler_order: str = NECK_EULER_ORDER,
         yaw_sign: int = NECK_YAW_SIGN,
         pitch_sign: int = NECK_PITCH_SIGN,
+        pose_zmq_addr: str = "",
     ):
         self.port_path = port
         self.baud = baud
@@ -448,6 +450,7 @@ class NeckMotor:
         self.euler_order = euler_order
         self.yaw_sign = yaw_sign
         self.pitch_sign = pitch_sign
+        self.pose_zmq_addr = pose_zmq_addr
 
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -455,6 +458,8 @@ class NeckMotor:
         self._packet = None
         self._xrt = None
         self._R = None
+        self._pose_sub = None
+        self._zmq_ctx = None
 
     @staticmethod
     def _rad_to_tick(rad: float, zero_tick: int) -> int:
@@ -479,31 +484,60 @@ class NeckMotor:
         return False
 
     def start(self) -> bool:
-        """Open SDK + serial port, enable torque, spawn loop thread.
+        """Open pose source + serial port, enable torque, spawn loop thread.
+
+        Pose source is either local xrobotoolkit_sdk (default) or a remote
+        ZMQ SUB socket when pose_zmq_addr is set.
 
         Returns True on success, False on failure (caller should continue
         without motor control).
         """
         try:
-            import xrobotoolkit_sdk as xrt
             from dynamixel_sdk import PacketHandler, PortHandler
             from scipy.spatial.transform import Rotation as R
         except ImportError as e:
             print(
                 f"\033[91m[Neck] Import failed: {e}. "
-                f"pip install dynamixel-sdk scipy and install xrobotoolkit_sdk.\033[0m"
+                f"pip install dynamixel-sdk scipy.\033[0m"
             )
             return False
 
-        self._xrt = xrt
         self._R = R
 
-        try:
-            xrt.init()
-            print("[Neck] XRoboToolkit SDK initialized.")
-        except Exception as e:
-            print(f"\033[91m[Neck] xrt.init() failed: {e}\033[0m")
-            return False
+        if self.pose_zmq_addr:
+            # Remote pose source — skip local SDK.
+            self._zmq_ctx = zmq.Context.instance()
+            self._pose_sub = self._zmq_ctx.socket(zmq.SUB)
+            self._pose_sub.setsockopt(zmq.CONFLATE, 1)
+            self._pose_sub.setsockopt(zmq.SUBSCRIBE, b"")
+            self._pose_sub.setsockopt(zmq.RCVTIMEO, 100)
+            try:
+                self._pose_sub.connect(self.pose_zmq_addr)
+                print(
+                    f"[Neck] ZMQ SUB pose source: {self.pose_zmq_addr}"
+                )
+            except Exception as e:
+                print(
+                    f"\033[91m[Neck] ZMQ connect failed: {e}\033[0m"
+                )
+                return False
+        else:
+            try:
+                import xrobotoolkit_sdk as xrt
+            except ImportError as e:
+                print(
+                    f"\033[91m[Neck] xrobotoolkit_sdk missing: {e}. "
+                    f"Either install it, or use --pose-zmq to read pose "
+                    f"from a remote publisher.\033[0m"
+                )
+                return False
+            self._xrt = xrt
+            try:
+                xrt.init()
+                print("[Neck] XRoboToolkit SDK initialized (local).")
+            except Exception as e:
+                print(f"\033[91m[Neck] xrt.init() failed: {e}\033[0m")
+                return False
 
         self._port = PortHandler(self.port_path)
         self._packet = PacketHandler(2.0)
@@ -548,6 +582,21 @@ class NeckMotor:
         )
         return True
 
+    def _read_pose(self):
+        """Return 7-vector [x,y,z,qx,qy,qz,qw] or None."""
+        if self._pose_sub is not None:
+            try:
+                raw = self._pose_sub.recv(flags=0)
+            except zmq.Again:
+                return None
+            try:
+                return json.loads(raw.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                return None
+        if self._xrt is not None:
+            return self._xrt.get_headset_pose()
+        return None
+
     def _loop(self) -> None:
         dt = 1.0 / self.control_hz
         yaw_cmd = 0.0
@@ -561,16 +610,15 @@ class NeckMotor:
         while self._running:
             next_tick += dt
 
-            # Read headset pose
+            # Read headset pose (local SDK or remote ZMQ SUB)
             yaw_target = yaw_cmd
             pitch_target = pitch_cmd
             pose_ok = False
             try:
-                pose = self._xrt.get_headset_pose()
+                pose = self._read_pose()
                 if pose is not None and len(pose) >= 7:
                     qx, qy, qz, qw = pose[3], pose[4], pose[5], pose[6]
-                    # SDK returns zero-filled quat when no live data has
-                    # arrived yet from the Pico; skip until stream is up.
+                    # Skip zero-norm quats (stale / pre-stream).
                     if (qx * qx + qy * qy + qz * qz + qw * qw) > 1e-6:
                         euler = self._R.from_quat(
                             [qx, qy, qz, qw]
@@ -679,6 +727,12 @@ class NeckMotor:
         finally:
             self._port = None
             self._packet = None
+            if self._pose_sub is not None:
+                try:
+                    self._pose_sub.close(linger=0)
+                except Exception:
+                    pass
+                self._pose_sub = None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -756,6 +810,16 @@ def _parse_args() -> argparse.Namespace:
         default=_env_bool("NECK_MOTOR", False),
         help="Drive the 2-DOF neck (Dynamixel IDs 0=yaw, 1=pitch) from Pico headset pose",
     )
+    p.add_argument(
+        "--pose-zmq",
+        default=os.environ.get("POSE_ZMQ", ""),
+        help=(
+            "ZMQ SUB address of a remote pose publisher, e.g. "
+            "'tcp://desktop-ip:5559'. When set, skip local xrobotoolkit_sdk "
+            "and read headset poses from this socket instead. Useful when the "
+            "XRoboToolKit PC Service daemon cannot run on the onboard PC."
+        ),
+    )
 
     # Network
     p.add_argument(
@@ -804,6 +868,7 @@ def _build_config(ns: argparse.Namespace) -> Any:
     c.right_wrist_serial = "" if ns.zed_only else ns.right_wrist_serial
     c.zed_only = ns.zed_only
     c.enable_neck_motor = ns.enable_neck_motor
+    c.pose_zmq = ns.pose_zmq
     return c
 
 
@@ -859,7 +924,7 @@ def start_server(cfg: Any) -> None:
 
     neck_motor: Optional[NeckMotor] = None
     if cfg.enable_neck_motor:
-        neck_motor = NeckMotor()
+        neck_motor = NeckMotor(pose_zmq_addr=cfg.pose_zmq)
         if not neck_motor.start():
             print("\033[91m[Neck] Failed to start; continuing without motor control.\033[0m")
             neck_motor = None
