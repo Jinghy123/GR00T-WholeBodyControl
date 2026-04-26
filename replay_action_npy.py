@@ -13,7 +13,7 @@ Usage:
 """
 
 # ── Hard-coded defaults ──────────────────────────────────────────────────────
-DEFAULT_NPY_PATH       = "/home/xiawei/data/action.npy"
+DEFAULT_NPY_PATH       = "/home/xiawei/data/actions_pour_water.npy"
 DEFAULT_TOKEN_DIM      = 64   # layout: hand_joints(14) + token(64) = 78
 DEFAULT_HAND_DIM       = 14
 DEFAULT_ZMQ_HOST       = "*"
@@ -25,7 +25,7 @@ FSQ_STEP = 0.0625  # = 1/16
 DEFAULT_ZMQ_PUB_PORT   = 5556
 DEFAULT_ZMQ_TOPIC      = "pose"
 DEFAULT_RECORDING_FREQ = 30
-DEFAULT_REPEAT         = 30  # send each action 30 times (≈1s each at 30Hz)
+DEFAULT_REPEAT         = 1  # send each action 30 times (≈1s each at 30Hz)
 # ──────────────────────────────────────────────────────────────────────────────
 
 import argparse

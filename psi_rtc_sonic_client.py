@@ -21,7 +21,7 @@ from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
 )
 
 # ---------------- Configuration ----------------
-TASK_INSTRUCTION = "pick bottle and turn and pour into cup"
+TASK_INSTRUCTION = "default/pick_up_the_pink_chip_can_and_pour_water_into_the_orange_cup"
 
 # FSQ configuration (must match g1_sonic_client / encoder)
 FSQ_MIN = -0.625
