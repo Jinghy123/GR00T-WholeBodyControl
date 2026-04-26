@@ -3,6 +3,9 @@
 # Environment setup script to replace shell.nix functionality
 # Source this file: source scripts/setup_env.sh
 
+# Preserve original PATH to prevent zsh from corrupting it
+_ORIGINAL_PATH="$PATH"
+
 echo "🔧 Setting up G1 Deploy environment..."
 
 # Run jetson_clocks on Jetson systems (bare-metal only)
@@ -246,7 +249,7 @@ setup_cuda_toolkit() {
         if [ -f "$cuda_path/bin/nvcc" ]; then
             export CUDAToolkit_ROOT="$cuda_path"
             export CUDA_HOME="$cuda_path"  # Alternative name CMake might use
-            export PATH="$cuda_path/bin:$PATH"
+            export PATH="$cuda_path/bin:$_ORIGINAL_PATH"
             export LD_LIBRARY_PATH="$cuda_path/lib64:$cuda_path/lib:$LD_LIBRARY_PATH"
             echo "✅ CUDA toolkit found at: $CUDAToolkit_ROOT"
             echo "   Added to PATH: $cuda_path/bin"
@@ -343,5 +346,14 @@ echo ""
 # Optional: Add this setup to the current shell session persistence
 if [ -n "$BASH_VERSION" ]; then
     export PS1="(g1_deploy) $PS1"
+elif [ -n "$ZSH_VERSION" ]; then
+    # For zsh with oh-my-zsh, use precmd hook to prepend prefix to prompt
+    _g1_deploy_precmd() {
+        # Prepend the prefix only if not already there
+        if [[ "$PROMPT" != *"(g1_deploy)"* ]]; then
+            PROMPT="(g1_deploy) ${PROMPT}"
+        fi
+    }
+    precmd_functions+=(_g1_deploy_precmd)
 fi
 
