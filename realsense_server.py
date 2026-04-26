@@ -89,6 +89,7 @@ NECK_PITCH_SIGN       = -1
 
 ADDR_TORQUE_ENABLE    = 64
 ADDR_GOAL_POSITION    = 116
+ADDR_PRESENT_POSITION = 132
 ADDR_HW_ERROR_STATUS  = 70
 TICKS_PER_REV         = 4096
 
@@ -437,6 +438,7 @@ class NeckMotor:
         yaw_sign: int = NECK_YAW_SIGN,
         pitch_sign: int = NECK_PITCH_SIGN,
         pose_zmq_addr: str = "",
+        state_pub_addr: str = "",
     ):
         self.port_path = port
         self.baud = baud
@@ -452,6 +454,7 @@ class NeckMotor:
         self.yaw_sign = yaw_sign
         self.pitch_sign = pitch_sign
         self.pose_zmq_addr = pose_zmq_addr
+        self.state_pub_addr = state_pub_addr
 
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -460,11 +463,16 @@ class NeckMotor:
         self._xrt = None
         self._R = None
         self._pose_sub = None
+        self._state_pub = None
         self._zmq_ctx = None
 
     @staticmethod
     def _rad_to_tick(rad: float, zero_tick: int) -> int:
         return zero_tick + int(rad * TICKS_PER_REV / (2 * math.pi))
+
+    @staticmethod
+    def _tick_to_rad(tick: int, zero_tick: int) -> float:
+        return (tick - zero_tick) * (2 * math.pi) / TICKS_PER_REV
 
     @staticmethod
     def _clamp(x: float, lo: float, hi: float) -> float:
@@ -570,6 +578,21 @@ class NeckMotor:
         )
         time.sleep(0.3)
 
+        # Optional ZMQ PUB of present-position [yaw_rad, pitch_rad].
+        if self.state_pub_addr:
+            if self._zmq_ctx is None:
+                self._zmq_ctx = zmq.Context.instance()
+            self._state_pub = self._zmq_ctx.socket(zmq.PUB)
+            self._state_pub.setsockopt(zmq.SNDHWM, 1)
+            self._state_pub.setsockopt(zmq.LINGER, 0)
+            try:
+                self._state_pub.bind(self.state_pub_addr)
+                print(f"[Neck] State PUB bound: {self.state_pub_addr}")
+            except Exception as e:
+                print(f"\033[91m[Neck] State PUB bind failed: {e}\033[0m")
+                self._state_pub.close(linger=0)
+                self._state_pub = None
+
         self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -582,6 +605,26 @@ class NeckMotor:
             f"@ {self.control_hz}Hz\033[0m"
         )
         return True
+
+    def _read_present_state(self):
+        """Return (yaw_rad, pitch_rad) read from motors, or (None, None) on error."""
+        if self._packet is None or self._port is None:
+            return None, None
+        try:
+            yaw_tick, _, yerr = self._packet.read4ByteTxRx(
+                self._port, self.yaw_id, ADDR_PRESENT_POSITION
+            )
+            pitch_tick, _, perr = self._packet.read4ByteTxRx(
+                self._port, self.pitch_id, ADDR_PRESENT_POSITION
+            )
+            if yerr != 0 or perr != 0:
+                return None, None
+            return (
+                self._tick_to_rad(yaw_tick, self.yaw_zero_tick),
+                self._tick_to_rad(pitch_tick, self.pitch_zero_tick),
+            )
+        except Exception:
+            return None, None
 
     def _read_pose(self):
         """Return 7-vector [x,y,z,qx,qy,qz,qw] or None."""
@@ -678,6 +721,19 @@ class NeckMotor:
             # except Exception as e:
             #     print(f"[Neck] write error: {e}")
 
+            # Publish present position [yaw_rad, pitch_rad] for downstream
+            # recorders. Done after the (currently disabled) goal write so the
+            # value reflects what the motors are actually at this tick.
+            if self._state_pub is not None:
+                yaw_meas, pitch_meas = self._read_present_state()
+                if yaw_meas is not None:
+                    try:
+                        self._state_pub.send_string(
+                            json.dumps([yaw_meas, pitch_meas])
+                        )
+                    except Exception:
+                        pass
+
             now = time.time()
 
             # Periodic hw-error check every 2s
@@ -739,6 +795,12 @@ class NeckMotor:
                 except Exception:
                     pass
                 self._pose_sub = None
+            if self._state_pub is not None:
+                try:
+                    self._state_pub.close(linger=0)
+                except Exception:
+                    pass
+                self._state_pub = None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -826,6 +888,16 @@ def _parse_args() -> argparse.Namespace:
             "XRoboToolKit PC Service daemon cannot run on the onboard PC."
         ),
     )
+    p.add_argument(
+        "--neck-state-pub",
+        default=os.environ.get("NECK_STATE_PUB", ""),
+        help=(
+            "ZMQ PUB bind address for the neck motor present-position stream "
+            "(e.g. 'tcp://*:5560'). When set, [yaw_rad, pitch_rad] read from "
+            "the Dynamixels is published at the neck control rate so a "
+            "recorder can log it into data.json."
+        ),
+    )
 
     # Network
     p.add_argument(
@@ -875,6 +947,7 @@ def _build_config(ns: argparse.Namespace) -> Any:
     c.zed_only = ns.zed_only
     c.enable_neck_motor = ns.enable_neck_motor
     c.pose_zmq = ns.pose_zmq
+    c.neck_state_pub = ns.neck_state_pub  # type: ignore[attr-defined]
     return c
 
 
@@ -930,7 +1003,10 @@ def start_server(cfg: Any) -> None:
 
     neck_motor: Optional[NeckMotor] = None
     if cfg.enable_neck_motor:
-        neck_motor = NeckMotor(pose_zmq_addr=cfg.pose_zmq)
+        neck_motor = NeckMotor(
+            pose_zmq_addr=cfg.pose_zmq,
+            state_pub_addr=cfg.neck_state_pub,
+        )
         if not neck_motor.start():
             print("\033[91m[Neck] Failed to start; continuing without motor control.\033[0m")
             neck_motor = None

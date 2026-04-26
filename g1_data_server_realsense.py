@@ -50,6 +50,12 @@ WBC_HOST  = "localhost"   # Host running g1_deploy_onnx_ref (often same machine)
 WBC_PORT  = 5557          # deploy ZMQ state publisher port
 WBC_TOPIC = "g1_debug"
 
+# realsense_server.py NeckMotor present-position publisher (--neck-state-pub).
+# Empty string = recorder skips neck logging.
+NECK_STATE_ZMQ = os.environ.get(
+    "NECK_STATE_ZMQ", f"tcp://{REALSENSE_HOST}:5560"
+)
+
 DATA_FOLDER = os.path.expanduser("~/data")
 TASK_NAME   = "demonstration"
 FPS         = 30
@@ -116,6 +122,50 @@ class RealSenseClient:
     def close(self):
         self._sock.close()
         self._ctx.term()
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Neck-motor state subscriber  (ZMQ SUB → realsense_server.py NeckMotor)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class NeckStateReader:
+    """Subscribes to realsense_server.py NeckMotor present-position stream.
+
+    Wire format: JSON `[yaw_rad, pitch_rad]`. CONFLATE keeps only the newest
+    sample so the recorder always pairs the freshest motor reading with the
+    current frame.
+    """
+
+    def __init__(self, addr: str):
+        self._ctx = zmq.Context.instance()
+        self._sock = self._ctx.socket(zmq.SUB)
+        self._sock.setsockopt(zmq.CONFLATE, 1)
+        self._sock.setsockopt(zmq.SUBSCRIBE, b"")
+        self._sock.setsockopt(zmq.LINGER, 0)
+        self._sock.connect(addr)
+        self._latest = None
+        print(f"[NeckState] Subscribed to {addr}")
+
+    def get_latest(self):
+        """Return latest [yaw, pitch] in radians, or None if nothing seen yet."""
+        try:
+            raw = self._sock.recv(flags=zmq.NOBLOCK)
+        except zmq.Again:
+            return self._latest
+        try:
+            msg = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return self._latest
+        if isinstance(msg, (list, tuple)) and len(msg) >= 2:
+            self._latest = [float(msg[0]), float(msg[1])]
+        return self._latest
+
+    def close(self):
+        try:
+            self._sock.close(linger=0)
+        except Exception:
+            pass
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # WBC state subscriber  (ZMQ SUB → g1_deploy_onnx_ref port 5557)
@@ -340,6 +390,7 @@ class DataCollector:
         data_folder: str = DATA_FOLDER,
         task_name: str   = TASK_NAME,
         frequency: int   = FPS,
+        neck_reader: "NeckStateReader | None" = None,
     ):
         self._camera   = camera
         self._state    = state_reader
@@ -347,6 +398,7 @@ class DataCollector:
         self._task     = task_name
         self._freq     = frequency
         self._dt       = 1.0 / frequency
+        self._neck_reader = neck_reader
 
         self._ep_writer  = None
         self._ep_dir     = None
@@ -458,6 +510,17 @@ class DataCollector:
 
                     # Record if we have state (with or without RGB frame)
                     if state is not None:
+                        # Tag the latest neck motor present-position
+                        # (yaw_rad, pitch_rad) onto the state dict so it lands
+                        # in data.json under states['neck'].
+                        if self._neck_reader is not None:
+                            neck = self._neck_reader.get_latest()
+                            state["neck"] = (
+                                np.asarray(neck, dtype=np.float32)
+                                if neck is not None
+                                else np.zeros(2, dtype=np.float32)
+                            )
+
                         colors = {"rgb": frame} if frame is not None else None
                         self._ep_writer.add_item(
                             colors=colors,
@@ -490,10 +553,17 @@ class DataCollector:
 if __name__ == "__main__":
     camera       = RealSenseClient()
     state_reader = WBCStateReader()
-    collector    = DataCollector(camera, state_reader)
+    neck_reader  = NeckStateReader(NECK_STATE_ZMQ) if NECK_STATE_ZMQ else None
+    collector    = DataCollector(
+        camera,
+        state_reader,
+        neck_reader=neck_reader,
+    )
 
     try:
         collector.run()
     finally:
         camera.close()
         state_reader.close()
+        if neck_reader is not None:
+            neck_reader.close()
