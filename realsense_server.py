@@ -533,20 +533,23 @@ class NeckMotor:
         else:
             try:
                 import xrobotoolkit_sdk as xrt
-            except ImportError as e:
+                self._xrt = xrt
+                try:
+                    xrt.init()
+                    print("[Neck] XRoboToolkit SDK initialized (local).")
+                except Exception as e:
+                    print(
+                        f"[Neck] xrt.init() failed: {e}. Continuing in "
+                        f"passive mode (motors held at zero, present-position "
+                        f"still published)."
+                    )
+                    self._xrt = None
+            except ImportError:
                 print(
-                    f"\033[91m[Neck] xrobotoolkit_sdk missing: {e}. "
-                    f"Either install it, or use --pose-zmq to read pose "
-                    f"from a remote publisher.\033[0m"
+                    "[Neck] No pose source configured (xrobotoolkit_sdk not "
+                    "installed, --pose-zmq not set). Running passive: motors "
+                    "held at zero, present-position still published."
                 )
-                return False
-            self._xrt = xrt
-            try:
-                xrt.init()
-                print("[Neck] XRoboToolkit SDK initialized (local).")
-            except Exception as e:
-                print(f"\033[91m[Neck] xrt.init() failed: {e}\033[0m")
-                return False
 
         self._port = PortHandler(self.port_path)
         self._packet = PacketHandler(2.0)
@@ -649,6 +652,9 @@ class NeckMotor:
         last_status_print = 0.0
         last_warn_print = 0.0
         pose_valid = False
+        # Passive mode = no pose source configured; only present-position
+        # publishing is meaningful, so suppress "no headset data" warnings.
+        no_pose_source = self._pose_sub is None and self._xrt is None
         next_tick = time.time()
 
         while self._running:
@@ -677,13 +683,14 @@ class NeckMotor:
                     last_warn_print = now
 
             if not pose_ok:
-                now = time.time()
-                if pose_valid or now - last_warn_print > 5.0:
-                    print(
-                        "[Neck] no headset data yet "
-                        "(Pico not streaming / service down?)"
-                    )
-                    last_warn_print = now
+                if not no_pose_source:
+                    now = time.time()
+                    if pose_valid or now - last_warn_print > 5.0:
+                        print(
+                            "[Neck] no headset data yet "
+                            "(Pico not streaming / service down?)"
+                        )
+                        last_warn_print = now
                 pose_valid = False
                 # Hold current cmd — don't snap to zero.
                 yaw_target = yaw_cmd
@@ -873,10 +880,15 @@ def _parse_args() -> argparse.Namespace:
     )
 
     # Neck motor
+    p.set_defaults(enable_neck_motor=_env_bool("NECK_MOTOR", True))
     p.add_argument(
-        "--enable-neck-motor", action="store_true",
-        default=_env_bool("NECK_MOTOR", False),
-        help="Drive the 2-DOF neck (Dynamixel IDs 0=yaw, 1=pitch) from Pico headset pose",
+        "--enable-neck-motor", action="store_true", dest="enable_neck_motor",
+        help="Enable the 2-DOF neck (Dynamixel IDs 0=yaw, 1=pitch). "
+             "Required for present-position publishing. (default: on)",
+    )
+    p.add_argument(
+        "--no-enable-neck-motor", action="store_false", dest="enable_neck_motor",
+        help="Disable the neck motor",
     )
     p.add_argument(
         "--pose-zmq",
@@ -890,7 +902,7 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--neck-state-pub",
-        default=os.environ.get("NECK_STATE_PUB", ""),
+        default=os.environ.get("NECK_STATE_PUB", "tcp://*:5560"),
         help=(
             "ZMQ PUB bind address for the neck motor present-position stream "
             "(e.g. 'tcp://*:5560'). When set, [yaw_rad, pitch_rad] read from "
