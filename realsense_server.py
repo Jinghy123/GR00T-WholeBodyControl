@@ -82,10 +82,10 @@ NECK_YAW_LIMIT_DEG    = 60.0
 NECK_PITCH_LIMIT_DEG  = 45.0
 NECK_SMOOTH_ALPHA     = 0.3    # 0 = frozen, 1 = no smoothing
 NECK_CONTROL_HZ       = 50
-# Headset quaternion → Euler. Calibrate signs/order by watching real motor vs. head.
-NECK_EULER_ORDER      = "yxz"   # scipy convention; returns (yaw, pitch, roll)
-NECK_YAW_SIGN         = -1
-NECK_PITCH_SIGN       = -1
+# Sign multipliers applied to the SMPL-X-derived (yaw, pitch). Flip if the
+# motor moves opposite to the head.
+NECK_YAW_SIGN         = +1
+NECK_PITCH_SIGN       = +1
 
 ADDR_TORQUE_ENABLE    = 64
 ADDR_GOAL_POSITION    = 116
@@ -411,10 +411,15 @@ class PicoVideoStreamer:
 
 
 class NeckMotor:
-    """Reads Pico headset pose via xrobotoolkit_sdk and drives 2 Dynamixels.
+    """Subscribes to SMPL-X-derived neck angles over ZMQ and drives 2 Dynamixels.
+
+    The publisher (pose_publisher.py on the desktop) extracts neck yaw/pitch
+    from SMPL-X body data via `human_head_to_robot_neck`, which decouples
+    head rotation from torso lean. This class just consumes the resulting
+    `[neck_yaw, neck_pitch]` JSON message and writes the motors.
 
     Thread model:
-      _loop — CONTROL_HZ: poll xrt.get_headset_pose() → yaw/pitch → clamp →
+      _loop — CONTROL_HZ: read [yaw, pitch] from ZMQ SUB → sign/clamp →
               smooth → rad_to_tick → Dynamixel write. Periodic HW-error
               check + auto-reboot.
 
@@ -433,7 +438,6 @@ class NeckMotor:
         pitch_limit_rad: float = math.radians(NECK_PITCH_LIMIT_DEG),
         smooth_alpha: float = NECK_SMOOTH_ALPHA,
         control_hz: int = NECK_CONTROL_HZ,
-        euler_order: str = NECK_EULER_ORDER,
         yaw_sign: int = NECK_YAW_SIGN,
         pitch_sign: int = NECK_PITCH_SIGN,
         pose_zmq_addr: str = "",
@@ -448,7 +452,6 @@ class NeckMotor:
         self.pitch_limit_rad = pitch_limit_rad
         self.smooth_alpha = smooth_alpha
         self.control_hz = control_hz
-        self.euler_order = euler_order
         self.yaw_sign = yaw_sign
         self.pitch_sign = pitch_sign
         self.pose_zmq_addr = pose_zmq_addr
@@ -457,8 +460,6 @@ class NeckMotor:
         self._thread: Optional[threading.Thread] = None
         self._port = None
         self._packet = None
-        self._xrt = None
-        self._R = None
         self._pose_sub = None
         self._zmq_ctx = None
 
@@ -485,60 +486,42 @@ class NeckMotor:
         return False
 
     def start(self) -> bool:
-        """Open pose source + serial port, enable torque, spawn loop thread.
+        """Open ZMQ SUB + serial port, enable torque, spawn loop thread.
 
-        Pose source is either local xrobotoolkit_sdk (default) or a remote
-        ZMQ SUB socket when pose_zmq_addr is set.
+        Requires pose_zmq_addr — pose_publisher.py (running on the desktop
+        with body trackers + general_motion_retargeting) is the only
+        supported source of neck angles.
 
         Returns True on success, False on failure (caller should continue
         without motor control).
         """
         try:
             from dynamixel_sdk import PacketHandler, PortHandler
-            from scipy.spatial.transform import Rotation as R
         except ImportError as e:
             print(
                 f"\033[91m[Neck] Import failed: {e}. "
-                f"pip install dynamixel-sdk scipy.\033[0m"
+                f"pip install dynamixel-sdk.\033[0m"
             )
             return False
 
-        self._R = R
+        if not self.pose_zmq_addr:
+            print(
+                "\033[91m[Neck] --pose-zmq is required. Run pose_publisher.py "
+                "on the desktop and pass --pose-zmq tcp://<desktop-ip>:5559.\033[0m"
+            )
+            return False
 
-        if self.pose_zmq_addr:
-            # Remote pose source — skip local SDK.
-            self._zmq_ctx = zmq.Context.instance()
-            self._pose_sub = self._zmq_ctx.socket(zmq.SUB)
-            self._pose_sub.setsockopt(zmq.CONFLATE, 1)
-            self._pose_sub.setsockopt(zmq.SUBSCRIBE, b"")
-            self._pose_sub.setsockopt(zmq.RCVTIMEO, 100)
-            try:
-                self._pose_sub.connect(self.pose_zmq_addr)
-                print(
-                    f"[Neck] ZMQ SUB pose source: {self.pose_zmq_addr}"
-                )
-            except Exception as e:
-                print(
-                    f"\033[91m[Neck] ZMQ connect failed: {e}\033[0m"
-                )
-                return False
-        else:
-            try:
-                import xrobotoolkit_sdk as xrt
-            except ImportError as e:
-                print(
-                    f"\033[91m[Neck] xrobotoolkit_sdk missing: {e}. "
-                    f"Either install it, or use --pose-zmq to read pose "
-                    f"from a remote publisher.\033[0m"
-                )
-                return False
-            self._xrt = xrt
-            try:
-                xrt.init()
-                print("[Neck] XRoboToolkit SDK initialized (local).")
-            except Exception as e:
-                print(f"\033[91m[Neck] xrt.init() failed: {e}\033[0m")
-                return False
+        self._zmq_ctx = zmq.Context.instance()
+        self._pose_sub = self._zmq_ctx.socket(zmq.SUB)
+        self._pose_sub.setsockopt(zmq.CONFLATE, 1)
+        self._pose_sub.setsockopt(zmq.SUBSCRIBE, b"")
+        self._pose_sub.setsockopt(zmq.RCVTIMEO, 100)
+        try:
+            self._pose_sub.connect(self.pose_zmq_addr)
+            print(f"[Neck] ZMQ SUB neck-angle source: {self.pose_zmq_addr}")
+        except Exception as e:
+            print(f"\033[91m[Neck] ZMQ connect failed: {e}\033[0m")
+            return False
 
         self._port = PortHandler(self.port_path)
         self._packet = PacketHandler(2.0)
@@ -583,20 +566,21 @@ class NeckMotor:
         )
         return True
 
-    def _read_pose(self):
-        """Return 7-vector [x,y,z,qx,qy,qz,qw] or None."""
-        if self._pose_sub is not None:
-            try:
-                raw = self._pose_sub.recv(flags=0)
-            except zmq.Again:
-                return None
-            try:
-                return json.loads(raw.decode("utf-8"))
-            except (ValueError, UnicodeDecodeError):
-                return None
-        if self._xrt is not None:
-            return self._xrt.get_headset_pose()
-        return None
+    def _read_neck_angles(self):
+        """Return (yaw_rad, pitch_rad) from the ZMQ SUB, or None."""
+        if self._pose_sub is None:
+            return None
+        try:
+            raw = self._pose_sub.recv(flags=0)
+        except zmq.Again:
+            return None
+        try:
+            msg = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return None
+        if not isinstance(msg, (list, tuple)) or len(msg) < 2:
+            return None
+        return float(msg[0]), float(msg[1])
 
     def _loop(self) -> None:
         dt = 1.0 / self.control_hz
@@ -611,34 +595,28 @@ class NeckMotor:
         while self._running:
             next_tick += dt
 
-            # Read headset pose (local SDK or remote ZMQ SUB)
+            # Read SMPL-X-derived neck angles from the ZMQ publisher.
             yaw_target = yaw_cmd
             pitch_target = pitch_cmd
             pose_ok = False
             try:
-                pose = self._read_pose()
-                if pose is not None and len(pose) >= 7:
-                    qx, qy, qz, qw = pose[3], pose[4], pose[5], pose[6]
-                    # Skip zero-norm quats (stale / pre-stream).
-                    if (qx * qx + qy * qy + qz * qz + qw * qw) > 1e-6:
-                        euler = self._R.from_quat(
-                            [qx, qy, qz, qw]
-                        ).as_euler(self.euler_order)
-                        yaw_target = float(euler[0]) * self.yaw_sign
-                        pitch_target = float(euler[1]) * self.pitch_sign
-                        pose_ok = True
+                angles = self._read_neck_angles()
+                if angles is not None:
+                    yaw_target = angles[0] * self.yaw_sign
+                    pitch_target = angles[1] * self.pitch_sign
+                    pose_ok = True
             except Exception as e:
                 now = time.time()
                 if now - last_warn_print > 2.0:
-                    print(f"[Neck] headset read error: {e}")
+                    print(f"[Neck] neck-angle read error: {e}")
                     last_warn_print = now
 
             if not pose_ok:
                 now = time.time()
                 if pose_valid or now - last_warn_print > 5.0:
                     print(
-                        "[Neck] no headset data yet "
-                        "(Pico not streaming / service down?)"
+                        "[Neck] no neck data yet "
+                        "(pose_publisher.py running? trackers streaming?)"
                     )
                     last_warn_print = now
                 pose_valid = False
@@ -814,16 +792,19 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--enable-neck-motor", action="store_true",
         default=_env_bool("NECK_MOTOR", False),
-        help="Drive the 2-DOF neck (Dynamixel IDs 0=yaw, 1=pitch) from Pico headset pose",
+        help=(
+            "Drive the 2-DOF neck (Dynamixel IDs 0=yaw, 1=pitch) from "
+            "SMPL-X-derived neck angles published by pose_publisher.py."
+        ),
     )
     p.add_argument(
         "--pose-zmq",
         default=os.environ.get("POSE_ZMQ", ""),
         help=(
-            "ZMQ SUB address of a remote pose publisher, e.g. "
-            "'tcp://desktop-ip:5559'. When set, skip local xrobotoolkit_sdk "
-            "and read headset poses from this socket instead. Useful when the "
-            "XRoboToolKit PC Service daemon cannot run on the onboard PC."
+            "Required when --enable-neck-motor is set. ZMQ SUB address of "
+            "pose_publisher.py, which publishes [neck_yaw, neck_pitch] "
+            "extracted from SMPL-X body data. Example: "
+            "'tcp://desktop-ip:5559'."
         ),
     )
 

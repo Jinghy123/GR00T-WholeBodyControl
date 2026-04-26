@@ -145,6 +145,49 @@ class RealSenseClient:
         self._ctx.term()
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Neck-action subscriber  (ZMQ SUB → pose_publisher.py port 5559)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class NeckActionReader:
+    """Subscribes to pose_publisher.py's `[neck_yaw, neck_pitch]` stream.
+
+    Same socket the G1 NeckMotor consumes — connect a second SUB so the
+    recorder logs the exact value being sent to the motors. CONFLATE keeps
+    only the newest sample.
+    """
+
+    def __init__(self, addr: str):
+        self._ctx = zmq.Context.instance()
+        self._sock = self._ctx.socket(zmq.SUB)
+        self._sock.setsockopt(zmq.CONFLATE, 1)
+        self._sock.setsockopt(zmq.SUBSCRIBE, b"")
+        self._sock.setsockopt(zmq.LINGER, 0)
+        self._sock.connect(addr)
+        self._latest = None
+
+    def get_latest(self):
+        """Drain pending messages and return [yaw, pitch] in radians, or None."""
+        try:
+            raw = self._sock.recv(flags=zmq.NOBLOCK)
+        except zmq.Again:
+            return self._latest
+        try:
+            msg = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return self._latest
+        if isinstance(msg, (list, tuple)) and len(msg) >= 2:
+            self._latest = [float(msg[0]), float(msg[1])]
+        return self._latest
+
+    def close(self):
+        try:
+            self._sock.close(linger=0)
+        except Exception:
+            pass
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # WBC state subscriber  (ZMQ SUB → g1_deploy_onnx_ref port 5557)
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -430,6 +473,7 @@ class DataCollector:
         frequency: int   = FPS,
         hand_type: str   = "dex3",
         wuji_reader: "WujiHandStateReader | None" = None,
+        neck_reader: "NeckActionReader | None" = None,
     ):
         self._camera      = camera
         self._state       = state_reader
@@ -439,6 +483,7 @@ class DataCollector:
         self._dt          = 1.0 / frequency
         self._hand_type   = hand_type.lower()
         self._wuji_reader = wuji_reader
+        self._neck_reader = neck_reader
 
         self._ep_writer  = None
         self._ep_dir     = None
@@ -594,6 +639,17 @@ class DataCollector:
                                 state["hand_joints"]  = np.zeros(40, dtype=np.float32)
                                 action["hand_joints"] = np.zeros(40, dtype=np.float32)
 
+                        # Neck command (yaw, pitch in radians) — same value the
+                        # G1 NeckMotor is being driven by. Recorded alongside
+                        # body action so replay/analysis can reproduce head pose.
+                        if self._neck_reader is not None:
+                            neck_cmd = self._neck_reader.get_latest()
+                            action["neck"] = (
+                                np.asarray(neck_cmd, dtype=np.float32)
+                                if neck_cmd is not None
+                                else np.zeros(2, dtype=np.float32)
+                            )
+
                         self._ep_writer.add_item(
                             colors=colors or None,
                             states=state,
@@ -634,6 +690,13 @@ if __name__ == "__main__":
                     help=f"ZMQ SUB port for wuji state (default: {WUJI_STATE_PORT})")
     ap.add_argument("--no-camera", action="store_true",
                     help="Disable camera (useful for hand-only recording)")
+    ap.add_argument("--neck-zmq", type=str, default="",
+                    help=(
+                        "ZMQ SUB address of pose_publisher.py "
+                        "(e.g. tcp://<desktop-ip>:5559). When set, the "
+                        "[neck_yaw, neck_pitch] command is recorded into "
+                        "data.json under actions['neck']."
+                    ))
     args = ap.parse_args()
 
     camera       = None if args.no_camera else RealSenseClient()
@@ -641,18 +704,23 @@ if __name__ == "__main__":
     wuji_reader  = None
     if args.hand_type == "wuji":
         wuji_reader = WujiHandStateReader(host=args.wuji_state_host, port=args.wuji_state_port)
+    neck_reader  = NeckActionReader(args.neck_zmq) if args.neck_zmq else None
 
     collector = DataCollector(
         camera,
         state_reader,
         hand_type   = args.hand_type,
         wuji_reader = wuji_reader,
+        neck_reader = neck_reader,
     )
 
     try:
         collector.run()
     finally:
-        camera.close()
+        if camera is not None:
+            camera.close()
         state_reader.close()
         if wuji_reader is not None:
             wuji_reader.close()
+        if neck_reader is not None:
+            neck_reader.close()
