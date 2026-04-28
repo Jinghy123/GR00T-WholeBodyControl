@@ -1,7 +1,9 @@
 """
-Unified camera server (robot-side):
+Unified camera + neck-motor server (robot-side):
   - ZED egocentric camera  (left RGB + stereo L|R)
   - RealSense D405 wrist cameras (left, right)
+  - 2-DOF neck (Dynamixel IDs 0=yaw, 1=pitch on /dev/ttyUSB0), driven by the
+    SMPL-X-derived `[yaw, pitch]` stream from pose_publisher.py.
 
 ZMQ REP bind: tcp://192.168.123.164:5558
 Each request receives a 4-part multipart reply (all JPEG bytes, b"" if unavailable):
@@ -11,10 +13,25 @@ Each request receives a 4-part multipart reply (all JPEG bytes, b"" if unavailab
   Part 2 — Left wrist RGB JPEG     (D405 serial 218622276113)
   Part 3 — Right wrist RGB JPEG    (D405 serial 218622276849)
 
-Optional: H.264 TCP stream of ZED stereo to Pico VR (--enable-pico).
+Optional outputs:
+  - H.264 TCP stream of ZED stereo to Pico VR (--enable-pico).
+  - ZMQ PUB on tcp://*:5560 of neck motor present-position
+    `[yaw_rad, pitch_rad]`, for g1_data_server.py to record into data.json.
+    Toggle via --neck-state-pub (default on, '' to disable).
+
+Usage (full pipeline, on the robot):
+    python realsense_server.py \
+        --zmq-bind tcp://0.0.0.0:5558 \
+        --enable-pico --pico-ip <PICO_IP> \
+        --enable-neck-motor \
+        --pose-zmq tcp://<DESKTOP_IP>:5559
+
+ZED-only quick test (no D405 wrists):
+    python realsense_server.py --zed-only ...
 
 Environment overrides: ZMQ_BIND, ENABLE_PICO, PICO_IP, VIDEO_PORT,
-                      ZED_RESOLUTION, ZED_FPS, VR_WIDTH, VR_HEIGHT
+                      ZED_RESOLUTION, ZED_FPS, VR_WIDTH, VR_HEIGHT,
+                      POSE_ZMQ, NECK_MOTOR, NECK_STATE_PUB
 """
 
 from __future__ import annotations
@@ -84,11 +101,12 @@ NECK_SMOOTH_ALPHA     = 0.3    # 0 = frozen, 1 = no smoothing
 NECK_CONTROL_HZ       = 50
 # Sign multipliers applied to the SMPL-X-derived (yaw, pitch). Flip if the
 # motor moves opposite to the head.
-NECK_YAW_SIGN         = +1
-NECK_PITCH_SIGN       = +1
+NECK_YAW_SIGN         = -1
+NECK_PITCH_SIGN       = -1
 
 ADDR_TORQUE_ENABLE    = 64
 ADDR_GOAL_POSITION    = 116
+ADDR_PRESENT_POSITION = 132
 ADDR_HW_ERROR_STATUS  = 70
 TICKS_PER_REV         = 4096
 
@@ -441,6 +459,7 @@ class NeckMotor:
         yaw_sign: int = NECK_YAW_SIGN,
         pitch_sign: int = NECK_PITCH_SIGN,
         pose_zmq_addr: str = "",
+        state_pub_addr: str = "",
     ):
         self.port_path = port
         self.baud = baud
@@ -455,17 +474,23 @@ class NeckMotor:
         self.yaw_sign = yaw_sign
         self.pitch_sign = pitch_sign
         self.pose_zmq_addr = pose_zmq_addr
+        self.state_pub_addr = state_pub_addr
 
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._port = None
         self._packet = None
         self._pose_sub = None
+        self._state_pub = None
         self._zmq_ctx = None
 
     @staticmethod
     def _rad_to_tick(rad: float, zero_tick: int) -> int:
         return zero_tick + int(rad * TICKS_PER_REV / (2 * math.pi))
+
+    @staticmethod
+    def _tick_to_rad(tick: int, zero_tick: int) -> float:
+        return (tick - zero_tick) * (2 * math.pi) / TICKS_PER_REV
 
     @staticmethod
     def _clamp(x: float, lo: float, hi: float) -> float:
@@ -553,6 +578,18 @@ class NeckMotor:
         )
         time.sleep(0.3)
 
+        if self.state_pub_addr:
+            self._state_pub = self._zmq_ctx.socket(zmq.PUB)
+            self._state_pub.setsockopt(zmq.SNDHWM, 1)
+            self._state_pub.setsockopt(zmq.LINGER, 0)
+            try:
+                self._state_pub.bind(self.state_pub_addr)
+                print(f"[Neck] State PUB bound: {self.state_pub_addr}")
+            except Exception as e:
+                print(f"\033[91m[Neck] State PUB bind failed: {e}\033[0m")
+                self._state_pub.close(linger=0)
+                self._state_pub = None
+
         self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -565,6 +602,26 @@ class NeckMotor:
             f"@ {self.control_hz}Hz\033[0m"
         )
         return True
+
+    def _read_present_state(self):
+        """Return (yaw_rad, pitch_rad) read from motors, or (None, None) on error."""
+        if self._packet is None or self._port is None:
+            return None, None
+        try:
+            yaw_tick, _, yerr = self._packet.read4ByteTxRx(
+                self._port, self.yaw_id, ADDR_PRESENT_POSITION
+            )
+            pitch_tick, _, perr = self._packet.read4ByteTxRx(
+                self._port, self.pitch_id, ADDR_PRESENT_POSITION
+            )
+            if yerr != 0 or perr != 0:
+                return None, None
+            return (
+                self._tick_to_rad(yaw_tick, self.yaw_zero_tick),
+                self._tick_to_rad(pitch_tick, self.pitch_zero_tick),
+            )
+        except Exception:
+            return None, None
 
     def _read_neck_angles(self):
         """Return (yaw_rad, pitch_rad) from the ZMQ SUB, or None."""
@@ -638,23 +695,27 @@ class NeckMotor:
             yaw_cmd += self.smooth_alpha * (yaw_target - yaw_cmd)
             pitch_cmd += self.smooth_alpha * (pitch_target - pitch_cmd)
 
-            # Write motors -- DISABLED: motors locked at zero position.
-            # The zero-pose write in start() already parked them at
-            # (yaw_zero_tick, pitch_zero_tick) with torque enabled, so they
-            # will hold there as long as the port stays open.
-            yaw_tick = self.yaw_zero_tick
-            pitch_tick = self.pitch_zero_tick
-            # yaw_tick = self._rad_to_tick(yaw_cmd, self.yaw_zero_tick)
-            # pitch_tick = self._rad_to_tick(pitch_cmd, self.pitch_zero_tick)
-            # try:
-            #     self._packet.write4ByteTxRx(
-            #         self._port, self.yaw_id, ADDR_GOAL_POSITION, yaw_tick
-            #     )
-            #     self._packet.write4ByteTxRx(
-            #         self._port, self.pitch_id, ADDR_GOAL_POSITION, pitch_tick
-            #     )
-            # except Exception as e:
-            #     print(f"[Neck] write error: {e}")
+            yaw_tick = self._rad_to_tick(yaw_cmd, self.yaw_zero_tick)
+            pitch_tick = self._rad_to_tick(pitch_cmd, self.pitch_zero_tick)
+            try:
+                self._packet.write4ByteTxRx(
+                    self._port, self.yaw_id, ADDR_GOAL_POSITION, yaw_tick
+                )
+                self._packet.write4ByteTxRx(
+                    self._port, self.pitch_id, ADDR_GOAL_POSITION, pitch_tick
+                )
+            except Exception as e:
+                print(f"[Neck] write error: {e}")
+
+            if self._state_pub is not None:
+                yaw_meas, pitch_meas = self._read_present_state()
+                if yaw_meas is not None:
+                    try:
+                        self._state_pub.send_string(
+                            json.dumps([yaw_meas, pitch_meas])
+                        )
+                    except Exception:
+                        pass
 
             now = time.time()
 
@@ -717,6 +778,12 @@ class NeckMotor:
                 except Exception:
                     pass
                 self._pose_sub = None
+            if self._state_pub is not None:
+                try:
+                    self._state_pub.close(linger=0)
+                except Exception:
+                    pass
+                self._state_pub = None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -807,6 +874,16 @@ def _parse_args() -> argparse.Namespace:
             "'tcp://desktop-ip:5559'."
         ),
     )
+    p.add_argument(
+        "--neck-state-pub",
+        default=os.environ.get("NECK_STATE_PUB", "tcp://*:5560"),
+        help=(
+            "ZMQ PUB bind address for the neck motor present-position stream "
+            "[yaw_rad, pitch_rad]. Read from the Dynamixels at the neck "
+            "control rate so a recorder can log it into data.json. "
+            "Set to empty string to disable. Default 'tcp://*:5560'."
+        ),
+    )
 
     # Network
     p.add_argument(
@@ -856,6 +933,7 @@ def _build_config(ns: argparse.Namespace) -> Any:
     c.zed_only = ns.zed_only
     c.enable_neck_motor = ns.enable_neck_motor
     c.pose_zmq = ns.pose_zmq
+    c.neck_state_pub = ns.neck_state_pub
     return c
 
 
@@ -911,7 +989,10 @@ def start_server(cfg: Any) -> None:
 
     neck_motor: Optional[NeckMotor] = None
     if cfg.enable_neck_motor:
-        neck_motor = NeckMotor(pose_zmq_addr=cfg.pose_zmq)
+        neck_motor = NeckMotor(
+            pose_zmq_addr=cfg.pose_zmq,
+            state_pub_addr=cfg.neck_state_pub,
+        )
         if not neck_motor.start():
             print("\033[91m[Neck] Failed to start; continuing without motor control.\033[0m")
             neck_motor = None

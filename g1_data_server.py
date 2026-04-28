@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
-G1 Data Collector — runs on laptop.
+G1 Data Collector — runs on the desktop / laptop.
 
-Data sources:
-  RGB frames  : ZMQ REQ → realsense_server.py on robot  (port 5558)
-  Robot state : ZMQ SUB → g1_deploy_onnx_ref output pub  (port 5557)
+Data sources (the recorder is the consumer; addresses are seen FROM the desktop):
+  RGB frames        : ZMQ REQ → realsense_server.py on the robot    (port 5558)
+  Robot body state  : ZMQ SUB → g1_deploy_onnx_ref on the robot     (port 5557)
+  Neck command      : ZMQ SUB → pose_publisher.py on the desktop   (port 5559) [opt]
+  Neck motor state  : ZMQ SUB → realsense_server.py on the robot   (port 5560) [opt]
+
+Output: per-episode folder under ~/data/<task>_<session>/episode_<N>/
+        with data.json (states + actions per frame) and color streams.
 
 Keyboard controls (single key, no Enter needed):
   s  → start recording a new episode
@@ -12,10 +17,36 @@ Keyboard controls (single key, no Enter needed):
   d  → stop recording and discard
   Ctrl-C → quit
 
-Setup:
-  Robot : realsense_server.py  (change its bind port to 5558)
-  Robot : g1_deploy_onnx_ref   (needs --output-type zmq or --output-type all)
-  Laptop: python g1_data_server.py
+Topology: G1 connects to the desktop over Ethernet at the fixed IP
+192.168.123.164. The recorder and the SMPL-X publisher both run on the
+desktop; everything else runs on the robot.
+
+Usage (typical run, with neck command + state recorded):
+    python g1_data_server.py \
+        --neck-zmq       tcp://localhost:5559 \
+        --neck-state-zmq tcp://192.168.123.164:5560
+
+(`--neck-zmq` points at pose_publisher.py running on the same desktop,
+so localhost is fine. `--neck-state-zmq` points at realsense_server.py
+on the robot.)
+
+Hand-only or hand-and-body recording is unchanged — pass --hand-type wuji
+plus --wuji-state-host to subscribe to wuji_hand_server.py.
+
+Environment overrides:
+  REALSENSE_HOST  default '192.168.123.164' (G1 Ethernet IP). Only override
+                  for laptop-only mock setups.
+  REALSENSE_PORT  default 5558.
+  NECK_STATE_ZMQ  default '' — same effect as --neck-state-zmq.
+
+NOTE: WBC_HOST is hardcoded to 'localhost'. With the WBC on the robot and
+the recorder on the desktop you must edit WBC_HOST in this file to
+'192.168.123.164' (it is not env-overridable yet).
+
+Required upstream processes for a real recording:
+  Robot  : realsense_server.py  (camera frames, neck control, state PUB)
+  Robot  : g1_deploy_onnx_ref   (--output-type zmq or all → body state PUB)
+  Desktop: pose_publisher.py    (SMPL-X neck angles → port 5559)
 """
 
 import datetime
@@ -48,8 +79,8 @@ def _rprint(msg):
     sys.stdout.write(msg + "\r\n")
     sys.stdout.flush()
 
-REALSENSE_HOST = "192.168.123.164"  # Robot IP for RealSense server
-REALSENSE_PORT = 5558               # Changed from 5556 to avoid collision
+REALSENSE_HOST = os.environ.get("REALSENSE_HOST", "192.168.123.164")  # Robot IP for RealSense server
+REALSENSE_PORT = int(os.environ.get("REALSENSE_PORT", "5558"))
                                     # NOTE: also update realsense_server.py bind port to 5558
 
 WBC_HOST  = "localhost"   # Host running g1_deploy_onnx_ref (often same machine)
@@ -168,6 +199,43 @@ class NeckActionReader:
 
     def get_latest(self):
         """Drain pending messages and return [yaw, pitch] in radians, or None."""
+        try:
+            raw = self._sock.recv(flags=zmq.NOBLOCK)
+        except zmq.Again:
+            return self._latest
+        try:
+            msg = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return self._latest
+        if isinstance(msg, (list, tuple)) and len(msg) >= 2:
+            self._latest = [float(msg[0]), float(msg[1])]
+        return self._latest
+
+    def close(self):
+        try:
+            self._sock.close(linger=0)
+        except Exception:
+            pass
+
+
+class NeckStateReader:
+    """Subscribes to realsense_server.py's neck present-position stream.
+
+    realsense_server.py reads ADDR_PRESENT_POSITION from both Dynamixels each
+    control tick and publishes JSON `[yaw_rad, pitch_rad]` on a PUB socket
+    (default `tcp://*:5560`). CONFLATE keeps only the newest sample.
+    """
+
+    def __init__(self, addr: str):
+        self._ctx = zmq.Context.instance()
+        self._sock = self._ctx.socket(zmq.SUB)
+        self._sock.setsockopt(zmq.CONFLATE, 1)
+        self._sock.setsockopt(zmq.SUBSCRIBE, b"")
+        self._sock.setsockopt(zmq.LINGER, 0)
+        self._sock.connect(addr)
+        self._latest = None
+
+    def get_latest(self):
         try:
             raw = self._sock.recv(flags=zmq.NOBLOCK)
         except zmq.Again:
@@ -474,16 +542,18 @@ class DataCollector:
         hand_type: str   = "dex3",
         wuji_reader: "WujiHandStateReader | None" = None,
         neck_reader: "NeckActionReader | None" = None,
+        neck_state_reader: "NeckStateReader | None" = None,
     ):
-        self._camera      = camera
-        self._state       = state_reader
-        self._folder      = data_folder
-        self._task        = task_name
-        self._freq        = frequency
-        self._dt          = 1.0 / frequency
-        self._hand_type   = hand_type.lower()
-        self._wuji_reader = wuji_reader
-        self._neck_reader = neck_reader
+        self._camera            = camera
+        self._state             = state_reader
+        self._folder            = data_folder
+        self._task              = task_name
+        self._freq              = frequency
+        self._dt                = 1.0 / frequency
+        self._hand_type         = hand_type.lower()
+        self._wuji_reader       = wuji_reader
+        self._neck_reader       = neck_reader
+        self._neck_state_reader = neck_state_reader
 
         self._ep_writer  = None
         self._ep_dir     = None
@@ -650,6 +720,14 @@ class DataCollector:
                                 else np.zeros(2, dtype=np.float32)
                             )
 
+                        if self._neck_state_reader is not None:
+                            neck_state = self._neck_state_reader.get_latest()
+                            state["neck"] = (
+                                np.asarray(neck_state, dtype=np.float32)
+                                if neck_state is not None
+                                else np.zeros(2, dtype=np.float32)
+                            )
+
                         self._ep_writer.add_item(
                             colors=colors or None,
                             states=state,
@@ -697,21 +775,32 @@ if __name__ == "__main__":
                         "[neck_yaw, neck_pitch] command is recorded into "
                         "data.json under actions['neck']."
                     ))
+    ap.add_argument("--neck-state-zmq", type=str,
+                    default=os.environ.get("NECK_STATE_ZMQ", ""),
+                    help=(
+                        "ZMQ SUB address of realsense_server.py's neck "
+                        "present-position publisher (typically "
+                        "tcp://192.168.123.164:5560 — the G1's Ethernet IP). "
+                        "When set, the measured [yaw, pitch] is recorded "
+                        "into data.json under states['neck']."
+                    ))
     args = ap.parse_args()
 
-    camera       = None if args.no_camera else RealSenseClient()
-    state_reader = WBCStateReader()
-    wuji_reader  = None
+    camera             = None if args.no_camera else RealSenseClient()
+    state_reader       = WBCStateReader()
+    wuji_reader        = None
     if args.hand_type == "wuji":
         wuji_reader = WujiHandStateReader(host=args.wuji_state_host, port=args.wuji_state_port)
-    neck_reader  = NeckActionReader(args.neck_zmq) if args.neck_zmq else None
+    neck_reader        = NeckActionReader(args.neck_zmq) if args.neck_zmq else None
+    neck_state_reader  = NeckStateReader(args.neck_state_zmq) if args.neck_state_zmq else None
 
     collector = DataCollector(
         camera,
         state_reader,
-        hand_type   = args.hand_type,
-        wuji_reader = wuji_reader,
-        neck_reader = neck_reader,
+        hand_type         = args.hand_type,
+        wuji_reader       = wuji_reader,
+        neck_reader       = neck_reader,
+        neck_state_reader = neck_state_reader,
     )
 
     try:
@@ -724,3 +813,5 @@ if __name__ == "__main__":
             wuji_reader.close()
         if neck_reader is not None:
             neck_reader.close()
+        if neck_state_reader is not None:
+            neck_state_reader.close()

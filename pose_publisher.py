@@ -15,7 +15,7 @@ at this publisher.
 
 Prereqs (desktop):
     conda activate gmr
-    # see TOPOLOGY2_QUICKSTART.md for the gmr install steps.
+    # see NECK_TELEOP_GUIDE.md for the gmr install steps.
 
 Usage:
     python pose_publisher.py --bind tcp://0.0.0.0:5559 --hz 50 \
