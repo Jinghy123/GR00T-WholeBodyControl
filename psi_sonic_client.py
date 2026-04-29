@@ -4,6 +4,7 @@ import time
 import threading
 import json
 import signal
+from collections import deque
 
 import cv2
 import numpy as np
@@ -12,19 +13,19 @@ import msgpack
 import requests
 import json_numpy
 
-json_numpy.patch()
-
 # Add project root to path for imports
-_GROOT_ROOT = os.path.expanduser("~/hsc/GR00T-WholeBodyControl")
-sys.path.insert(0, _GROOT_ROOT)
+# _GROOT_ROOT = os.path.expanduser("~/hsc/GR00T-WholeBodyControl")
+# sys.path.insert(0, _GROOT_ROOT)
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
     pack_pose_message,
     build_command_message,
 )
 from encoder_client import EncoderClient
 
+json_numpy.patch()
+
 # ---------------- Configuration ----------------
-TASK_INSTRUCTION = "pick bottle and turn and pour into cup"
+TASK_INSTRUCTION = "default/pick_bottle_and_turn_and_pour_into_cup"
 
 # FSQ configuration (must match g1_sonic_client / encoder)
 FSQ_MIN = -0.625
@@ -38,7 +39,7 @@ FREQ_POLICY = 30  # Hz
 ACTION_DIM = 78
 
 # Encoder model path (for frozen token between chunks)
-ENCODER_MODEL = os.path.join(_GROOT_ROOT, "gear_sonic_deploy/policy/release/model_encoder.onnx")
+ENCODER_MODEL = "gear_sonic_deploy/policy/release/model_encoder.onnx"
 
 # Joint order conversion: WBC publishes in Mujoco order, encoder expects IsaacLab order
 _MUJOCO_TO_ISAACLAB_DOF = np.array(
@@ -87,7 +88,7 @@ class RSCamera:
 class RobotStateSubscriber:
     """Subscribe to robot state published by g1_deploy_onnx_ref on ZMQ PUB port."""
 
-    def __init__(self, host="localhost", port=5557, topic="g1_debug"):
+    def __init__(self, host="localhost", port=5557, topic="g1_debug", queue_size=30):
         self._context = zmq.Context()
         self._socket = self._context.socket(zmq.SUB)
         self._socket.connect(f"tcp://{host}:{port}")
@@ -97,7 +98,7 @@ class RobotStateSubscriber:
 
         self._topic = topic
         self._lock = threading.Lock()
-        self._latest_state = None
+        self._state_queue = deque(maxlen=queue_size)
         self._running = True
         self._thread = threading.Thread(target=self._recv_loop, daemon=True)
         self._thread.start()
@@ -120,13 +121,36 @@ class RobotStateSubscriber:
             try:
                 state = msgpack.unpackb(payload, raw=False)
                 with self._lock:
-                    self._latest_state = state
+                    self._state_queue.append(state)
             except Exception as e:
                 print(f"[StateSubscriber] Unpack error: {e}")
 
     def get_state(self):
+        """Return the latest robot state dict, or None if queue is empty."""
         with self._lock:
-            return self._latest_state
+            return self._state_queue[-1] if self._state_queue else None
+
+    def get_all_states(self):
+        """Return a list of all queued robot states, padded with earliest frame to reach queue_size."""
+        with self._lock:
+            if not self._state_queue:
+                return []
+            states = list(self._state_queue)
+            if len(states) < self._state_queue.maxlen:
+                earliest = states[0]
+                padding = [earliest] * (self._state_queue.maxlen - len(states))
+                return padding + states
+            return states
+
+    def get_state_queue(self):
+        """Return a copy of the state queue (as deque)."""
+        with self._lock:
+            return deque(self._state_queue)
+
+    def clear_states(self):
+        """Clear all queued states."""
+        with self._lock:
+            self._state_queue.clear()
 
     def stop(self):
         self._running = False
@@ -208,13 +232,20 @@ class PsiSonicClient:
     # ---------- Policy request ----------
     def _build_observation_payload(self):
         """Capture current state + frame, build payload dict (json_numpy-aware)."""
-        state = self._state_sub.get_state()
-        assert state is not None, "Robot state not available"
+        # state = self._state_sub.get_state()
+        # assert state is not None, "Robot state not available"
+        states = self._state_sub.get_all_states()
+        assert len(states) > 0, "No robot states available"
 
-        body_q = np.array(state["body_q_measured"], dtype=np.float32)
-        left_hand_states = np.array(state["left_hand_q"], dtype=np.float32)
-        right_hand_states = np.array(state["right_hand_q"], dtype=np.float32)
-        states = np.concatenate((body_q, left_hand_states, right_hand_states), axis=0)
+        state_list = []
+        for state in states:
+            body_q = np.array(state["body_q_measured"], dtype=np.float32)
+            left_hand_states = np.array(state["left_hand_q"], dtype=np.float32)
+            right_hand_states = np.array(state["right_hand_q"], dtype=np.float32)
+            state = np.concatenate((body_q, left_hand_states, right_hand_states), axis=0)
+            state_list.append(state)
+        
+        states_np = np.stack(state_list, axis=0)  # (N, 29)
 
         frame = self._camera.get_frame()
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -222,7 +253,7 @@ class PsiSonicClient:
 
         payload = {
             "image": {"observation.images.egocentric": frame},
-            "state": {"states": states.reshape(1, -1)},
+            "state": {"states": states_np},
             "gt_action": None,
             "dataset_name": None,
             "instruction": self._instruction,
@@ -435,7 +466,7 @@ class PsiSonicClient:
 
 # ---------------- Main ----------------
 def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_topic,
-         camera_address, instruction):
+         camera_address, instruction, state_history_length=1):
     print("[MAIN] Initializing components...")
 
     # 1. Initialize token publisher (ZMQ PUB, Protocol v4)
@@ -443,7 +474,7 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
     print(f"[MAIN] TokenPublisher bound on port {zmq_pub_port}, topic='{zmq_topic}'")
 
     # 2. Initialize robot state subscriber (ZMQ SUB)
-    state_sub = RobotStateSubscriber(host=zmq_host, port=zmq_sub_port, topic=zmq_sub_topic)
+    state_sub = RobotStateSubscriber(host=zmq_host, port=zmq_sub_port, topic=zmq_sub_topic, queue_size=state_history_length)
     print(f"[MAIN] State subscriber connected to {zmq_host}:{zmq_sub_port}, topic='{zmq_sub_topic}'")
 
     # 3. Initialize camera
@@ -521,6 +552,8 @@ if __name__ == "__main__":
                         help="Camera ZMQ address")
     parser.add_argument("--instruction", type=str, default=None,
                         help="Task instruction for VLA policy")
+    parser.add_argument("--state-history-length", type=int, default=1,
+                        help="Number of past frames to include in state history")
 
     args = parser.parse_args()
 
@@ -536,4 +569,5 @@ if __name__ == "__main__":
         zmq_sub_topic=args.zmq_sub_topic,
         camera_address=args.camera_address,
         instruction=instruction,
+        state_history_length=args.state_history_length,
     )

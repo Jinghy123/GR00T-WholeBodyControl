@@ -3,10 +3,15 @@
 # Environment setup script to replace shell.nix functionality
 # Source this file: source scripts/setup_env.sh
 
-# Preserve original PATH to prevent zsh from corrupting it
-_ORIGINAL_PATH="$PATH"
-
 echo "🔧 Setting up G1 Deploy environment..."
+
+# Ensure core system binaries are available even if PATH is partially broken
+CORE_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+if [ -n "$PATH" ]; then
+    export PATH="$CORE_PATH:$PATH"
+else
+    export PATH="$CORE_PATH"
+fi
 
 # Run jetson_clocks on Jetson systems (bare-metal only)
 if command -v jetson_clocks &> /dev/null; then
@@ -33,10 +38,10 @@ ONNX_RUNTIME_PATHS=(
 )
 
 ONNX_FOUND=false
-for path in "${ONNX_RUNTIME_PATHS[@]}"; do
-    if [ -d "$path" ]; then
-        export onnxruntime_DIR="$path/lib/cmake/onnxruntime"
-        echo "✅ ONNX Runtime found at: $path"
+for onnx_path in "${ONNX_RUNTIME_PATHS[@]}"; do
+    if [ -d "$onnx_path" ]; then
+        export onnxruntime_DIR="$onnx_path/lib/cmake/onnxruntime"
+        echo "✅ ONNX Runtime found at: $onnx_path"
         ONNX_FOUND=true
         break
     fi
@@ -126,6 +131,13 @@ export OPENSSL_ROOT_DIR="/usr"
 # ROS2 Environment Setup - dynamically find ROS2 installation
 ROS2_FOUND=false
 
+# Source the ROS setup file that matches the current shell
+if [ -n "$ZSH_VERSION" ]; then
+    ROS2_SETUP_FILE="setup.zsh"
+else
+    ROS2_SETUP_FILE="setup.bash"
+fi
+
 # Common ROS2 distributions in order of preference (newest first)
 ROS2_DISTROS=("jazzy" "iron" "humble" "galactic" "foxy" "eloquent" "dashing" "crystal")
 ROS2_INSTALL_PATHS=("/opt/ros" "/usr/local/ros" "$HOME/ros2_ws/install")
@@ -136,7 +148,7 @@ for install_path in "${ROS2_INSTALL_PATHS[@]}"; do
     fi
     
     for distro in "${ROS2_DISTROS[@]}"; do
-        ros2_setup_file="$install_path/$distro/setup.bash"
+        ros2_setup_file="$install_path/$distro/$ROS2_SETUP_FILE"
         if [ -f "$ros2_setup_file" ]; then
             source "$ros2_setup_file"
             export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
@@ -249,7 +261,7 @@ setup_cuda_toolkit() {
         if [ -f "$cuda_path/bin/nvcc" ]; then
             export CUDAToolkit_ROOT="$cuda_path"
             export CUDA_HOME="$cuda_path"  # Alternative name CMake might use
-            export PATH="$cuda_path/bin:$_ORIGINAL_PATH"
+            export PATH="$cuda_path/bin:$PATH"
             export LD_LIBRARY_PATH="$cuda_path/lib64:$cuda_path/lib:$LD_LIBRARY_PATH"
             echo "✅ CUDA toolkit found at: $CUDAToolkit_ROOT"
             echo "   Added to PATH: $cuda_path/bin"
@@ -346,14 +358,5 @@ echo ""
 # Optional: Add this setup to the current shell session persistence
 if [ -n "$BASH_VERSION" ]; then
     export PS1="(g1_deploy) $PS1"
-elif [ -n "$ZSH_VERSION" ]; then
-    # For zsh with oh-my-zsh, use precmd hook to prepend prefix to prompt
-    _g1_deploy_precmd() {
-        # Prepend the prefix only if not already there
-        if [[ "$PROMPT" != *"(g1_deploy)"* ]]; then
-            PROMPT="(g1_deploy) ${PROMPT}"
-        fi
-    }
-    precmd_functions+=(_g1_deploy_precmd)
 fi
 
