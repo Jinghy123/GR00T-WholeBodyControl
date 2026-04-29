@@ -2179,7 +2179,8 @@ class G1Deploy {
       std::string zmq_out_topic = "g1_debug",
       bool enable_motion_recording = false,
       std::array<double, 3> initial_compliance = {0.05, 0.05, 0.0},
-      double initial_max_close_ratio = 1.0)
+      double initial_max_close_ratio = 1.0,
+      std::string default_motion_name = "")
       : time_(0.0),
         publish_dt_(0.002),
         control_dt_(0.02),
@@ -2287,7 +2288,22 @@ class G1Deploy {
         if (!motion_reader_.motions.empty()) {
           std::cout << "✓ Motion data loaded successfully!" << std::endl;
           // motion_reader_.PrintSummary();
-          motion_reader_.current_motion_index_ = 0;
+
+          // Find the default motion by name
+          int default_motion_index = 0;
+          for (size_t i = 0; i < motion_reader_.motions.size(); i++) {
+            if (motion_reader_.motions[i]->name == default_motion_name) {
+              default_motion_index = i;
+              std::cout << "✓ Found default motion '" << default_motion_name << "' at index " << i << std::endl;
+              break;
+            }
+          }
+          if (default_motion_index == 0 && motion_reader_.motions[0]->name != default_motion_name) {
+            std::cout << "⚠ Warning: Default motion '" << default_motion_name << "' not found, using index 0 ("
+                      << motion_reader_.motions[0]->name << ")" << std::endl;
+          }
+
+          motion_reader_.current_motion_index_ = default_motion_index;
           std::string motion_name;
           {
             std::lock_guard<std::mutex> lock(current_motion_mutex_);
@@ -3822,7 +3838,7 @@ class G1Deploy {
 
       switch (program_state_) {
         case ProgramState::INIT:
-          if (!InitControl()) {
+        if (!InitControl()) {
             std::cout << "LowState is not available, waiting for robot to be ready" << std::endl;
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
           }
@@ -4169,6 +4185,7 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --max-close-ratio <value>: set initial hand max close ratio (0.2-1.0; default: 1.0 = full closure)" << std::endl;
     std::cout << "                             0.2 = limited (80% open), 1.0 = full closure allowed" << std::endl;
     std::cout << "                             Keyboard controls: x/c = +/- 0.1 (always available)" << std::endl;
+    std::cout << "  --default-motion <name>: set the default motion to load on startup (default: first motion alphabetically)" << std::endl;
     std::cout << "\nExamples:" << std::endl;
     std::cout << "  " << argv[0] << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --planner-file policy/planner.onnx --obs-config policy/single_frame/observation_config.yaml --disable-crc-check" << std::endl;
     std::cout << "  " << argv[0] << " enp5s0 policy/token/model.onnx reference/bones_072925_test/ --obs-config policy/token/observation_config.yaml --encoder-file policy/token/encoder.onnx" << std::endl;
@@ -4212,6 +4229,7 @@ int main(int argc, char const* argv[]) {
   std::string zmq_out_topic = "g1_debug";
   std::array<double, 3> initial_compliance = {0.5, 0.5, 0.0}; // initial compliance is 0.5 for both hands (keyboard controllable)
   double initial_max_close_ratio = 1.0; // default allows full closure, use --max-close-ratio to limit
+  std::string default_motion_name = "neutral_kick_R_001__A543"; // default motion to load on startup
   for (int i = 4; i < argc; i++) {
     if (std::string(argv[i]) == "--disable-crc-check") {
       disableCrcCheck = true;
@@ -4430,7 +4448,7 @@ int main(int argc, char const* argv[]) {
             std::cerr << "Error: --max-close-ratio must be between 0.2 and 1.0" << std::endl;
             exit(1);
           }
-          std::cout << "[INFO] Initial hand max close ratio set to: " << initial_max_close_ratio 
+          std::cout << "[INFO] Initial hand max close ratio set to: " << initial_max_close_ratio
                     << " (0.2 = limited, 1.0 = full closure)" << std::endl;
         } catch (...) {
           std::cerr << "Error: Invalid max close ratio value: " << argv[i + 1] << std::endl;
@@ -4439,6 +4457,15 @@ int main(int argc, char const* argv[]) {
         i++; // Skip the next argument since it's the ratio value
       } else {
         std::cerr << "Error: --max-close-ratio requires a value argument" << std::endl;
+        exit(1);
+      }
+    } else if (std::string(argv[i]) == "--default-motion") {
+      if (i + 1 < argc) {
+        default_motion_name = argv[i + 1];
+        std::cout << "[INFO] Default motion set to: " << default_motion_name << std::endl;
+        i++; // Skip the next argument since it's the motion name
+      } else {
+        std::cerr << "Error: --default-motion requires a motion name argument" << std::endl;
         exit(1);
       }
     }
@@ -4473,7 +4500,8 @@ int main(int argc, char const* argv[]) {
     zmq_out_topic,
     enableMotionRecording,
     initial_compliance,
-    initial_max_close_ratio
+    initial_max_close_ratio,
+    default_motion_name
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   
