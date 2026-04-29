@@ -118,13 +118,19 @@ pip install numpy opencv-python pyzmq dynamixel-sdk scipy
 No XRoboToolKit binding, no daemon, no gmr.
 
 #### 2. ZED SDK (JetPack 6.x / CUDA 12.6)
-Download the Jetson build matching your JetPack from
-[stereolabs.com/developers](https://www.stereolabs.com/developers/release).
-After installation:
+The installer is bundled in the repo for the G1's L4T 36.5 image:
+[ZED_SDK_Tegra_L4T36.5_v5.2.3.zstd.run](ZED_SDK_Tegra_L4T36.5_v5.2.3.zstd.run).
+
 ```bash
+cd $GR00T_ROOT
+chmod +x ZED_SDK_Tegra_L4T36.5_v5.2.3.zstd.run
+./ZED_SDK_Tegra_L4T36.5_v5.2.3.zstd.run        # follow the interactive prompts
 cd /usr/local/zed
 python get_python_api.py
 ```
+
+If your JetPack / CUDA version differs from L4T 36.5, fetch the matching
+build instead from [stereolabs.com/developers](https://www.stereolabs.com/developers/release).
 
 #### 3. Host / permissions
 ```bash
