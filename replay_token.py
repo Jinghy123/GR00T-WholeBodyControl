@@ -22,6 +22,10 @@ DEFAULT_ZMQ_HOST        = "*"
 DEFAULT_ZMQ_PUB_PORT    = 5556
 DEFAULT_ZMQ_TOPIC      = "pose"
 DEFAULT_RECORDING_FREQ = 30
+# ── Neck-motor replay (matches pose_publisher.py wire format) ──────────────────
+DEFAULT_ENABLE_NECK    = False
+DEFAULT_NECK_PUB_HOST  = "*"
+DEFAULT_NECK_PUB_PORT  = 5559
 # ──────────────────────────────────────────────────────────────────────────────
 
 import argparse
@@ -84,6 +88,63 @@ class TokenPublisher:
         self._context.term()
 
 
+class NeckPublisher:
+    """ZMQ PUB of `[neck_yaw, neck_pitch]` JSON for the G1 NeckMotor.
+
+    Wire format matches pose_publisher.py exactly (SNDHWM=1, LINGER=0,
+    payload = json.dumps([float(yaw), float(pitch)]).encode()), so
+    realsense_server.py's --pose-zmq subscriber consumes this stream
+    without any change. NOTE: stop pose_publisher.py before running
+    replay or the bind on port 5559 will collide.
+    """
+
+    def __init__(self, host=DEFAULT_NECK_PUB_HOST, port=DEFAULT_NECK_PUB_PORT):
+        self._ctx = zmq.Context()
+        self._sock = self._ctx.socket(zmq.PUB)
+        self._sock.setsockopt(zmq.SNDHWM, 1)
+        self._sock.setsockopt(zmq.LINGER, 0)
+        bind_addr = f"tcp://{host}:{port}"
+        try:
+            self._sock.bind(bind_addr)
+        except zmq.ZMQError as e:
+            self._sock.close(linger=0)
+            self._ctx.term()
+            raise RuntimeError(
+                f"NeckPublisher bind failed on {bind_addr}: {e}. "
+                f"Is pose_publisher.py still running? `pkill -f pose_publisher.py`"
+            ) from e
+        print(f"[NeckPublisher] PUB bound to {bind_addr}")
+        self._last = None
+
+    def publish(self, yaw, pitch):
+        msg = json.dumps([float(yaw), float(pitch)]).encode("utf-8")
+        self._sock.send(msg)
+        self._last = (float(yaw), float(pitch))
+
+    def publish_last(self):
+        """Re-publish the last sent value (used while holding the final token)."""
+        if self._last is not None:
+            self.publish(*self._last)
+
+    def stop(self):
+        self._sock.close(linger=0)
+        self._ctx.term()
+
+
+def _extract_neck(frame):
+    """Return (yaw_rad, pitch_rad) from frame.actions['neck'], or None if absent."""
+    actions = frame.get("actions") or {}
+    neck = actions.get("neck")
+    if neck is None:
+        return None
+    try:
+        if len(neck) >= 2:
+            return float(neck[0]), float(neck[1])
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
 # ── Load episode (new format: list of dict) ─────────────────────────────────
 
 def load_episode(episode_dir):
@@ -111,11 +172,23 @@ def load_episode(episode_dir):
 # ── Replay logic ──────────────────────────────────────────────────────────────
 
 def replay(episode_dir, zmq_host, zmq_pub_port, zmq_topic,
-           frequency, dry_run=False):
+           frequency, dry_run=False,
+           enable_neck=DEFAULT_ENABLE_NECK,
+           neck_pub_host=DEFAULT_NECK_PUB_HOST,
+           neck_pub_port=DEFAULT_NECK_PUB_PORT):
     frames, _ = load_episode(episode_dir)
     dt = 1.0 / frequency
 
     publisher = TokenPublisher(host=zmq_host, port=zmq_pub_port, topic=zmq_topic)
+
+    neck_publisher = None
+    if enable_neck and not dry_run:
+        n_with_neck = sum(1 for f in frames if _extract_neck(f) is not None)
+        if n_with_neck == 0:
+            print("[ReplayToken] --enable-neck set but no frame has actions['neck']; skipping neck replay.")
+        else:
+            print(f"[ReplayToken] Neck replay enabled: {n_with_neck}/{len(frames)} frames have neck data.")
+            neck_publisher = NeckPublisher(host=neck_pub_host, port=neck_pub_port)
 
     print("[ReplayToken] Waiting for ZMQ connections...")
     time.sleep(1.0)
@@ -156,6 +229,13 @@ def replay(episode_dir, zmq_host, zmq_pub_port, zmq_topic,
             if not dry_run:
                 publisher.publish_token(token, left_hand=left_hand, right_hand=right_hand)
 
+            if neck_publisher is not None:
+                neck = _extract_neck(frame)
+                if neck is not None:
+                    neck_publisher.publish(*neck)
+                else:
+                    neck_publisher.publish_last()  # hold last value if this frame is missing it
+
             last_token = token
             last_left_hand = left_hand
             last_right_hand = right_hand
@@ -173,6 +253,8 @@ def replay(episode_dir, zmq_host, zmq_pub_port, zmq_topic,
     except KeyboardInterrupt:
         print("\n[ReplayToken] Interrupted by user.")
         publisher.stop()
+        if neck_publisher is not None:
+            neck_publisher.stop()
         return
 
     print(f"\n[ReplayToken] Done. Sent {publisher._frame_index} frames.")
@@ -183,6 +265,8 @@ def replay(episode_dir, zmq_host, zmq_pub_port, zmq_topic,
             while True:
                 t0 = time.perf_counter()
                 publisher.publish_token(last_token, left_hand=last_left_hand, right_hand=last_right_hand)
+                if neck_publisher is not None:
+                    neck_publisher.publish_last()
                 sleep_t = dt - (time.perf_counter() - t0)
                 if sleep_t > 0:
                     time.sleep(sleep_t)
@@ -190,6 +274,8 @@ def replay(episode_dir, zmq_host, zmq_pub_port, zmq_topic,
             print("\n[ReplayToken] Hold interrupted by user.")
 
     publisher.stop()
+    if neck_publisher is not None:
+        neck_publisher.stop()
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
@@ -224,6 +310,19 @@ def main():
         "--dry-run", action="store_true",
         help="Load and iterate frames without sending anything (for testing)",
     )
+    parser.add_argument(
+        "--enable-neck", action="store_true", default=DEFAULT_ENABLE_NECK,
+        help="Replay actions['neck'] to the G1 NeckMotor over ZMQ PUB. "
+             "Stop pose_publisher.py before enabling — both bind port 5559.",
+    )
+    parser.add_argument(
+        "--neck-pub-host", type=str, default=DEFAULT_NECK_PUB_HOST,
+        help=f"Neck PUB bind host (default: {DEFAULT_NECK_PUB_HOST})",
+    )
+    parser.add_argument(
+        "--neck-pub-port", type=int, default=DEFAULT_NECK_PUB_PORT,
+        help=f"Neck PUB port (default: {DEFAULT_NECK_PUB_PORT})",
+    )
     args = parser.parse_args()
 
     replay(
@@ -233,6 +332,9 @@ def main():
         zmq_topic=args.zmq_topic,
         frequency=args.frequency,
         dry_run=args.dry_run,
+        enable_neck=args.enable_neck,
+        neck_pub_host=args.neck_pub_host,
+        neck_pub_port=args.neck_pub_port,
     )
 
 

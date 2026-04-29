@@ -28,6 +28,10 @@ DEFAULT_LATENCY_FRAMES = 30    # frames @ 30Hz to hold after each chunk
 DEFAULT_WBC_HOST       = "localhost"
 DEFAULT_WBC_PORT       = 5557
 DEFAULT_WBC_TOPIC      = "g1_debug"
+# ── Neck-motor replay (matches pose_publisher.py wire format) ─────────────────
+DEFAULT_ENABLE_NECK    = False
+DEFAULT_NECK_PUB_HOST  = "*"
+DEFAULT_NECK_PUB_PORT  = 5559
 # ── Encoder model ──────────────────────────────────────────────────────────────
 ENCODER_MODEL = "gear_sonic_deploy/policy/release/model_encoder.onnx"
 # ──────────────────────────────────────────────────────────────────────────────
@@ -141,6 +145,62 @@ class TokenPublisher:
         self._context.term()
 
 
+class NeckPublisher:
+    """ZMQ PUB of `[neck_yaw, neck_pitch]` JSON for the G1 NeckMotor.
+
+    Wire format matches pose_publisher.py exactly (SNDHWM=1, LINGER=0,
+    payload = json.dumps([float(yaw), float(pitch)]).encode()), so
+    realsense_server.py's --pose-zmq subscriber consumes this stream
+    without any change. NOTE: stop pose_publisher.py before running
+    replay or the bind on port 5559 will collide.
+    """
+
+    def __init__(self, host=DEFAULT_NECK_PUB_HOST, port=DEFAULT_NECK_PUB_PORT):
+        self._ctx = zmq.Context()
+        self._sock = self._ctx.socket(zmq.PUB)
+        self._sock.setsockopt(zmq.SNDHWM, 1)
+        self._sock.setsockopt(zmq.LINGER, 0)
+        bind_addr = f"tcp://{host}:{port}"
+        try:
+            self._sock.bind(bind_addr)
+        except zmq.ZMQError as e:
+            self._sock.close(linger=0)
+            self._ctx.term()
+            raise RuntimeError(
+                f"NeckPublisher bind failed on {bind_addr}: {e}. "
+                f"Is pose_publisher.py still running? `pkill -f pose_publisher.py`"
+            ) from e
+        print(f"[NeckPublisher] PUB bound to {bind_addr}")
+        self._last = None
+
+    def publish(self, yaw, pitch):
+        msg = json.dumps([float(yaw), float(pitch)]).encode("utf-8")
+        self._sock.send(msg)
+        self._last = (float(yaw), float(pitch))
+
+    def publish_last(self):
+        if self._last is not None:
+            self.publish(*self._last)
+
+    def stop(self):
+        self._sock.close(linger=0)
+        self._ctx.term()
+
+
+def _extract_neck(frame):
+    """Return (yaw_rad, pitch_rad) from frame.actions['neck'], or None if absent."""
+    actions = frame.get("actions") or {}
+    neck = actions.get("neck")
+    if neck is None:
+        return None
+    try:
+        if len(neck) >= 2:
+            return float(neck[0]), float(neck[1])
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
 def load_episode(episode_dir):
     json_path = os.path.join(episode_dir, "data.json")
     if not os.path.exists(json_path):
@@ -175,14 +235,21 @@ def _extract_tokens(frames):
             hand_joints = np.array(hand_joints, dtype=np.float32)
             left_hand = hand_joints[:7]
             right_hand = hand_joints[7:]
-        tokens.append((token, left_hand, right_hand))
+        neck = _extract_neck(frame)
+        tokens.append((token, left_hand, right_hand, neck))
     return tokens
 
 
-def _send_one(publisher, token, left_hand, right_hand, dt, dry_run):
+def _send_one(publisher, token, left_hand, right_hand, dt, dry_run,
+              neck_publisher=None, neck=None):
     t0 = time.perf_counter()
     if not dry_run:
         publisher.publish_token(token, left_hand=left_hand, right_hand=right_hand)
+        if neck_publisher is not None:
+            if neck is not None:
+                neck_publisher.publish(*neck)
+            else:
+                neck_publisher.publish_last()
     sleep_t = dt - (time.perf_counter() - t0)
     if sleep_t > 0:
         time.sleep(sleep_t)
@@ -215,13 +282,25 @@ def _compute_freeze_token(encoder, state_reader, last_token, last_left, last_rig
 def replay(episode_dir, zmq_host, zmq_pub_port, zmq_topic,
            frequency, chunk_size, latency_frames, dry_run=False,
            wbc_host=DEFAULT_WBC_HOST, wbc_port=DEFAULT_WBC_PORT,
-           wbc_topic=DEFAULT_WBC_TOPIC):
+           wbc_topic=DEFAULT_WBC_TOPIC,
+           enable_neck=DEFAULT_ENABLE_NECK,
+           neck_pub_host=DEFAULT_NECK_PUB_HOST,
+           neck_pub_port=DEFAULT_NECK_PUB_PORT):
     frames, _ = load_episode(episode_dir)
     dt = 1.0 / frequency
     tokens = _extract_tokens(frames)
     total = len(tokens)
 
     publisher = TokenPublisher(host=zmq_host, port=zmq_pub_port, topic=zmq_topic)
+
+    neck_publisher = None
+    if enable_neck and not dry_run:
+        n_with_neck = sum(1 for tup in tokens if tup[3] is not None)
+        if n_with_neck == 0:
+            print("[ReplayLatency] --enable-neck set but no token frame has actions['neck']; skipping neck replay.")
+        else:
+            print(f"[ReplayLatency] Neck replay enabled: {n_with_neck}/{total} token frames have neck data.")
+            neck_publisher = NeckPublisher(host=neck_pub_host, port=neck_pub_port)
 
     # Start WBC state reader and encoder (skip in dry-run)
     state_reader = None
@@ -248,13 +327,14 @@ def replay(episode_dir, zmq_host, zmq_pub_port, zmq_topic,
             chunk = tokens[chunk_idx * chunk_size : (chunk_idx + 1) * chunk_size]
 
             # ── EXECUTING: send chunk ─────────────────────────────────────
-            for j, (token, left_hand, right_hand) in enumerate(chunk):
+            for j, (token, left_hand, right_hand, neck) in enumerate(chunk):
                 frame_no = chunk_idx * chunk_size + j + 1
                 print(f"[ReplayLatency] chunk {chunk_idx+1}/{n_chunks}  frame {frame_no:4d}/{total}  [EXEC  ]", end="\r")
-                _send_one(publisher, token, left_hand, right_hand, dt, dry_run)
+                _send_one(publisher, token, left_hand, right_hand, dt, dry_run,
+                          neck_publisher=neck_publisher, neck=neck)
 
             # ── WAITING: encoder freeze token for latency_frames ticks ────
-            last_token, last_left, last_right = chunk[-1]
+            last_token, last_left, last_right, last_neck = chunk[-1]
             if not dry_run:
                 freeze_token, freeze_left, freeze_right = _compute_freeze_token(
                     encoder, state_reader, last_token, last_left, last_right
@@ -262,30 +342,38 @@ def replay(episode_dir, zmq_host, zmq_pub_port, zmq_topic,
             else:
                 freeze_token, freeze_left, freeze_right = last_token, last_left, last_right
 
+            # Hold the last neck angle through the wait (no encoder freeze
+            # equivalent — head stays where it was at end of chunk).
             for h in range(latency_frames):
                 print(f"[ReplayLatency] chunk {chunk_idx+1}/{n_chunks}  hold   {h+1:4d}/{latency_frames}  [WAITING]", end="\r")
-                _send_one(publisher, freeze_token, freeze_left, freeze_right, dt, dry_run)
+                _send_one(publisher, freeze_token, freeze_left, freeze_right, dt, dry_run,
+                          neck_publisher=neck_publisher, neck=last_neck)
 
     except KeyboardInterrupt:
         print("\n[ReplayLatency] Interrupted by user.")
         publisher.stop()
         if state_reader:
             state_reader.close()
+        if neck_publisher is not None:
+            neck_publisher.stop()
         return
 
     print(f"\n[ReplayLatency] Done. Sent {publisher._frame_index} frames.")
 
-    last_token, last_left, last_right = tokens[-1]
+    last_token, last_left, last_right, last_neck = tokens[-1]
     print("[ReplayLatency] Holding last token. Press Ctrl+C to stop.")
     try:
         while True:
-            _send_one(publisher, last_token, last_left, last_right, dt, dry_run)
+            _send_one(publisher, last_token, last_left, last_right, dt, dry_run,
+                      neck_publisher=neck_publisher, neck=last_neck)
     except KeyboardInterrupt:
         print("\n[ReplayLatency] Hold interrupted by user.")
 
     publisher.stop()
     if state_reader:
         state_reader.close()
+    if neck_publisher is not None:
+        neck_publisher.stop()
 
 
 def main():
@@ -312,6 +400,13 @@ def main():
                         help=f"WBC state publisher port (default: {DEFAULT_WBC_PORT})")
     parser.add_argument("--wbc-topic", type=str, default=DEFAULT_WBC_TOPIC,
                         help=f"WBC state topic (default: {DEFAULT_WBC_TOPIC})")
+    parser.add_argument("--enable-neck", action="store_true", default=DEFAULT_ENABLE_NECK,
+                        help="Replay actions['neck'] to the G1 NeckMotor over ZMQ PUB. "
+                             "Stop pose_publisher.py before enabling — both bind port 5559.")
+    parser.add_argument("--neck-pub-host", type=str, default=DEFAULT_NECK_PUB_HOST,
+                        help=f"Neck PUB bind host (default: {DEFAULT_NECK_PUB_HOST})")
+    parser.add_argument("--neck-pub-port", type=int, default=DEFAULT_NECK_PUB_PORT,
+                        help=f"Neck PUB port (default: {DEFAULT_NECK_PUB_PORT})")
     args = parser.parse_args()
 
     replay(
@@ -326,6 +421,9 @@ def main():
         wbc_host=args.wbc_host,
         wbc_port=args.wbc_port,
         wbc_topic=args.wbc_topic,
+        enable_neck=args.enable_neck,
+        neck_pub_host=args.neck_pub_host,
+        neck_pub_port=args.neck_pub_port,
     )
 
 
