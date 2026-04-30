@@ -195,3 +195,4 @@ teleop_vids/
 
 # XRoboToolkit installer packages (too large for GitHub)
 *.deb
+.claude/settings.local.json

@@ -95,7 +95,7 @@ ACTION_DIM = 78
 # Image buffer
 IMAGE_BUFFER_SIZE = 100
 
-# TASK_PROMPT = "pick up the bottle and place it on the left"
+# TASK_PROMPT = "pick up the green grapes and place it into the green bowl"
 TASK_PROMPT = "pick up the red box and pour water into the orange cup"
 
 def fsq_quantize(continuous_value, fsq_min=FSQ_MIN, fsq_max=FSQ_MAX, fsq_step=FSQ_STEP):
