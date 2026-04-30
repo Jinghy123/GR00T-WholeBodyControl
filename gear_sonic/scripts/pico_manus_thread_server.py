@@ -101,6 +101,9 @@ except ImportError as _retarget_err:
 M_to_unitree_hand = np.array(
     [[0, 1, 0, 0], [0, 0, -1, 0], [1, 0, 0, 0], [0, 0, 0, 1]], dtype=np.float64
 )
+# M_to_unitree_hand = np.array(
+#     [[0, 1, 0, 0], [0, 0, 1, 0], [1, 0, 0, 0], [0, 0, 0, 1]], dtype=np.float64
+# )
 
 try:
     from gear_sonic.utils.teleop.vis.vr3pt_pose_visualizer import VR3PtPoseVisualizer
@@ -701,6 +704,9 @@ def compute_hand_joints_from_manus(
     tip_idx = [24, 5, 10]  # thumb, index, middle (Manus 25-node layout)
     ref_left = unitree_left_hand[tip_idx].copy()
     ref_right = unitree_right_hand[tip_idx].copy()
+
+    ref_left[0, 2]  *= -1                                                         
+    ref_right[0, 2] *= -1
 
     # Per-tip scaling from vr_pico.py
     ref_left[0] *= 1.15
