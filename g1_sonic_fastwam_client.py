@@ -300,6 +300,7 @@ class PolicyClientManager:
         self._action_only = action_only
         self._client = None
         self._session_id = None
+        self._infer_lock = threading.Lock()
 
     def connect(self):
         """Connect to policy server and initialize session."""
@@ -324,7 +325,7 @@ class PolicyClientManager:
             print(f"[PolicyClient] Action-only mode: ON")
         print(f"[PolicyClient] Connected successfully!")
 
-    def get_action(self, images, state):
+    def get_action(self, images, state, rtc_metadata=None):
         """
         Send observation to policy server and get action.
 
@@ -349,11 +350,14 @@ class PolicyClientManager:
         if self._action_only:
             obs["action_only_inference"] = True
             obs["action_attend_to_noisy_video"] = False
+        if rtc_metadata:
+            obs.update(rtc_metadata)
 
         # Get action from policy server
         try:
             start = time.time()
-            action_from_policy = self._client.infer(obs)
+            with self._infer_lock:
+                action_from_policy = self._client.infer(obs)
             end = time.time()
             print(f"[PolicyClient] Inference time: {end - start:.4f} seconds")
 
@@ -403,9 +407,13 @@ class TokenPolicyClient:
                  wbc_host, wbc_port, wbc_topic,
                  action_only=False,
                  dry_run=False,
-                 max_chunks=0):
+                 max_chunks=0,
+                 enable_rtc_prefetch=False,
+                 rtc_prefetch_step=15):
         self._dry_run = bool(dry_run)
         self._max_chunks = max(0, int(max_chunks))
+        self._enable_rtc_prefetch = bool(enable_rtc_prefetch)
+        self._rtc_prefetch_step = max(1, int(rtc_prefetch_step))
 
         # Initialize components
         self._camera = RSCamera(host=camera_host, port=camera_port)
@@ -419,7 +427,17 @@ class TokenPolicyClient:
         self._sequence_done_event = threading.Event()
 
         self._pending_chunk: np.ndarray | None = None  # latest chunk from inference worker
+        self._pending_chunk_seq = 0
+        self._regular_request_inflight = False
         self._chunk_lock = threading.Lock()
+        self._prefetch_lock = threading.Lock()
+        self._prefetch_inflight = False
+        self._prefetch_chunk: np.ndarray | None = None
+        self._prefetch_elapsed_ticks: int | None = None
+        self._prefetch_start_time = 0.0
+        self._prefetch_start_step: int | None = None
+        self._prefetch_freeze_ticks = 0
+        self._last_rtc_elapsed_ticks: int | None = None
 
         self.image_buffer = deque(maxlen=IMAGE_BUFFER_SIZE)
         self.image_buffer_lock = threading.Lock()
@@ -456,24 +474,133 @@ class TokenPolicyClient:
         with self.image_buffer_lock:
             self.image_buffer.append(frame_rgb)
 
+    def _request_next_chunk(self, label="regular"):
+        with self._chunk_lock:
+            if self._regular_request_inflight:
+                return False
+            self._regular_request_inflight = True
+            self._sequence_done_event.set()
+        print(f"[Inference] Requested {label} policy chunk.")
+        return True
 
-    def _get_policy_chunk(self, frame_indices):
+    def _latest_image_from_buffer(self):
+        with self.image_buffer_lock:
+            if len(self.image_buffer) > 0:
+                return self.image_buffer[-1].copy()
+        self._get_image()
+        with self.image_buffer_lock:
+            return self.image_buffer[-1].copy()
+
+    def _get_policy_chunk(self, frame_indices, rtc_metadata=None, latest_only=False):
         """
         Capture current observation and query policy server.
         Returns np.ndarray of shape (N, action_dim), or None on failure.
         """
-        
-        with self.image_buffer_lock:
-            selected = [self.image_buffer[i].copy() for i in frame_indices]  # (T, H, W, 3)
-        selected = np.stack(selected, axis=0) # (T, H, W, 3) or (1, H, W, 3)
-        if len(frame_indices) == 1:
-            selected = selected[0]  # (H, W, 3)
+        if latest_only:
+            selected = self._latest_image_from_buffer()
+        else:
+            with self.image_buffer_lock:
+                selected = [self.image_buffer[i].copy() for i in frame_indices]  # (T, H, W, 3)
+            selected = np.stack(selected, axis=0) # (T, H, W, 3) or (1, H, W, 3)
+            if len(frame_indices) == 1:
+                selected = selected[0]  # (H, W, 3)
 
         state = self._state_reader.get_state()
         assert state is not None
 
-        action = self._policy_client.get_action(selected, state)
+        action = self._policy_client.get_action(selected, state, rtc_metadata=rtc_metadata)
         return action
+
+    def _start_rtc_prefetch(self, exec_steps):
+        if not self._enable_rtc_prefetch:
+            return False
+        exec_steps = int(exec_steps)
+        if exec_steps <= 0:
+            return False
+
+        with self._prefetch_lock:
+            if self._prefetch_inflight or self._prefetch_chunk is not None:
+                return False
+            self._prefetch_inflight = True
+            self._prefetch_chunk = None
+            self._prefetch_elapsed_ticks = None
+            self._prefetch_start_time = time.perf_counter()
+            self._prefetch_start_step = exec_steps
+            self._prefetch_freeze_ticks = 0
+
+        rtc_metadata = {
+            "rtc_prefetch": True,
+            "rtc_exec_steps": exec_steps,
+            "rtc_request_step": exec_steps,
+        }
+        if self._last_rtc_elapsed_ticks is not None:
+            rtc_metadata["rtc_client_elapsed_ticks"] = int(self._last_rtc_elapsed_ticks)
+
+        print(
+            f"[RTC] Prefetch start step={exec_steps} "
+            f"prev_elapsed_ticks={rtc_metadata.get('rtc_client_elapsed_ticks')}"
+        )
+
+        def _worker():
+            try:
+                t0 = time.perf_counter()
+                chunk = self._get_policy_chunk([-1], rtc_metadata=rtc_metadata, latest_only=True)
+                elapsed_s = time.perf_counter() - t0
+                elapsed_ticks = max(0, int(np.ceil(elapsed_s * FREQ_POLICY)))
+                if chunk is None:
+                    raise RuntimeError("RTC prefetch returned no chunk")
+                if not isinstance(chunk, np.ndarray) or chunk.ndim != 2 or chunk.shape[0] != ACTION_HORIZON:
+                    raise RuntimeError(f"RTC prefetch returned invalid chunk shape: {getattr(chunk, 'shape', None)}")
+                with self._prefetch_lock:
+                    self._prefetch_chunk = chunk
+                    self._prefetch_elapsed_ticks = elapsed_ticks
+                    self._prefetch_inflight = False
+                print(
+                    f"[RTC] Prefetch ready elapsed_ticks={elapsed_ticks} "
+                    f"shape={chunk.shape}"
+                )
+            except Exception as e:
+                with self._prefetch_lock:
+                    self._prefetch_inflight = False
+                    self._prefetch_chunk = None
+                    self._prefetch_elapsed_ticks = None
+                print(f"[RTC] Prefetch failed: {e}")
+
+        thread = threading.Thread(target=_worker, daemon=True)
+        thread.start()
+        return True
+
+    def _has_rtc_prefetch_inflight(self):
+        with self._prefetch_lock:
+            return self._prefetch_inflight
+
+    def _consume_rtc_prefetch(self, current_idx, current_chunk_len):
+        with self._prefetch_lock:
+            if self._prefetch_chunk is None:
+                return None
+            chunk = self._prefetch_chunk
+            elapsed_ticks = 0 if self._prefetch_elapsed_ticks is None else int(self._prefetch_elapsed_ticks)
+            freeze_ticks = int(self._prefetch_freeze_ticks)
+            self._prefetch_chunk = None
+            self._prefetch_elapsed_ticks = None
+            self._prefetch_start_step = None
+            self._prefetch_freeze_ticks = 0
+
+        handoff_idx = int(np.clip(elapsed_ticks, 0, max(0, len(chunk) - 1)))
+        ready_before_boundary = int(current_idx) < int(current_chunk_len)
+        self._last_rtc_elapsed_ticks = elapsed_ticks
+        print(
+            f"[RTC] Handoff elapsed_ticks={elapsed_ticks} handoff_idx={handoff_idx} "
+            f"ready_before_boundary={ready_before_boundary} freeze_ticks={freeze_ticks}"
+        )
+        return chunk, handoff_idx
+
+    def _increment_rtc_freeze_ticks(self):
+        with self._prefetch_lock:
+            if self._prefetch_inflight:
+                self._prefetch_freeze_ticks += 1
+                return self._prefetch_freeze_ticks
+            return self._prefetch_freeze_ticks
 
     def _log_action(self, actions: np.ndarray, dt: float) -> None:
 
@@ -517,7 +644,7 @@ class TokenPolicyClient:
                     frame_indices = RELATIVE_OFFSETS # get previous 4 frames relative to current step
                     with self.image_buffer_lock:
                         len_image_buffer = len(self.image_buffer)
-                    assert len_image_buffer == ACTION_HORIZON, f"Expected {ACTION_HORIZON} frames in image buffer, got {len_image_buffer}"
+                    assert len_image_buffer >= ACTION_HORIZON, f"Expected at least {ACTION_HORIZON} frames in image buffer, got {len_image_buffer}"
                 
                 t0 = time.time()
                 chunk = self._get_policy_chunk(frame_indices)
@@ -526,13 +653,19 @@ class TokenPolicyClient:
                     self._log_action(chunk, dt)
                     with self._chunk_lock:
                         self._pending_chunk = chunk
-                    self.image_buffer.clear()
+                        self._pending_chunk_seq += 1
+                        self._regular_request_inflight = False
+                    with self.image_buffer_lock:
+                        self.image_buffer.clear()
                     step += 1
                     self._sequence_done_event.clear()
                 else:
                     raise RuntimeError("[Inference] Failed to get chunk.")
             except RuntimeError as e:
                 print(f"[Inference] {e}")
+                with self._chunk_lock:
+                    self._regular_request_inflight = False
+                self._sequence_done_event.clear()
                 self._running.clear()
                 return
 
@@ -548,13 +681,14 @@ class TokenPolicyClient:
         chunks_seen = 0
 
         print("[DryRun] Requesting first policy inference; WBC publish is disabled.")
-        self._sequence_done_event.set()
+        self._request_next_chunk("initial dry-run")
         while self._sequence_done_event.is_set() and self._running.is_set():
             time.sleep(0.05)
 
         while self._running.is_set():
             with self._chunk_lock:
                 chunk = None if self._pending_chunk is None else self._pending_chunk.copy()
+                chunk_seq = self._pending_chunk_seq
             if chunk is None:
                 print("[DryRun] No chunk available; stopping.")
                 self._running.clear()
@@ -570,18 +704,60 @@ class TokenPolicyClient:
                 self._running.clear()
                 return
 
-            for _ in range(ACTION_HORIZON):
+            next_chunk = None
+            for step in range(ACTION_HORIZON):
                 if not self._running.is_set():
                     return
                 t_start = time.perf_counter()
                 self._get_image()
+                exec_steps = step + 1
+                if self._enable_rtc_prefetch and exec_steps == min(self._rtc_prefetch_step, ACTION_HORIZON):
+                    self._start_rtc_prefetch(exec_steps)
+                prefetched = self._consume_rtc_prefetch(exec_steps, ACTION_HORIZON)
+                if prefetched is not None:
+                    next_chunk, _ = prefetched
+                    break
                 elapsed = time.perf_counter() - t_start
                 sleep_time = dt - elapsed
                 if sleep_time > 0:
                     time.sleep(sleep_time)
 
-            self._sequence_done_event.set()
-            while self._sequence_done_event.is_set() and self._running.is_set():
+            if next_chunk is not None:
+                with self._chunk_lock:
+                    self._pending_chunk = next_chunk
+                    self._pending_chunk_seq += 1
+                continue
+
+            if self._enable_rtc_prefetch:
+                prefetched = self._consume_rtc_prefetch(ACTION_HORIZON, ACTION_HORIZON)
+                if prefetched is not None:
+                    next_chunk, _ = prefetched
+                    with self._chunk_lock:
+                        self._pending_chunk = next_chunk
+                        self._pending_chunk_seq += 1
+                    continue
+
+            if self._enable_rtc_prefetch and self._has_rtc_prefetch_inflight():
+                while self._running.is_set():
+                    prefetched = self._consume_rtc_prefetch(ACTION_HORIZON, ACTION_HORIZON)
+                    if prefetched is not None:
+                        next_chunk, _ = prefetched
+                        with self._chunk_lock:
+                            self._pending_chunk = next_chunk
+                            self._pending_chunk_seq += 1
+                        break
+                    freeze_ticks = self._increment_rtc_freeze_ticks()
+                    print(f"[RTC] Dry-run waiting for prefetch freeze_ticks={freeze_ticks}")
+                    time.sleep(dt)
+                if next_chunk is not None:
+                    continue
+
+            self._request_next_chunk("dry-run fallback")
+            while self._running.is_set():
+                with self._chunk_lock:
+                    ready = self._pending_chunk_seq > chunk_seq
+                if ready:
+                    break
                 time.sleep(0.05)
 
     def _publish_loop(self):
@@ -600,13 +776,18 @@ class TokenPolicyClient:
         # immediately once it arrives (matches psi_sonic_client pattern).
         self._token_publisher.send_command(start=True, stop=False, planner=True)
         print("[PublishLoop] Requesting first policy inference...")
-        self._sequence_done_event.set()
+        self._request_next_chunk("initial publish")
         while self._sequence_done_event.is_set() and self._running.is_set():
             time.sleep(0.05)
         if not self._running.is_set():
             return
         with self._chunk_lock:
             chunk = self._pending_chunk
+            chunk_seq = self._pending_chunk_seq
+        if chunk is None:
+            print("[PublishLoop] No initial chunk available; stopping.")
+            self._running.clear()
+            return
 
 
         idx = 0
@@ -616,12 +797,20 @@ class TokenPolicyClient:
 
         while self._running.is_set():
             t_start = time.perf_counter()
+            prefetch_step_after_capture = None
+
+            if self._enable_rtc_prefetch:
+                prefetched = self._consume_rtc_prefetch(idx, len(chunk))
+                if prefetched is not None:
+                    chunk, idx = prefetched
+                    frozen_action = None
 
             if idx < len(chunk):
                 # ── EXECUTING ──────────────────────────────────────────────
                 action = chunk[idx]
                 last_action = action.copy()
                 idx += 1
+                prefetch_step_after_capture = idx
                 using_last_action = False
             else:
                 # ── WAITING for next chunk ─────────────────────────────────
@@ -645,12 +834,28 @@ class TokenPolicyClient:
                     else:
                         frozen_action = last_action.copy()
                         print(f"[PublishLoop] Chunk done, no robot state — repeating last action.")
-                    self._sequence_done_event.set()
+                    if not self._enable_rtc_prefetch:
+                        self._request_next_chunk("boundary")
+                    elif not self._has_rtc_prefetch_inflight():
+                        self._request_next_chunk("rtc fallback")
                     idx += 1
 
-                if not self._sequence_done_event.is_set():  # means inference done
+                if self._enable_rtc_prefetch:
+                    prefetched = self._consume_rtc_prefetch(idx, len(chunk))
+                    if prefetched is not None:
+                        chunk, idx = prefetched
+                        frozen_action = None
+                        print(f"[PublishLoop] RTC chunk received: shape={chunk.shape}. Resuming execution.")
+                    elif not self._has_rtc_prefetch_inflight():
+                        self._request_next_chunk("rtc fallback")
+
+                with self._chunk_lock:
+                    regular_ready = self._pending_chunk_seq > chunk_seq
+
+                if regular_ready:
                     with self._chunk_lock:
                         chunk = self._pending_chunk
+                        chunk_seq = self._pending_chunk_seq
                     frozen_action = None
                     idx = 0
                     print(f"[PublishLoop] New chunk received: shape={chunk.shape}. "
@@ -660,10 +865,20 @@ class TokenPolicyClient:
                     action = chunk[idx]
                     last_action = action.copy()
                     idx += 1
+                    prefetch_step_after_capture = idx
+                    using_last_action = False
+                elif self._enable_rtc_prefetch and idx < len(chunk):
+                    action = chunk[idx]
+                    last_action = action.copy()
+                    idx += 1
+                    prefetch_step_after_capture = idx
                     using_last_action = False
                 else:
                     action = frozen_action
                     using_last_action = True
+                    if self._enable_rtc_prefetch and self._has_rtc_prefetch_inflight():
+                        freeze_ticks = self._increment_rtc_freeze_ticks()
+                        print(f"[RTC] Waiting for prefetch freeze_ticks={freeze_ticks}")
 
             self._token_publisher.publish_token(action)
             
@@ -675,6 +890,11 @@ class TokenPolicyClient:
 
             if not using_last_action:
                 self._get_image()
+                if (
+                    self._enable_rtc_prefetch
+                    and prefetch_step_after_capture == min(self._rtc_prefetch_step, len(chunk))
+                ):
+                    self._start_rtc_prefetch(prefetch_step_after_capture)
 
     def stop(self):
         """Stop the client."""
@@ -740,6 +960,10 @@ def main():
                        help="Query policy chunks and camera/state at 30Hz without sending WBC start/stop/token messages")
     parser.add_argument("--max-chunks", type=int, default=0,
                        help="Dry-run: stop after this many policy chunks; 0 means run until Ctrl+C")
+    parser.add_argument("--enable-rtc-prefetch", action="store_true",
+                       help="Start the next FastWAM inference mid-chunk with RTC metadata")
+    parser.add_argument("--rtc-prefetch-step", type=int, default=15,
+                       help="Action step at which to start RTC prefetch")
 
     args = parser.parse_args()
 
@@ -747,6 +971,8 @@ def main():
         print("[Main] Action-only mode enabled: video denoising will be skipped")
     if args.dry_run:
         print("[Main] Dry-run enabled: no WBC start/stop/token messages will be sent")
+    if args.enable_rtc_prefetch:
+        print(f"[Main] RTC prefetch enabled: step={args.rtc_prefetch_step}")
 
     # Create and start client
     client = TokenPolicyClient(
@@ -764,6 +990,8 @@ def main():
         action_only=args.action_only,
         dry_run=args.dry_run,
         max_chunks=args.max_chunks,
+        enable_rtc_prefetch=args.enable_rtc_prefetch,
+        rtc_prefetch_step=args.rtc_prefetch_step,
     )
 
     try:
