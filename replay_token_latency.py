@@ -31,7 +31,7 @@ DEFAULT_WBC_TOPIC      = "g1_debug"
 # ── Neck-motor replay (matches pose_publisher.py wire format) ─────────────────
 DEFAULT_ENABLE_NECK    = False
 DEFAULT_NECK_PUB_HOST  = "*"
-DEFAULT_NECK_PUB_PORT  = 5559
+DEFAULT_NECK_PUB_PORT  = 5570
 # ── Encoder model ──────────────────────────────────────────────────────────────
 ENCODER_MODEL = "gear_sonic_deploy/policy/release/model_encoder.onnx"
 # ──────────────────────────────────────────────────────────────────────────────
@@ -152,7 +152,7 @@ class NeckPublisher:
     payload = json.dumps([float(yaw), float(pitch)]).encode()), so
     realsense_server.py's --pose-zmq subscriber consumes this stream
     without any change. NOTE: stop pose_publisher.py before running
-    replay or the bind on port 5559 will collide.
+    replay or the bind on port 5570 will collide.
     """
 
     def __init__(self, host=DEFAULT_NECK_PUB_HOST, port=DEFAULT_NECK_PUB_PORT):
@@ -402,7 +402,8 @@ def main():
                         help=f"WBC state topic (default: {DEFAULT_WBC_TOPIC})")
     parser.add_argument("--enable-neck", action="store_true", default=DEFAULT_ENABLE_NECK,
                         help="Replay actions['neck'] to the G1 NeckMotor over ZMQ PUB. "
-                             "Stop pose_publisher.py before enabling — both bind port 5559.")
+                             "Stop pico_manus_thread_server.py (or pose_publisher.py if used) "
+                             "before enabling — both bind port 5570.")
     parser.add_argument("--neck-pub-host", type=str, default=DEFAULT_NECK_PUB_HOST,
                         help=f"Neck PUB bind host (default: {DEFAULT_NECK_PUB_HOST})")
     parser.add_argument("--neck-pub-port", type=int, default=DEFAULT_NECK_PUB_PORT,

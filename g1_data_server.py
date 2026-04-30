@@ -5,7 +5,8 @@ G1 Data Collector — runs on the desktop / laptop.
 Data sources (the recorder is the consumer; addresses are seen FROM the desktop):
   RGB frames        : ZMQ REQ → realsense_server.py on the robot    (port 5558)
   Robot body state  : ZMQ SUB → g1_deploy_onnx_ref on the robot     (port 5557)
-  Neck command      : ZMQ SUB → pose_publisher.py on the desktop   (port 5559) [opt]
+  Neck command      : ZMQ SUB → pico_manus_thread_server.py (or
+                       pose_publisher.py if neck-only) on the desktop  (port 5570) [opt]
   Neck motor state  : ZMQ SUB → realsense_server.py on the robot   (port 5560) [opt]
 
 Output: per-episode folder under ~/data/<task>_<session>/episode_<N>/
@@ -23,7 +24,7 @@ desktop; everything else runs on the robot.
 
 Usage (typical run, with neck command + state recorded):
     python g1_data_server.py \
-        --neck-zmq       tcp://localhost:5559 \
+        --neck-zmq       tcp://localhost:5570 \
         --neck-state-zmq tcp://192.168.123.164:5560
 
 (`--neck-zmq` points at pose_publisher.py running on the same desktop,
@@ -46,7 +47,10 @@ the recorder on the desktop you must edit WBC_HOST in this file to
 Required upstream processes for a real recording:
   Robot  : realsense_server.py  (camera frames, neck control, state PUB)
   Robot  : g1_deploy_onnx_ref   (--output-type zmq or all → body state PUB)
-  Desktop: pose_publisher.py    (SMPL-X neck angles → port 5559)
+  Desktop: pico_manus_thread_server.py  (Manus/Wuji teleop + neck angles
+                                         → ports 5556 / 5559 / 5570)
+           OR pose_publisher.py          (neck-only, alternative source
+                                         on port 5570)
 """
 
 import datetime
@@ -176,7 +180,8 @@ class RealSenseClient:
         self._ctx.term()
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Neck-action subscriber  (ZMQ SUB → pose_publisher.py port 5559)
+# Neck-action subscriber  (ZMQ SUB → pico_manus_thread_server.py or
+#                          pose_publisher.py, port 5570)
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -685,8 +690,13 @@ class DataCollector:
                         colors = {}
                         if ego is not None:        colors["rgb"]         = ego
                         if ego_stereo is not None: colors["stereo"]      = ego_stereo
-                        if lw is not None:         colors["left_wrist"]  = lw
-                        if rw is not None:         colors["right_wrist"] = rw
+                        # DISABLED: D405 wrist frames not recorded — wrists
+                        # are hard-off in realsense_server.py for now. Server
+                        # still pads the multipart reply so `lw` / `rw` are
+                        # always None here; the writes were no-ops anyway,
+                        # but the explicit skip makes the intent obvious.
+                        # if lw is not None:         colors["left_wrist"]  = lw
+                        # if rw is not None:         colors["right_wrist"] = rw
 
                         # If no body state, create minimal state/action with hand data
                         if state is None:
@@ -771,7 +781,7 @@ if __name__ == "__main__":
     ap.add_argument("--neck-zmq", type=str, default="",
                     help=(
                         "ZMQ SUB address of pose_publisher.py "
-                        "(e.g. tcp://<desktop-ip>:5559). When set, the "
+                        "(e.g. tcp://<desktop-ip>:5570). When set, the "
                         "[neck_yaw, neck_pitch] command is recorded into "
                         "data.json under actions['neck']."
                     ))

@@ -24,6 +24,7 @@
 
 from collections import defaultdict, deque
 from enum import Enum, IntEnum
+import json
 import os
 import subprocess
 import sys
@@ -113,6 +114,47 @@ try:
 except ImportError:
     print("Warning: get_g1_key_frame_poses not available (pyvista may not be installed).")
     get_g1_key_frame_poses = None
+
+# Neck publishing: convert xrt body pose array → smplx-style dict, then call
+# human_head_to_robot_neck (head rotation relative to spine in YXZ Euler) to
+# get [yaw, pitch] for the G1 NeckMotor. Same wire format as pose_publisher.py
+# so realsense_server.py --pose-zmq consumes the stream unchanged.
+try:
+    from general_motion_retargeting import human_head_to_robot_neck as _human_head_to_robot_neck
+except ImportError as _gmr_err:
+    print(f"Warning: general_motion_retargeting not available ({_gmr_err}); --enable_neck_pub will be a no-op.")
+    _human_head_to_robot_neck = None
+
+# 22-joint name table — matches gear_sonic/scripts/pico_gmr_thread_server.py:60
+# and external_dependencies/gmr_shim/general_motion_retargeting/__init__.py.
+_XROBOT_JOINT_NAMES = (
+    "Pelvis", "Left_Hip", "Right_Hip", "Spine1", "Left_Knee", "Right_Knee",
+    "Spine2", "Left_Ankle", "Right_Ankle", "Spine3", "Left_Foot", "Right_Foot",
+    "Neck", "Left_Collar", "Right_Collar", "Head",
+    "Left_Shoulder", "Right_Shoulder",
+    "Left_Elbow", "Right_Elbow", "Left_Wrist", "Right_Wrist",
+)
+
+
+def _body_poses_to_smplx_dict(body_poses_np):
+    """Convert xrt 24×7 body pose array (Unity frame, [x,y,z,qx,qy,qz,qw])
+    to {joint_name: (pos, quat_wxyz)} matching gmr's XRobotStreamer output.
+
+    Returns None on degenerate quaternions or undersized array — caller should
+    skip publishing that tick.
+    """
+    if body_poses_np is None or body_poses_np.shape[0] < len(_XROBOT_JOINT_NAMES):
+        return None
+    out = {}
+    for i, name in enumerate(_XROBOT_JOINT_NAMES):
+        pos = np.asarray(body_poses_np[i, :3], dtype=np.float64).copy()
+        qxyzw = np.asarray(body_poses_np[i, 3:7], dtype=np.float64).copy()
+        n = float(np.linalg.norm(qxyzw))
+        if not np.isfinite(n) or n < 1e-6:
+            return None
+        qxyzw /= n
+        out[name] = (pos, np.array([qxyzw[3], qxyzw[0], qxyzw[1], qxyzw[2]]))
+    return out
 
 
 class LocomotionMode(IntEnum):
@@ -1004,6 +1046,9 @@ def _pose_stream_common(
     enable_smpl_vis: bool = False,
     hand_type: str = "manus_dex3",
     wuji_hand_port: int = 5559,
+    enable_neck_pub: bool = True,
+    neck_pub_port: int = 5570,
+    neck_retarget_scale: float = 1.5,
 ):
     """Shared pose streaming loop used by run_pico."""
     if xrt is None:
@@ -1030,11 +1075,22 @@ def _pose_stream_common(
 
     # Wuji hand: create PUB socket for 26D tracking data
     wuji_hand_pub = None
-    if hand_type == "wuji":
+    neck_pub = None
+    ctx = None
+    if hand_type == "wuji" or enable_neck_pub:
         ctx = zmq.Context()
+    if hand_type == "wuji":
         wuji_hand_pub = ctx.socket(zmq.PUB)
         wuji_hand_pub.bind(f"tcp://*:{wuji_hand_port}")
         print(f"[{log_prefix}] Wuji hand PUB bound to port {wuji_hand_port}")
+    if enable_neck_pub and _human_head_to_robot_neck is not None:
+        neck_pub = ctx.socket(zmq.PUB)
+        neck_pub.setsockopt(zmq.SNDHWM, 1)
+        neck_pub.setsockopt(zmq.LINGER, 0)
+        neck_pub.bind(f"tcp://*:{neck_pub_port}")
+        print(f"[{log_prefix}] Neck PUB bound to port {neck_pub_port}")
+    elif enable_neck_pub and _human_head_to_robot_neck is None:
+        print(f"[{log_prefix}] Neck publishing requested but general_motion_retargeting not importable; skipping.")
 
     streamer = PoseStreamer(
         socket=socket,
@@ -1049,6 +1105,8 @@ def _pose_stream_common(
         manus_receiver=manus_receiver,
         hand_retargeting=hand_retargeting,
         wuji_hand_pub=wuji_hand_pub,
+        neck_pub=neck_pub,
+        neck_retarget_scale=neck_retarget_scale,
     )
 
     if stop_event is None:
@@ -1067,6 +1125,8 @@ def _pose_stream_common(
             manus_receiver.stop()
         if wuji_hand_pub is not None:
             wuji_hand_pub.close()
+        if neck_pub is not None:
+            neck_pub.close()
 
 
 class ThreePointPose:
@@ -1382,6 +1442,8 @@ class PoseStreamer:
         manus_receiver=None,
         hand_retargeting=None,
         wuji_hand_pub=None,
+        neck_pub=None,
+        neck_retarget_scale: float = 1.5,
     ):
         self.socket = socket
         self.reader = reader
@@ -1396,6 +1458,9 @@ class PoseStreamer:
         self.manus_receiver = manus_receiver
         self.hand_retargeting = hand_retargeting
         self.wuji_hand_pub = wuji_hand_pub  # ZMQ PUB socket for wuji 26D tracking
+        self.neck_pub = neck_pub            # ZMQ PUB socket for neck [yaw, pitch] JSON
+        self.neck_retarget_scale = float(neck_retarget_scale)
+        self._last_neck_publish_time = 0.0
 
         self.device = (
             torch.device("cuda") if use_cuda and torch.cuda.is_available() else torch.device("cpu")
@@ -1471,6 +1536,39 @@ class PoseStreamer:
         self.buffer_cleared = True
         self.step = 0
 
+    def publish_neck_once(self, body_poses_np, current_time=None):
+        """Rate-limited (50 Hz) publish of `[yaw, pitch]` JSON on self.neck_pub.
+
+        Wire format matches pose_publisher.py exactly so realsense_server.py's
+        --pose-zmq subscriber consumes this stream unchanged. Safe to call from
+        either run_once (POSE mode) or the manager loop (any mode).
+        """
+        if self.neck_pub is None or _human_head_to_robot_neck is None:
+            return
+        if body_poses_np is None:
+            return
+        if current_time is None:
+            current_time = time.time()
+        if current_time - self._last_neck_publish_time < (1.0 / 50.0):
+            return
+        smplx_data = _body_poses_to_smplx_dict(body_poses_np)
+        if smplx_data is None:
+            return
+        try:
+            yaw, pitch = _human_head_to_robot_neck(smplx_data)
+        except Exception:
+            return
+        yaw *= self.neck_retarget_scale
+        pitch *= self.neck_retarget_scale
+        try:
+            self.neck_pub.send(json.dumps([float(yaw), float(pitch)]).encode("utf-8"))
+        except Exception:
+            return
+        self._last_neck_publish_time = current_time
+        if not hasattr(self, "_neck_success_printed"):
+            print(f"[{self.log_prefix}] Publishing neck angles at 50Hz")
+            self._neck_success_printed = True
+
     def run_once(self):
         """Execute one iteration of the pose streaming loop."""
         sample = self.reader.get_latest()
@@ -1499,6 +1597,11 @@ class PoseStreamer:
         if sample is None:
             time.sleep(0.005)
             return
+
+        # Neck angle publish (50Hz, same cadence as Wuji). Done before the
+        # heavier compute_from_body_poses call so a slow downstream step
+        # doesn't starve the neck driver.
+        self.publish_neck_once(sample["body_poses_np"], current_time=current_time)
 
         latest_data = compute_from_body_poses(
             self.parent_indices, self.device, sample["body_poses_np"]
@@ -1733,6 +1836,9 @@ def run_pico(
     skip_body_tracking: bool = False,  # If True, skip waiting. If False, auto-detect with timeout
     hand_type: str = "manus_dex3",
     wuji_hand_port: int = 5559,
+    enable_neck_pub: bool = True,
+    neck_pub_port: int = 5570,
+    neck_retarget_scale: float = 1.5,
 ):
     """Run Pico body tracking with real-time visualization and ZMQ streaming."""
     if xrt is None:
@@ -1783,6 +1889,9 @@ def run_pico(
             enable_smpl_vis=enable_smpl_vis,
             hand_type=hand_type,
             wuji_hand_port=wuji_hand_port,
+            enable_neck_pub=enable_neck_pub,
+            neck_pub_port=neck_pub_port,
+            neck_retarget_scale=neck_retarget_scale,
         )
     finally:
         socket.close()
@@ -2049,6 +2158,9 @@ def run_pico_manager(
     hand_type: str = "manus_dex3",
     wuji_hand_port: int = 5559,
     skip_body_tracking: bool = False,  # If True, skip waiting. If False, auto-detect with timeout
+    enable_neck_pub: bool = True,
+    neck_pub_port: int = 5570,
+    neck_retarget_scale: float = 1.5,
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
@@ -2116,6 +2228,18 @@ def run_pico_manager(
         wuji_hand_pub.bind(f"tcp://*:{wuji_hand_port}")
         print(f"[Manager] Wuji hand tracking PUB bound to port {wuji_hand_port}")
 
+    # Neck command stream (JSON [yaw, pitch]) — same wire format as
+    # pose_publisher.py so realsense_server.py --pose-zmq subscribes unchanged.
+    neck_pub = None
+    if enable_neck_pub and _human_head_to_robot_neck is not None:
+        neck_pub = context.socket(zmq.PUB)
+        neck_pub.setsockopt(zmq.SNDHWM, 1)
+        neck_pub.setsockopt(zmq.LINGER, 0)
+        neck_pub.bind(f"tcp://*:{neck_pub_port}")
+        print(f"[Manager] Neck PUB bound to port {neck_pub_port}")
+    elif enable_neck_pub and _human_head_to_robot_neck is None:
+        print("[Manager] Neck publishing requested but general_motion_retargeting not importable; skipping.")
+
     pose_streamer = PoseStreamer(
         socket=socket,
         reader=reader,
@@ -2129,6 +2253,8 @@ def run_pico_manager(
         manus_receiver=manus_receiver,
         hand_retargeting=hand_retargeting,
         wuji_hand_pub=wuji_hand_pub,
+        neck_pub=neck_pub,
+        neck_retarget_scale=neck_retarget_scale,
     )
     planner_streamer = PlannerStreamer(
         socket=socket,
@@ -2305,6 +2431,15 @@ def run_pico_manager(
                             print(f"[Wuji] Publishing hand tracking data at 50Hz ({len(tracking_msg)} bytes)")
                             pose_streamer._wuji_success_printed = True
 
+            # Publish neck angles in all modes (not just POSE) — keeps the head
+            # tracking the operator while the user is in PLANNER, etc.
+            if pose_streamer.neck_pub is not None:
+                latest_sample = pose_streamer.reader.get_latest()
+                if latest_sample is not None:
+                    pose_streamer.publish_neck_once(
+                        latest_sample["body_poses_np"], current_time=current_time
+                    )
+
             # Run one iteration of the new mode
             if new_mode == StreamMode.POSE:
                 pose_streamer.run_once()
@@ -2346,6 +2481,8 @@ def run_pico_manager(
         socket.close()
         if wuji_hand_pub is not None:
             wuji_hand_pub.close()
+        if neck_pub is not None:
+            neck_pub.close()
         context.term()
         # Stop recording manager
         if rec_manager is not None:
@@ -2457,6 +2594,27 @@ if __name__ == "__main__":
         action="store_true",
         help="Skip waiting for body tracking data (run with Manus only)",
     )
+    # Neck-motor publishing — drives the G1 NeckMotor over the same wire format
+    # as pose_publisher.py. Default-on so a single process drives both hand and
+    # neck teleop. Disable with --no_neck_pub for neck-only bring-ups using
+    # pose_publisher.py instead.
+    parser.set_defaults(enable_neck_pub=True)
+    parser.add_argument(
+        "--enable_neck_pub", dest="enable_neck_pub", action="store_true",
+        help="Publish neck [yaw, pitch] JSON for the G1 NeckMotor (default on)",
+    )
+    parser.add_argument(
+        "--no_neck_pub", dest="enable_neck_pub", action="store_false",
+        help="Disable the neck PUB; useful when running pose_publisher.py separately",
+    )
+    parser.add_argument(
+        "--neck_pub_port", type=int, default=5570,
+        help="ZMQ PUB port for neck [yaw, pitch] JSON (default: 5570 — kept clear of the Wuji 5559-5561 block: 5559 wuji_hand, 5560 wuji_state, 5561 wuji_replay cmd)",
+    )
+    parser.add_argument(
+        "--neck_retarget_scale", type=float, default=1.5,
+        help="Multiplier on (yaw, pitch) before publishing (default: 1.5, matches pose_publisher.py)",
+    )
     args = parser.parse_args()
 
     # Standalone VR3Pt test modes (exit after finishing)
@@ -2500,6 +2658,9 @@ if __name__ == "__main__":
             hand_type=args.hand_type,
             wuji_hand_port=args.wuji_hand_port,
             skip_body_tracking=args.skip_body_tracking,
+            enable_neck_pub=args.enable_neck_pub,
+            neck_pub_port=args.neck_pub_port,
+            neck_retarget_scale=args.neck_retarget_scale,
         )
     else:
         # Run legacy single-thread pose streaming
@@ -2518,4 +2679,7 @@ if __name__ == "__main__":
             skip_body_tracking=args.skip_body_tracking,
             hand_type=args.hand_type,
             wuji_hand_port=args.wuji_hand_port,
+            enable_neck_pub=args.enable_neck_pub,
+            neck_pub_port=args.neck_pub_port,
+            neck_retarget_scale=args.neck_retarget_scale,
         )

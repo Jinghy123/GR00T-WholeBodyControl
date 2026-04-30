@@ -1,17 +1,18 @@
 """
 Unified camera + neck-motor server (robot-side):
   - ZED egocentric camera  (left RGB + stereo L|R)
-  - RealSense D405 wrist cameras (left, right)
   - 2-DOF neck (Dynamixel IDs 0=yaw, 1=pitch on /dev/ttyUSB0), driven by the
     SMPL-X-derived `[yaw, pitch]` stream from pose_publisher.py.
+  - (D405 wrist cameras are HARD-DISABLED in this build; pyrealsense2 is not
+    imported. Search for `DISABLED: D405 wrists` to re-enable.)
 
 ZMQ REP bind: tcp://192.168.123.164:5558
 Each request receives a 4-part multipart reply (all JPEG bytes, b"" if unavailable):
 
   Part 0 — Ego left RGB JPEG       (ZED left)
   Part 1 — Ego stereo JPEG         (ZED left|right, for VR / archival)
-  Part 2 — Left wrist RGB JPEG     (D405 serial 218622276113)
-  Part 3 — Right wrist RGB JPEG    (D405 serial 218622276849)
+  Part 2 — b""                     (was left wrist D405 — disabled)
+  Part 3 — b""                     (was right wrist D405 — disabled)
 
 Optional outputs:
   - H.264 TCP stream of ZED stereo to Pico VR (--enable-pico).
@@ -24,7 +25,7 @@ Usage (full pipeline, on the robot):
         --zmq-bind tcp://0.0.0.0:5558 \
         --enable-pico --pico-ip <PICO_IP> \
         --enable-neck-motor \
-        --pose-zmq tcp://<DESKTOP_IP>:5559
+        --pose-zmq tcp://<DESKTOP_IP>:5570
 
 ZED-only quick test (no D405 wrists):
     python realsense_server.py --zed-only ...
@@ -52,7 +53,11 @@ from typing import Any, Optional
 import cv2
 import numpy as np
 import pyzed.sl as sl
-import pyrealsense2 as rs
+# DISABLED: D405 wrist-camera support — see "DISABLED" blocks below.
+# Hard-importing pyrealsense2 forces an unnecessary dependency on the G1
+# sonic env when no D405s are connected. Re-enable here AND in every
+# block tagged `DISABLED: D405 wrists` to bring wrist capture back.
+# import pyrealsense2 as rs
 import zmq
 
 gi = None
@@ -65,8 +70,9 @@ Gst = None
 latest_ego_rgb_bytes: Optional[bytes] = None
 latest_ego_stereo_bytes: Optional[bytes] = None
 latest_ego_stereo_frame: Optional[np.ndarray] = None
-latest_left_wrist_bytes: Optional[bytes] = None
-latest_right_wrist_bytes: Optional[bytes] = None
+# DISABLED: D405 wrists — keep slot vars unused so the REP reply just sends b"".
+# latest_left_wrist_bytes: Optional[bytes] = None
+# latest_right_wrist_bytes: Optional[bytes] = None
 frame_seq = 0
 frame_cond = threading.Condition()
 
@@ -209,48 +215,53 @@ def zed_capture_thread(cfg: Any) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# RealSense D405 wrist capture
+# DISABLED: D405 wrist capture
+# Whole `wrist_capture_thread` is commented out so the server doesn't depend on
+# pyrealsense2. The REP reply still pads the wrist slots with b"" — see the
+# `_serve_loop` block below — so the client-side multipart contract is intact.
+# Re-enable: uncomment `import pyrealsense2 as rs` near the top, this function,
+# and the matching blocks tagged `DISABLED: D405 wrists` in `start_server`.
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def wrist_capture_thread(serial: str, side: str) -> None:
-    global latest_left_wrist_bytes, latest_right_wrist_bytes
-
-    pipeline = rs.pipeline()
-    config = rs.config()
-    config.enable_device(serial)
-    config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-
-    try:
-        pipeline.start(config)
-        print(f"[Wrist-{side}] Started (serial={serial}): RGB active.")
-    except Exception as e:
-        print(f"[Wrist-{side}] Failed to start (serial={serial}): {e}")
-        return
-
-    while True:
-        try:
-            frames = pipeline.wait_for_frames()
-            color_frame = frames.get_color_frame()
-            if not color_frame:
-                continue
-
-            color_image = np.ascontiguousarray(
-                np.asarray(color_frame.get_data(), dtype=np.uint8)
-            )
-            if color_image.ndim != 3 or color_image.size == 0:
-                continue
-            encoded_rgb = _jpeg_encode_bgr(color_image, 80)
-
-            with frame_cond:
-                if side == "left":
-                    latest_left_wrist_bytes = encoded_rgb
-                else:
-                    latest_right_wrist_bytes = encoded_rgb
-
-        except Exception as e:
-            print(f"[Wrist-{side}] Capture error: {e}")
-            time.sleep(0.01)
+# def wrist_capture_thread(serial: str, side: str) -> None:
+#     global latest_left_wrist_bytes, latest_right_wrist_bytes
+#
+#     pipeline = rs.pipeline()
+#     config = rs.config()
+#     config.enable_device(serial)
+#     config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+#
+#     try:
+#         pipeline.start(config)
+#         print(f"[Wrist-{side}] Started (serial={serial}): RGB active.")
+#     except Exception as e:
+#         print(f"[Wrist-{side}] Failed to start (serial={serial}): {e}")
+#         return
+#
+#     while True:
+#         try:
+#             frames = pipeline.wait_for_frames()
+#             color_frame = frames.get_color_frame()
+#             if not color_frame:
+#                 continue
+#
+#             color_image = np.ascontiguousarray(
+#                 np.asarray(color_frame.get_data(), dtype=np.uint8)
+#             )
+#             if color_image.ndim != 3 or color_image.size == 0:
+#                 continue
+#             encoded_rgb = _jpeg_encode_bgr(color_image, 80)
+#
+#             with frame_cond:
+#                 if side == "left":
+#                     latest_left_wrist_bytes = encoded_rgb
+#                 else:
+#                     latest_right_wrist_bytes = encoded_rgb
+#
+#         except Exception as e:
+#             print(f"[Wrist-{side}] Capture error: {e}")
+#             time.sleep(0.01)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -532,7 +543,7 @@ class NeckMotor:
         if not self.pose_zmq_addr:
             print(
                 "\033[91m[Neck] --pose-zmq is required. Run pose_publisher.py "
-                "on the desktop and pass --pose-zmq tcp://<desktop-ip>:5559.\033[0m"
+                "on the desktop and pass --pose-zmq tcp://<desktop-ip>:5570.\033[0m"
             )
             return False
 
@@ -791,18 +802,22 @@ class NeckMotor:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+# DISABLED: D405 wrists — pyrealsense2 isn't imported, so this can't run.
+# def list_realsense_devices() -> None:
+#     ctx = rs.context()
+#     devices = ctx.query_devices()
+#     if len(devices) == 0:
+#         print("No RealSense devices detected.")
+#         return
+#     print(f"Found {len(devices)} RealSense device(s):")
+#     for i, dev in enumerate(devices):
+#         name = dev.get_info(rs.camera_info.name)
+#         serial = dev.get_info(rs.camera_info.serial_number)
+#         fw = dev.get_info(rs.camera_info.firmware_version)
+#         print(f"  [{i}] {name}  serial={serial}  firmware={fw}")
 def list_realsense_devices() -> None:
-    ctx = rs.context()
-    devices = ctx.query_devices()
-    if len(devices) == 0:
-        print("No RealSense devices detected.")
-        return
-    print(f"Found {len(devices)} RealSense device(s):")
-    for i, dev in enumerate(devices):
-        name = dev.get_info(rs.camera_info.name)
-        serial = dev.get_info(rs.camera_info.serial_number)
-        fw = dev.get_info(rs.camera_info.firmware_version)
-        print(f"  [{i}] {name}  serial={serial}  firmware={fw}")
+    print("[Server] D405 wrist support is disabled in this build "
+          "(pyrealsense2 not imported). Re-enable to use --list-devices.")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -812,7 +827,8 @@ def list_realsense_devices() -> None:
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Unified camera server: ZED ego + RealSense D405 wrist (ZMQ + optional Pico)"
+        description="Unified camera server: ZED ego (ZMQ + optional Pico). "
+                    "D405 wrist support is hard-disabled in this build."
     )
 
     # ZED
@@ -840,19 +856,22 @@ def _parse_args() -> argparse.Namespace:
         default=int(os.environ.get("ZED_JPEG_STEREO_QUALITY", "60")),
     )
 
+    # ── DISABLED: D405 wrists ────────────────────────────────────────────────
     # Wrist (D405 serials documented in past_streaming_pipeline)
-    p.add_argument(
-        "--left-wrist-serial", default="218622276113",
-        help="Serial of left wrist D405 (empty string to disable)",
-    )
-    p.add_argument(
-        "--right-wrist-serial", default="218622276849",
-        help="Serial of right wrist D405 (empty string to disable)",
-    )
+    # p.add_argument(
+    #     "--left-wrist-serial", default="218622276113",
+    #     help="Serial of left wrist D405 (empty string to disable)",
+    # )
+    # p.add_argument(
+    #     "--right-wrist-serial", default="218622276849",
+    #     help="Serial of right wrist D405 (empty string to disable)",
+    # )
+    # `--zed-only` is now a no-op (kept for backward compatibility with
+    # existing scripts/docs that pass it). Wrist support is hard-off.
     p.add_argument(
         "--zed-only", action="store_true",
-        default=_env_bool("ZED_ONLY", False),
-        help="Use ZED only; disable both RealSense wrist cameras",
+        default=_env_bool("ZED_ONLY", True),
+        help="(no-op — wrist support hard-disabled in this build)",
     )
 
     # Neck motor
@@ -871,7 +890,7 @@ def _parse_args() -> argparse.Namespace:
             "Required when --enable-neck-motor is set. ZMQ SUB address of "
             "pose_publisher.py, which publishes [neck_yaw, neck_pitch] "
             "extracted from SMPL-X body data. Example: "
-            "'tcp://desktop-ip:5559'."
+            "'tcp://desktop-ip:5570'."
         ),
     )
     p.add_argument(
@@ -928,9 +947,10 @@ def _build_config(ns: argparse.Namespace) -> Any:
     c.enable_pico = ns.enable_pico
     c.pico_ip = ns.pico_ip
     c.pico_port = ns.pico_port
-    c.left_wrist_serial = "" if ns.zed_only else ns.left_wrist_serial
-    c.right_wrist_serial = "" if ns.zed_only else ns.right_wrist_serial
-    c.zed_only = ns.zed_only
+    # DISABLED: D405 wrists — serials forced empty regardless of CLI/env.
+    c.left_wrist_serial = ""
+    c.right_wrist_serial = ""
+    c.zed_only = True
     c.enable_neck_motor = ns.enable_neck_motor
     c.pose_zmq = ns.pose_zmq
     c.neck_state_pub = ns.neck_state_pub
@@ -940,33 +960,32 @@ def _build_config(ns: argparse.Namespace) -> Any:
 def start_server(cfg: Any) -> None:
     global Gst, gi
 
-    if cfg.zed_only:
-        print("[Server] Mode: ZED only (wrist cameras disabled).")
-    else:
-        print("[Server] Mode: ZED + 2x RealSense wrist cameras.")
-        list_realsense_devices()
+    print("[Server] Mode: ZED only (wrist cameras hard-disabled in code).")
 
     threading.Thread(
         target=zed_capture_thread, args=(cfg,), daemon=True
     ).start()
 
-    if cfg.left_wrist_serial:
-        threading.Thread(
-            target=wrist_capture_thread,
-            args=(cfg.left_wrist_serial, "left"),
-            daemon=True,
-        ).start()
-    else:
-        print("[Wrist-left] Disabled (no serial provided).")
-
-    if cfg.right_wrist_serial:
-        threading.Thread(
-            target=wrist_capture_thread,
-            args=(cfg.right_wrist_serial, "right"),
-            daemon=True,
-        ).start()
-    else:
-        print("[Wrist-right] Disabled (no serial provided).")
+    # ── DISABLED: D405 wrists ────────────────────────────────────────────────
+    # No wrist threads spawned — pyrealsense2 isn't imported. Re-enable by
+    # uncommenting the import + this block + `wrist_capture_thread` itself.
+    # if cfg.left_wrist_serial:
+    #     threading.Thread(
+    #         target=wrist_capture_thread,
+    #         args=(cfg.left_wrist_serial, "left"),
+    #         daemon=True,
+    #     ).start()
+    # else:
+    #     print("[Wrist-left] Disabled (no serial provided).")
+    #
+    # if cfg.right_wrist_serial:
+    #     threading.Thread(
+    #         target=wrist_capture_thread,
+    #         args=(cfg.right_wrist_serial, "right"),
+    #         daemon=True,
+    #     ).start()
+    # else:
+    #     print("[Wrist-right] Disabled (no serial provided).")
 
     pico_streamer: Optional[PicoVideoStreamer] = None
     if cfg.enable_pico:
@@ -1024,8 +1043,10 @@ def start_server(cfg: Any) -> None:
                     frame_cond.wait(timeout=0.1)
                 ego_rgb = latest_ego_rgb_bytes
                 ego_stereo = latest_ego_stereo_bytes
-                lw = latest_left_wrist_bytes
-                rw = latest_right_wrist_bytes
+                # DISABLED: D405 wrists — pad slots with empty bytes so the
+                # 4-part multipart contract stays intact for the client.
+                lw = b""
+                rw = b""
                 last_sent_seq = frame_seq
 
             if ego_rgb is None:

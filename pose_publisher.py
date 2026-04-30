@@ -1,4 +1,9 @@
-"""Desktop-side neck-angle publisher for the G1 neck-motor loop.
+"""Desktop-side neck-angle publisher for the G1 neck-motor loop — STANDALONE.
+
+NOTE: For the standard hand+neck teleop session you no longer need this
+script — `gear_sonic/scripts/pico_manus_thread_server.py` now publishes the
+same neck stream alongside the body/hand teleop. This file remains for
+neck-only sessions (demos, unit tests, sessions without Manus/Wuji gloves).
 
 Runs on the machine with the XRoboToolKit daemon, the body trackers, and the
 `general_motion_retargeting` package. Pulls SMPL-X body data from
@@ -10,7 +15,7 @@ Going through SMPL-X instead of the raw headset pose decouples neck rotation
 from torso lean: the spine joints absorb body lean, leaving the neck angles
 unchanged when the operator walks or leans without rotating the head.
 
-On the G1, point `realsense_server.py --pose-zmq tcp://<desktop-ip>:5559`
+On the G1, point `realsense_server.py --pose-zmq tcp://<desktop-ip>:5570`
 at this publisher.
 
 Prereqs (desktop):
@@ -18,7 +23,7 @@ Prereqs (desktop):
     # see NECK_TELEOP_GUIDE.md for the gmr install steps.
 
 Usage:
-    python pose_publisher.py --bind tcp://0.0.0.0:5559 --hz 50 \
+    python pose_publisher.py --bind tcp://0.0.0.0:5570 --hz 50 \
         --neck-retarget-scale 1.5
 """
 from __future__ import annotations
@@ -39,8 +44,10 @@ def main() -> None:
         )
     )
     p.add_argument(
-        "--bind", default="tcp://0.0.0.0:5559",
-        help="ZMQ PUB bind address (default tcp://0.0.0.0:5559)",
+        "--bind", default="tcp://0.0.0.0:5570",
+        help="ZMQ PUB bind address (default tcp://0.0.0.0:5570 — kept clear "
+             "of the Wuji 5559-5561 block so neck publishing works alongside "
+             "any Wuji mode)",
     )
     p.add_argument(
         "--hz", type=int, default=50,

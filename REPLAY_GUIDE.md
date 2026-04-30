@@ -11,7 +11,8 @@ These two scripts re-publish the actions captured in a recorded
 
 Both scripts can additionally drive the **2-DOF neck motors** by
 re-publishing `actions['neck']` on the same ZMQ port that
-`pose_publisher.py` would use. Add `--enable-neck` to either invocation.
+`pico_manus_thread_server.py` (or `pose_publisher.py` fallback) would use.
+Add `--enable-neck` to either invocation.
 
 ---
 
@@ -24,7 +25,7 @@ re-publishing `actions['neck']` on the same ZMQ port that
 │  replay_token*.py     ── PUB :5556 ─►│──────────────►│  WBC controller (sub)     │
 │   (token + hands)        topic=pose  │               │  (g1_deploy_onnx_ref)     │
 │                                      │               │                           │
-│  replay_token*.py     ── PUB :5559 ─►│──────────────►│  realsense_server.py      │
+│  replay_token*.py     ── PUB :5570 ─►│──────────────►│  realsense_server.py      │
 │   (--enable-neck)        JSON [y,p]  │               │  --pose-zmq               │
 │                                      │               │   (NeckMotor SUB)         │
 │                                      │               │                           │
@@ -38,9 +39,12 @@ re-publishing `actions['neck']` on the same ZMQ port that
   `gear_sonic.utils.teleop.zmq.zmq_planner_sender.pack_pose_message`
   with `version=4`. Contains `token_state` (latent), optional
   `left_hand_joints` / `right_hand_joints` (7-D each).
-- **Neck (`:5559`)** — JSON-encoded `[yaw_rad, pitch_rad]`. Identical to
-  `pose_publisher.py`'s wire format; `realsense_server.py`'s
-  `--pose-zmq` subscriber consumes it without any change.
+- **Neck (`:5570`)** — JSON-encoded `[yaw_rad, pitch_rad]`. Identical to
+  `pico_manus_thread_server.py`'s neck PUB and `pose_publisher.py`'s wire
+  format; `realsense_server.py`'s `--pose-zmq` subscriber consumes it
+  without any change. (Port chosen at 5570 to stay clear of the Wuji
+  block 5559-5561: 5559 wuji_hand tracking, 5560 wuji_state, 5561
+  wuji_replay command port.)
 - **WBC state (`:5557`, latency variant only)** — msgpack from the WBC
   controller, used by `replay_token_latency.py` to compute a freeze
   token through the encoder during the WAITING phase.
@@ -59,7 +63,7 @@ re-publishing `actions['neck']` on the same ZMQ port that
        --zed-only \
        --zmq-bind tcp://0.0.0.0:5558 \
        --enable-neck-motor \
-       --pose-zmq tcp://<DESKTOP_IP>:5559
+       --pose-zmq tcp://<DESKTOP_IP>:5570
    ```
    See [NECK_TELEOP_GUIDE.md](NECK_TELEOP_GUIDE.md) for full setup.
    Don't forget `sudo chmod 777 /dev/ttyUSB0`.
@@ -70,12 +74,15 @@ re-publishing `actions['neck']` on the same ZMQ port that
 2. The `gear_sonic_deploy/policy/release/model_encoder.onnx` model
    (latency variant only — used to compute freeze tokens). Path is
    resolved relative to `_GROOT_ROOT` at the top of each script.
-3. **Stop any running `pose_publisher.py`** before using `--enable-neck`:
+3. **Stop any running neck publisher** before using `--enable-neck` —
+   in standard flow that's `pico_manus_thread_server.py`, but
+   `pose_publisher.py` is also possible:
    ```bash
+   pkill -f pico_manus_thread_server.py
    pkill -f pose_publisher.py
    ```
-   Both bind port 5559; otherwise the replay's bind fails fast with a
-   clear `NeckPublisher bind failed on tcp://*:5559` error.
+   All three bind port 5570; otherwise the replay's bind fails fast
+   with a clear `NeckPublisher bind failed on tcp://*:5570` error.
 
 ### What's in a record
 The replay scripts read from each frame:
@@ -101,7 +108,7 @@ python replay_token.py --episode-dir /home/xiawei/data/<task>_<session>/episode_
 
 ### Vanilla replay + neck
 ```bash
-pkill -f pose_publisher.py
+pkill -f pico_manus_thread_server.py; pkill -f pose_publisher.py
 python replay_token.py \
     --episode-dir /home/xiawei/data/<task>_<session>/episode_0 \
     --enable-neck
@@ -117,7 +124,7 @@ python replay_token_latency.py \
 
 ### Latency-simulating replay + neck
 ```bash
-pkill -f pose_publisher.py
+pkill -f pico_manus_thread_server.py; pkill -f pose_publisher.py
 python replay_token_latency.py \
     --episode-dir /home/xiawei/data/<task>_<session>/episode_0 \
     --chunk-size 24 \
@@ -141,7 +148,7 @@ tokens/neck before you light up the robot.
 ```
 [ReplayToken] Loaded N frames at 30 Hz from <path>/data.json
 [ReplayToken] Neck replay enabled: K/N frames have neck data.
-[NeckPublisher] PUB bound to tcp://*:5559
+[NeckPublisher] PUB bound to tcp://*:5570
 [ReplayToken] Waiting for ZMQ connections...
 [TokenPublisher] Command: start=True stop=False planner=True
 [ReplayToken] Starting token replay of N frames...
@@ -159,7 +166,7 @@ control loop).
 ```
 [ReplayLatency] Loaded N frames at 30 Hz from <path>/data.json
 [ReplayLatency] Neck replay enabled: K/M token frames have neck data.
-[NeckPublisher] PUB bound to tcp://*:5559
+[NeckPublisher] PUB bound to tcp://*:5570
 [WBCState] Subscribed to localhost:5557 topic=g1_debug
 [ReplayLatency] Waiting for ZMQ connections...
 [TokenPublisher] Command: start=True stop=False planner=True
@@ -213,9 +220,11 @@ troubleshooting "tick stays at the zero tick").
   neck-less episode never moves the neck (the publisher reports
   "no frame has actions['neck']; skipping neck replay" and continues
   with token-only replay).
-- **`pose_publisher.py` and replay can't both run at once.** They both
-  bind port 5559. The replay's bind error message tells you to
-  `pkill -f pose_publisher.py`.
+- **The desktop neck publisher and replay can't both run at once.**
+  Whichever one is binding 5570 — `pico_manus_thread_server.py` (the
+  default in standard flow) or `pose_publisher.py` (fallback) — has to
+  stop before replay binds. The replay's bind error tells you which to
+  pkill.
 - **`WBC_HOST` in `replay_token_latency.py` is hardcoded to `localhost`**
   (line 28). When running off-robot, override with `--wbc-host
   192.168.123.164` so the encoder freeze can read real WBC state.
@@ -233,10 +242,16 @@ troubleshooting "tick stays at the zero tick").
 
 ## Troubleshooting
 
-**`NeckPublisher bind failed on tcp://*:5559`**
-`pose_publisher.py` is still running. `pkill -f pose_publisher.py`,
-then re-run. Same error if some other process holds 5559 — find it
-with `sudo fuser -v 5559/tcp`.
+**`NeckPublisher bind failed on tcp://*:5570`**
+A desktop neck publisher is still bound — `pico_manus_thread_server.py`
+in standard flow, `pose_publisher.py` if you ran the fallback. Kill
+whichever:
+```bash
+pkill -f pico_manus_thread_server.py
+pkill -f pose_publisher.py
+```
+then re-run. Same error if some other process holds 5570 — find it
+with `sudo fuser -v 5570/tcp`.
 
 **`--enable-neck set but no frame has actions['neck']`**
 The recorded episode predates the neck-recording feature, or the
@@ -246,7 +261,7 @@ neck; the head won't move during playback.
 **Tokens stream but the G1 neck doesn't move**
 Check in order:
 1. `realsense_server.py` on the G1 logs `[Neck] ZMQ SUB neck-angle
-   source: tcp://<desktop-ip>:5559` — if the address is `localhost`
+   source: tcp://<desktop-ip>:5570` — if the address is `localhost`
    or wrong, the G1 isn't subscribed to your replay.
 2. The G1 logs periodic `[Neck] yaw … pitch …` lines that change. If
    they're stuck at the zero tick, motor writes are disabled in

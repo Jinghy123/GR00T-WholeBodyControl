@@ -1,14 +1,18 @@
 """
-Live 3-camera viewer for realsense_server.py.
+Live ZED-only viewer for realsense_server.py.
 
-Displays three OpenCV windows — ZED ego, left-wrist D405, right-wrist D405 —
-by polling the server's 4-part ZMQ REP reply. Press 'q' or ESC to quit.
-Use --duration N to auto-exit after N seconds.
+Displays the ZED ego window (and optionally the ZED stereo L|R) by polling
+the server's 4-part ZMQ REP reply. Press 'q' or ESC to quit. Use --duration
+N to auto-exit after N seconds.
+
+D405 wrist windows are HARD-DISABLED (search for `DISABLED: D405 wrists`
+to re-enable). The server pads the wrist slots with b"" so this viewer
+only shows the ZED.
 
 Usage:
   python test_viewer.py                                      # connect to 127.0.0.1:5558
   python test_viewer.py --server 192.168.123.164             # robot IP
-  python test_viewer.py --show-stereo                        # add 4th window (ZED stereo)
+  python test_viewer.py --show-stereo                        # add stereo window
   python test_viewer.py --duration 15                        # auto-close after 15s
 """
 
@@ -44,7 +48,8 @@ def run(args):
     sock = _make_sock(ctx, addr)
     print(f"[viewer] connected to {addr}")
 
-    windows = ["ZED Ego", "Left Wrist (D405)", "Right Wrist (D405)"]
+    # DISABLED: D405 wrists — only ZED windows are created.
+    windows = ["ZED Ego"]
     if args.show_stereo:
         windows.insert(1, "ZED Stereo L|R")
     for w in windows:
@@ -74,10 +79,12 @@ def run(args):
                 cv2.imshow("ZED Ego", ego)
             if args.show_stereo and stereo is not None:
                 cv2.imshow("ZED Stereo L|R", stereo)
-            if lw is not None:
-                cv2.imshow("Left Wrist (D405)", lw)
-            if rw is not None:
-                cv2.imshow("Right Wrist (D405)", rw)
+            # DISABLED: D405 wrist windows — wrist slots from the server are
+            # always b"". Re-enable alongside the wrist code in realsense_server.py.
+            # if lw is not None:
+            #     cv2.imshow("Left Wrist (D405)", lw)
+            # if rw is not None:
+            #     cv2.imshow("Right Wrist (D405)", rw)
 
             frames += 1
             now = time.time()

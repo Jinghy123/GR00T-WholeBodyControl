@@ -22,15 +22,16 @@ SMPL-X publisher, data collector — runs on the **desktop**.
         │                                                        │       │
                                                                  ▼       │
 ┌──────────────────────────────────────┐               ┌───────────────────────────┐
-│      Desktop PC (x86_64)             │               │   G1 Orin  192.168.123.164│
+│   Desktop PC (x86_64)                │               │ G1 Orin  192.168.123.164  │
 │                                      │               │                           │
-│  XRoboToolKit service (.deb)         │               │  realsense_server.py      │
-│  pose_publisher.py     ── PUB :5559 ─┤──────────────►│  --pose-zmq tcp://desktop │
-│  (gmr shim: XRobotStreamer +         │  JSON         │                  :5559    │
-│   human_head_to_robot_neck)          │  [yaw,pitch]  │  ├─ ZED Mini              │
-│                                      │               │  └─ U2D2 + 2 Dynamixels   │
-│  g1_data_server.py     ◄── REP :5558 ┤◄──────────────┤    (yaw=ID0, pitch=ID1)   │
-│  (records data.json)   ◄── PUB :5560 ┤◄──────────────┤    (state PUB :5560)      │
+│   XRoboToolKit service (.deb)        │               │ realsense_server.py       │
+│   pico_manus_thread_server.py        │               │   --pose-zmq …:5570       │
+│   ├─ Manus / Wuji teleop  ─ PUB 5556 ┼──────────────►│   ├─ ZED Mini             │
+│   └─ neck (gmr shim       ─ PUB 5570 ┼──────────────►│   └─ U2D2 + 2 Dynamixels  │
+│      human_head_to_robot_neck)       │               │      (yaw=ID0, pitch=ID1) │
+│                                      │               │                           │
+│   g1_data_server.py     ◄ REQ 5558 ──┼───────────────┤   (camera REP)            │
+│    (records data.json)  ◄ SUB 5560 ──┼───────────────┤   (neck state PUB)        │
 └──────────────────────────────────────┘               └───────────────────────────┘
 ```
 
@@ -38,8 +39,12 @@ Responsibilities:
 
 - **Desktop PC** runs the XRoboToolKit PC Service daemon, the
   `xrobotoolkit_sdk` binding, the in-tree `general_motion_retargeting`
-  shim, [pose_publisher.py](pose_publisher.py), and
-  [g1_data_server.py](g1_data_server.py).
+  shim, [gear_sonic/scripts/pico_manus_thread_server.py](gear_sonic/scripts/pico_manus_thread_server.py)
+  (which now publishes both the body/hand teleop on port 5556 **and**
+  the neck `[yaw, pitch]` stream on port 5570), and
+  [g1_data_server.py](g1_data_server.py). The standalone
+  [pose_publisher.py](pose_publisher.py) is still available as a fallback
+  for neck-only sessions but is no longer needed in the standard flow.
 - **G1 Orin** owns the ZED Mini, the U2D2 (`/dev/ttyUSB0`), and the two
   Dynamixels. It only runs [realsense_server.py](realsense_server.py) — no
   XRoboToolKit install, no gmr install, no daemon.
@@ -207,22 +212,39 @@ Put on the headset, launch XRoboToolkit Client, confirm "Connected" to
 the desktop's IP, start tracking. Make sure body trackers are paired and
 streaming.
 
-### Desktop terminal 2 — pose publisher (leave running)
+### Desktop terminal 2 — Manus + neck teleop server (leave running)
+
+This single process publishes both the body/hand teleop stream on port
+5556 *and* the neck `[yaw, pitch]` stream on port 5570. There's no
+longer a separate `pose_publisher.py` step in the standard flow.
+
 ```bash
 micromamba activate sonic
 cd $GR00T_ROOT
-python pose_publisher.py \
-    --bind tcp://0.0.0.0:5559 \
-    --hz 50 \
-    --neck-retarget-scale 1.5
+python gear_sonic/scripts/pico_manus_thread_server.py \
+    --hand_type manus_dex3 \
+    --neck_pub_port 5570 \
+    --neck_retarget_scale 1.5
 ```
 Expected logs:
-- `XRobotStreamer initialized.`
-- `PUB bound to tcp://0.0.0.0:5559`
-- Periodic `published N neck samples @ ~50 Hz` (as you move your head).
+- `ZMQ socket bound to port 5556`
+- `[Main] Neck PUB bound to port 5570`  (or `[Manager] …` in `--manager` mode)
+- `[Main] Publishing neck angles at 50Hz` (after a few frames of head motion)
 
-If it warns `smplx_data is None`, the body trackers aren't streaming yet
-(see [Troubleshooting](#troubleshooting)).
+Hand-type variants:
+- `--hand_type wuji` also binds the Wuji 26D hand stream on **5559**;
+  this no longer collides with neck since neck moved to 5570.
+- `--hand_type none` runs body+neck only.
+- `--no_neck_pub` disables the neck publish (use this if you'd rather
+  drive the neck via standalone `pose_publisher.py`).
+
+**Standalone neck-only fallback** (e.g. neck demos, or any session
+without Manus/Wuji):
+```bash
+python pose_publisher.py --bind tcp://0.0.0.0:5570 --hz 50 \
+    --neck-retarget-scale 1.5
+```
+Either source binds 5570 — never run both at once.
 
 ### G1 terminal — camera + neck server
 
@@ -242,13 +264,13 @@ python realsense_server.py \
     --zmq-bind tcp://0.0.0.0:5558 \
     --enable-pico --pico-ip <PICO_IP> \
     --enable-neck-motor \
-    --pose-zmq tcp://<DESKTOP_IP>:5559
+    --pose-zmq tcp://<DESKTOP_IP>:5570
 ```
 
 Expected lines, in order:
 - `[ZED] Started: resolution=vga fps=30`
 - `[PicoStreamer] Connected to Pico <PICO_IP>:12345`
-- `[Neck] ZMQ SUB neck-angle source: tcp://<DESKTOP_IP>:5559`
+- `[Neck] ZMQ SUB neck-angle source: tcp://<DESKTOP_IP>:5570`
 - `[Neck] State PUB bound: tcp://*:5560`
 - `[Neck] Started: /dev/ttyUSB0@2000000 IDs 0/1 ...`
 - Periodic `[Neck] yaw ... pitch ...` with the **tick value changing**
@@ -288,17 +310,29 @@ python test_viewer.py --server 192.168.123.164 --port 5558 --show-stereo
 | `--pico-ip <ip>` | `192.168.0.128` | Pico headset IP. |
 | `--pico-port <port>` | `12345` | Pico TCP video port. |
 | `--enable-neck-motor` | off (env `NECK_MOTOR`) | Drive the 2-DOF neck. Requires `--pose-zmq`. |
-| `--pose-zmq <addr>` | "" (env `POSE_ZMQ`) | **Required with `--enable-neck-motor`.** ZMQ SUB address of `pose_publisher.py`. Wire format: JSON `[neck_yaw, neck_pitch]` (radians). Example: `tcp://<desktop-ip>:5559`. |
+| `--pose-zmq <addr>` | "" (env `POSE_ZMQ`) | **Required with `--enable-neck-motor`.** ZMQ SUB address of the desktop neck publisher (`pico_manus_thread_server.py` or `pose_publisher.py`). Wire format: JSON `[neck_yaw, neck_pitch]` (radians). Example: `tcp://<desktop-ip>:5570`. |
 | `--neck-state-pub <addr>` | `tcp://*:5560` (env `NECK_STATE_PUB`) | ZMQ PUB bind for the neck motor present-position stream `[yaw_rad, pitch_rad]`. Read from the Dynamixels every control tick. Empty string disables. |
 | `--resolution <preset>` | `vga` | `vga`, `hd720`, `hd1080`, `hd1200`, `hd2k`, `auto`. |
 | `--fps <n>` | `30` | ZED FPS. |
 | `--list-devices` | — | Print attached RealSense devices and exit. |
 
-`pose_publisher.py`:
+Neck publisher flags — pick whichever process is publishing neck:
+
+`pico_manus_thread_server.py` (canonical, neck on by default):
 
 | Flag | Default | Purpose |
 |------|---------|---------|
-| `--bind <addr>` | `tcp://0.0.0.0:5559` | ZMQ PUB bind. |
+| `--enable_neck_pub` / `--no_neck_pub` | on | Toggle neck publishing. |
+| `--neck_pub_port <n>` | `5570` | ZMQ PUB port for `[yaw, pitch]` JSON. |
+| `--neck_retarget_scale <f>` | `1.5` | Multiplier on `(yaw, pitch)` before publishing. |
+| `--hand_type {manus_dex3,wuji,none}` | `manus_dex3` | Hand pipeline. Wuji additionally binds 5559. |
+| `--wuji_hand_port <n>` | `5559` | Wuji 26D tracking PUB port. |
+
+`pose_publisher.py` (optional fallback, neck-only):
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--bind <addr>` | `tcp://0.0.0.0:5570` | ZMQ PUB bind. |
 | `--hz <n>` | `50` | Publish rate (matches `NECK_CONTROL_HZ`). |
 | `--neck-retarget-scale <f>` | `1.5` | Multiplier on `(yaw, pitch)` before publishing. |
 
@@ -312,7 +346,7 @@ collector with both ZMQ subscriptions:
 
 ```bash
 python g1_data_server.py \
-    --neck-zmq       tcp://localhost:5559 \              # action label  (publisher on this machine)
+    --neck-zmq       tcp://localhost:5570 \              # action label  (neck publisher on this machine)
     --neck-state-zmq tcp://192.168.123.164:5560          # proprioception (G1 Ethernet IP)
 ```
 
@@ -407,13 +441,15 @@ Another process has it. `sudo fuser -v /dev/ttyUSB0` lists holders.
 Kill any stale `realsense_server.py`.
 
 **`zmq.error.ZMQError: Address already in use` on the desktop**
-An old `pose_publisher.py` is still running:
-`pkill -f pose_publisher.py`.
+An old neck publisher is still bound to 5570 — usually
+`pico_manus_thread_server.py` (or `pose_publisher.py` if you ran the
+fallback). Kill whichever is stale:
+`pkill -f pico_manus_thread_server.py` or `pkill -f pose_publisher.py`.
 
 **`[Neck] State PUB bind failed: Address already in use`**
 A previous `realsense_server.py` is still bound to `:5560`. Either kill
 it (`pkill -f realsense_server.py`), use a different port via
-`--neck-state-pub tcp://*:5561`, or pass `--neck-state-pub ""` to
+`--neck-state-pub tcp://*:5571`, or pass `--neck-state-pub ""` to
 disable state publishing this run.
 
 **`states['neck']` is missing from `data.json`**
@@ -434,9 +470,14 @@ instead of snapping back to zero. Ctrl-C the G1 server to zero-return
 cleanly.
 
 **Neck moves when leaning torso (the bug this pipeline was built to fix)**
-That's a regression from a misconfigured publisher. Confirm
-`pose_publisher.py` logs `XRobotStreamer initialized.` (not
-`XRoboToolkit SDK initialized.`) and that it's importing
-`XRobotStreamer` + `human_head_to_robot_neck` from
-`general_motion_retargeting`, not falling back to the raw
-`xrt.get_headset_pose()`.
+That's a regression from a misconfigured publisher. The current path
+goes through `human_head_to_robot_neck` (head rotation relative to the
+SMPL-X spine), so leaning shouldn't translate to neck motion.
+- For `pico_manus_thread_server.py`: confirm the gmr shim resolved at
+  startup — if you see `Warning: general_motion_retargeting not
+  available …; --enable_neck_pub will be a no-op.` it never published
+  neck. Fix the PYTHONPATH export (Setup §1.2).
+- For `pose_publisher.py` fallback: confirm it logs `XRobotStreamer
+  initialized.` (not `XRoboToolkit SDK initialized.`) and that it's
+  importing `XRobotStreamer` + `human_head_to_robot_neck` from
+  `general_motion_retargeting`.
