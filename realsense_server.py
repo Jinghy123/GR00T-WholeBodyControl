@@ -107,7 +107,7 @@ NECK_SMOOTH_ALPHA     = 0.3    # 0 = frozen, 1 = no smoothing
 NECK_CONTROL_HZ       = 50
 # Sign multipliers applied to the SMPL-X-derived (yaw, pitch). Flip if the
 # motor moves opposite to the head.
-NECK_YAW_SIGN         = -1
+NECK_YAW_SIGN         = 1
 NECK_PITCH_SIGN       = -1
 
 ADDR_TORQUE_ENABLE    = 64
@@ -633,6 +633,8 @@ class NeckMotor:
             )
         except Exception:
             return None, None
+        
+        
 
     def _read_neck_angles(self):
         """Return (yaw_rad, pitch_rad) from the ZMQ SUB, or None."""

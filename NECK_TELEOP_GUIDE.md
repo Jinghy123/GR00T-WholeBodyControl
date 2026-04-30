@@ -137,13 +137,91 @@ python get_python_api.py
 If your JetPack / CUDA version differs from L4T 36.5, fetch the matching
 build instead from [stereolabs.com/developers](https://www.stereolabs.com/developers/release).
 
-#### 3. Host / permissions
+#### 3. GStreamer for the Pico H.264 stream
+
+`realsense_server.py --enable-pico` encodes the ZED stereo with GStreamer
+(`x264enc` → TCP) and pushes it to the headset. It needs the system
+GStreamer plugins **and** PyGObject (`gi`) inside the env. Without these,
+the server logs
+
+```
+ENABLE_PICO set but GStreamer/PyGObject not available: No module named 'gi'
+```
+
+once at startup and silently disables the streamer — the rest of the
+pipeline (neck, ZMQ camera REP, neck-state PUB) still runs, so the
+headset just stays black.
+
+##### 3.1 System packages
+```bash
+sudo apt install -y \
+    gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 \
+    gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav \
+    libgirepository1.0-dev libcairo2-dev pkg-config
+```
+
+##### 3.2 PyGObject in the env
+
+Do **not** try to expose the system `python3-gi` to a Python-3.10 env via
+a `.pth` shim — the system `_gi.so` on Ubuntu 20.04 is built for system
+Python 3.8 and fails with `cannot import name '_gi'` under 3.10. Build it
+inside the env instead:
+
+```bash
+micromamba activate sonic            # or `conda activate sonic`
+pip install pycairo "PyGObject<3.51"
+```
+
+The `<3.51` pin is required on Ubuntu 20.04: PyGObject 3.51+ needs
+`girepository-2.0` (GLib ≥ 2.80), but 20.04 ships GLib 2.64 with
+`girepository-1.0`. The 3.50.x series is the last that builds against
+the older introspection lib. Without the pin, pip fails with
+`Dependency 'girepository-2.0' is required but not found`.
+
+##### 3.3 libffi `LD_PRELOAD` (conda/miniconda envs only)
+
+Conda ships its own `libffi`, which masks the system `libffi.so.7` that
+GStreamer's `libgobject-2.0` was linked against. Symptom on import:
+
+```
+undefined symbol: ffi_type_uint32, version LIBFFI_BASE_7.0
+```
+
+Force-load the system libffi for any sonic shell:
+
+```bash
+echo 'export LD_PRELOAD=/lib/aarch64-linux-gnu/libffi.so.7' >> ~/.bashrc
+```
+
+Or scope it to the env via an activate hook (replace the path if you use
+micromamba or a different env root):
+
+```bash
+mkdir -p ~/miniconda3/envs/sonic/etc/conda/activate.d
+echo 'export LD_PRELOAD=/lib/aarch64-linux-gnu/libffi.so.7' \
+    > ~/miniconda3/envs/sonic/etc/conda/activate.d/libffi.sh
+```
+
+Pure-system installs (no conda/micromamba) don't need this step.
+
+##### 3.4 Verify
+
+```bash
+python -c "import gi; gi.require_version('Gst','1.0'); from gi.repository import Gst; Gst.init([]); print('Gst ok')"
+```
+
+Should print `Gst ok`. Once this passes, `realsense_server.py
+--enable-pico …` will log `[PicoStreamer] Connected to Pico <ip>:12345`
+as soon as the XRoboToolkit Client app is running on the headset.
+
+#### 4. Host / permissions
 ```bash
 sudo ufw disable
 sudo usermod -aG dialout $USER     # for /dev/ttyUSB0; log out/in to apply
 ```
 
-#### 4. Sanity-check the motor port
+#### 5. Sanity-check the motor port
 ```bash
 python -c "
 from dynamixel_sdk import PortHandler, PacketHandler
@@ -396,6 +474,28 @@ only supported source.
 
 **`[Neck] Import failed: No module named 'dynamixel_sdk'`**
 `pip install dynamixel-sdk` in the G1's env.
+
+**`ENABLE_PICO set but GStreamer/PyGObject not available: No module named 'gi'`**
+PyGObject isn't installed in the sonic env — the streamer silently
+disables itself, neck still works, headset stays black. Follow G1 Orin
+setup §3.
+
+**`pip install PyGObject` fails with `Dependency 'girepository-2.0' is required but not found`**
+PyGObject ≥ 3.51 needs GLib 2.80; Ubuntu 20.04 ships GLib 2.64. Pin to
+the older series: `pip install "PyGObject<3.51"`.
+
+**`ImportError: cannot import name '_gi' from partially initialized module 'gi'`**
+You exposed the system `python3-gi` to a Python-3.10 env via a `.pth`
+file (e.g. `system_dist.pth`). The system `_gi.so` is built for Ubuntu
+20.04's system Python 3.8 and won't load under 3.10. Delete the `.pth`
+and `pip install "PyGObject<3.51"` inside the env (G1 Orin setup §3.2).
+
+**`undefined symbol: ffi_type_uint32, version LIBFFI_BASE_7.0`**
+Conda's bundled `libffi` is being loaded instead of the system one,
+which is what `libgobject-2.0` was linked against. Force-load the
+system libffi:
+`export LD_PRELOAD=/lib/aarch64-linux-gnu/libffi.so.7`
+(see G1 Orin setup §3.3 for a permanent activate hook).
 
 **`[Neck] Could not open /dev/ttyUSB0`**
 - USB cable plugged in? `ls /dev/ttyUSB*`.
