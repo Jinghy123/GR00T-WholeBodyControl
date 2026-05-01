@@ -23,6 +23,7 @@ import sys
 import time
 import threading
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
@@ -113,6 +114,140 @@ IMAGE_BUFFER_SIZE = 100
 # TASK_PROMPT = "pick up the bottle and place it on the left"
 TASK_PROMPT = "pick up the red box and pour water into the orange cup"
 
+
+@dataclass
+class FirstChunkSanityReport:
+    ok: bool
+    reason: str
+    hand_delta_l2: float | None
+    hand_delta_max: float | None
+    token_clip_fraction: float
+    token_range: tuple[float, float]
+
+
+@dataclass
+class HandStateHealthReport:
+    ok: bool
+    reason: str
+    saturation_fraction: float | None
+    startup_sentinel_l2: float | None
+    hand_range: tuple[float, float] | None
+
+
+# WBC fallback/default value observed in bad live traces before a real hand
+# command/state has been supplied. It is published under *_measured fields in
+# the current WBC debug stream, but it is far outside the FastWAM 0422 initial
+# state distribution.
+STARTUP_HAND_SENTINEL = np.array(
+    [0.0, 0.0, 1.75, -1.57, -1.75, -1.57, -1.75, 0.0, 0.0, -1.75, 1.57, 1.75, 1.57, 1.75],
+    dtype=np.float32,
+)
+
+# RealWorld/0422 dataset-derived first-frame hand fallback. Across the 141
+# available 0422 episodes, the first states.hand_joints median/min/max are all
+# this zero vector, so this is the least surprising policy-conditioning value
+# when WBC is still publishing its default hand fallback.
+DATASET_INITIAL_HAND_FALLBACK = np.zeros(14, dtype=np.float32)
+
+
+def parse_hand_state_fallback(mode="dataset_initial", values=None):
+    mode = str(mode or "none").strip().lower()
+    if mode in ("none", "off", "disabled"):
+        return None
+    if mode in ("dataset_initial", "0422_initial"):
+        return DATASET_INITIAL_HAND_FALLBACK.copy()
+    if mode == "zeros":
+        return np.zeros(14, dtype=np.float32)
+    if mode == "custom":
+        if values is None or str(values).strip() == "":
+            raise ValueError("--hand-state-fallback-values is required when fallback mode is custom")
+        parsed = np.fromstring(str(values), dtype=np.float32, sep=",")
+        if parsed.shape != (14,):
+            raise ValueError(
+                f"--hand-state-fallback-values must contain 14 comma-separated floats, got {parsed.shape}"
+            )
+        if not np.isfinite(parsed).all():
+            raise ValueError("--hand-state-fallback-values contains non-finite values")
+        return parsed.astype(np.float32, copy=True)
+    raise ValueError(f"Unknown invalid hand state fallback mode: {mode}")
+
+
+def state_with_hand_fallback(state, fallback):
+    if state is None or fallback is None:
+        return state
+    hand = np.asarray(fallback, dtype=np.float32).reshape(-1)
+    if hand.shape != (14,):
+        raise ValueError(f"hand fallback must have shape (14,), got {hand.shape}")
+    patched = {}
+    for key, value in state.items():
+        if isinstance(value, np.ndarray):
+            patched[key] = value.copy()
+        else:
+            patched[key] = value
+    patched["left_hand_q"] = hand[:7].copy()
+    patched["right_hand_q"] = hand[7:].copy()
+    return patched
+
+
+class RtcPrefetchState:
+    """Small pure state machine for one-prefetch-per-active-chunk RTC scheduling."""
+
+    def __init__(self, prefetch_step=15, timeout_sec=1.0):
+        self.prefetch_step = max(1, int(prefetch_step))
+        self.timeout_sec = max(0.0, float(timeout_sec))
+        self.active_chunk_id = 0
+        self.prefetch_started_for_chunk = False
+        self.inflight = False
+        self.inflight_chunk_id = None
+        self.ready_chunk_id = None
+        self.start_time = 0.0
+
+    def adopt_chunk(self):
+        self.active_chunk_id += 1
+        self.prefetch_started_for_chunk = False
+        return self.active_chunk_id
+
+    def should_start(self, executed_steps, chunk_len):
+        threshold = min(self.prefetch_step, int(chunk_len))
+        return (
+            int(executed_steps) >= threshold
+            and not self.prefetch_started_for_chunk
+            and not self.inflight
+            and self.ready_chunk_id is None
+        )
+
+    def mark_started(self, now):
+        self.prefetch_started_for_chunk = True
+        self.inflight = True
+        self.inflight_chunk_id = self.active_chunk_id
+        self.start_time = float(now)
+        return self.inflight_chunk_id
+
+    def mark_ready(self, chunk_id):
+        if not self.inflight or chunk_id != self.inflight_chunk_id:
+            return False
+        self.inflight = False
+        self.ready_chunk_id = chunk_id
+        return True
+
+    def consume_ready(self):
+        if self.ready_chunk_id != self.active_chunk_id:
+            return False
+        self.ready_chunk_id = None
+        return True
+
+    def clear_ready(self):
+        self.ready_chunk_id = None
+
+    def timeout_expired(self, now):
+        if not self.inflight or self.timeout_sec <= 0:
+            return False
+        if float(now) - self.start_time <= self.timeout_sec:
+            return False
+        self.inflight = False
+        self.inflight_chunk_id = None
+        return True
+
 def fsq_quantize(continuous_value, fsq_min=FSQ_MIN, fsq_max=FSQ_MAX, fsq_step=FSQ_STEP):
     clipped = np.clip(continuous_value, fsq_min, fsq_max)
 
@@ -121,6 +256,85 @@ def fsq_quantize(continuous_value, fsq_min=FSQ_MIN, fsq_max=FSQ_MAX, fsq_step=FS
     quantized = np.clip(quantized, fsq_min, fsq_max)
 
     return quantized
+
+
+def token_clip_fraction(token):
+    token = np.asarray(token, dtype=np.float32)
+    if token.size == 0:
+        return 0.0
+    return float(np.mean((token <= FSQ_MIN) | (token >= FSQ_MAX)))
+
+
+def first_chunk_sanity_report(
+    chunk,
+    state,
+    hand_l2_threshold=2.0,
+    hand_max_threshold=1.0,
+    token_clip_threshold=0.95,
+):
+    chunk = np.asarray(chunk, dtype=np.float32)
+    if chunk.ndim != 2 or chunk.shape[0] <= 0 or chunk.shape[1] != ACTION_DIM:
+        return FirstChunkSanityReport(False, f"invalid_chunk_shape={chunk.shape}", None, None, 1.0, (0.0, 0.0))
+    token = chunk[0, 14:]
+    clip_fraction = token_clip_fraction(token)
+    token_range = (float(np.min(token)), float(np.max(token)))
+    if state is None:
+        return FirstChunkSanityReport(False, "missing_wbc_state", None, None, clip_fraction, token_range)
+    current_hand = np.concatenate([state["left_hand_q"], state["right_hand_q"]], axis=-1).astype(np.float32)
+    hand_delta = chunk[0, :14] - current_hand
+    hand_l2 = float(np.linalg.norm(hand_delta))
+    hand_max = float(np.max(np.abs(hand_delta)))
+    reasons = []
+    if hand_l2 > float(hand_l2_threshold):
+        reasons.append(f"hand_l2={hand_l2:.4f}>{float(hand_l2_threshold):.4f}")
+    if hand_max > float(hand_max_threshold):
+        reasons.append(f"hand_max={hand_max:.4f}>{float(hand_max_threshold):.4f}")
+    if clip_fraction > float(token_clip_threshold):
+        reasons.append(f"token_clip_fraction={clip_fraction:.4f}>{float(token_clip_threshold):.4f}")
+    return FirstChunkSanityReport(
+        ok=not reasons,
+        reason="ok" if not reasons else ";".join(reasons),
+        hand_delta_l2=hand_l2,
+        hand_delta_max=hand_max,
+        token_clip_fraction=clip_fraction,
+        token_range=token_range,
+    )
+
+
+def hand_state_health_report(
+    state,
+    saturation_abs_threshold=1.55,
+    saturation_fraction_threshold=0.6,
+    startup_sentinel_l2_threshold=0.25,
+):
+    if state is None:
+        return HandStateHealthReport(False, "missing_wbc_state", None, None, None)
+    try:
+        hand = np.concatenate([state["left_hand_q"], state["right_hand_q"]], axis=-1).astype(np.float32)
+    except Exception as exc:
+        return HandStateHealthReport(False, f"invalid_hand_state:{exc}", None, None, None)
+    if hand.shape != (14,):
+        return HandStateHealthReport(False, f"invalid_hand_shape={hand.shape}", None, None, None)
+    if not np.isfinite(hand).all():
+        return HandStateHealthReport(False, "nonfinite_hand_state", None, None, None)
+
+    saturation_fraction = float(np.mean(np.abs(hand) >= float(saturation_abs_threshold)))
+    startup_sentinel_l2 = float(np.linalg.norm(hand - STARTUP_HAND_SENTINEL))
+    hand_range = (float(np.min(hand)), float(np.max(hand)))
+    reasons = []
+    if startup_sentinel_l2 <= float(startup_sentinel_l2_threshold):
+        reasons.append(f"startup_sentinel_l2={startup_sentinel_l2:.4f}")
+    if saturation_fraction > float(saturation_fraction_threshold):
+        reasons.append(
+            f"hand_saturation_fraction={saturation_fraction:.4f}>{float(saturation_fraction_threshold):.4f}"
+        )
+    return HandStateHealthReport(
+        ok=not reasons,
+        reason="ok" if not reasons else ";".join(reasons),
+        saturation_fraction=saturation_fraction,
+        startup_sentinel_l2=startup_sentinel_l2,
+        hand_range=hand_range,
+    )
 
 
 
@@ -325,7 +539,7 @@ class PolicyClientManager:
             print(f"[PolicyClient] Action-only mode: ON")
         print(f"[PolicyClient] Connected successfully!")
 
-    def get_action(self, images, state, rtc_metadata=None):
+    def get_action(self, images, state, rtc_metadata=None, recording_frames=None):
         """
         Send observation to policy server and get action.
 
@@ -352,6 +566,8 @@ class PolicyClientManager:
             obs["action_attend_to_noisy_video"] = False
         if rtc_metadata:
             obs.update(rtc_metadata)
+        if recording_frames is not None:
+            obs["recording/head"] = recording_frames
 
         # Get action from policy server
         try:
@@ -378,11 +594,11 @@ class PolicyClientManager:
             print(f"[PolicyClient] Error getting action: {e}")
             return None
 
-    def reset(self):
+    def reset(self, reset_info=None):
         """Send reset signal to policy server."""
         if self._client:
             try:
-                self._client.reset({})
+                self._client.reset({} if reset_info is None else dict(reset_info))
                 print("[PolicyClient] Reset signal sent successfully.")
             except Exception as e:
                 print(f"[PolicyClient] Failed to send reset: {e}")
@@ -409,11 +625,46 @@ class TokenPolicyClient:
                  dry_run=False,
                  max_chunks=0,
                  enable_rtc_prefetch=False,
-                 rtc_prefetch_step=15):
+                 rtc_prefetch_step=15,
+                 rtc_prefetch_timeout_sec=1.0,
+                 first_chunk_sanity="warn",
+                 first_chunk_hand_l2_threshold=2.0,
+                 first_chunk_hand_max_threshold=1.0,
+                 first_chunk_token_clip_threshold=0.95,
+                 start_after_first_chunk=True,
+                 require_valid_hand_state=True,
+                 valid_hand_state_timeout_sec=5.0,
+                 hand_state_saturation_fraction_threshold=0.6,
+                 invalid_hand_state_fallback="dataset_initial",
+                 hand_state_fallback_values=None,
+                 send_recording_frames=True,
+                 max_recording_frames=120):
         self._dry_run = bool(dry_run)
         self._max_chunks = max(0, int(max_chunks))
         self._enable_rtc_prefetch = bool(enable_rtc_prefetch)
         self._rtc_prefetch_step = max(1, int(rtc_prefetch_step))
+        self._rtc_prefetch_timeout_sec = max(0.0, float(rtc_prefetch_timeout_sec))
+        self._rtc_state = RtcPrefetchState(
+            prefetch_step=self._rtc_prefetch_step,
+            timeout_sec=self._rtc_prefetch_timeout_sec,
+        )
+        self._first_chunk_sanity = str(first_chunk_sanity)
+        self._first_chunk_hand_l2_threshold = float(first_chunk_hand_l2_threshold)
+        self._first_chunk_hand_max_threshold = float(first_chunk_hand_max_threshold)
+        self._first_chunk_token_clip_threshold = float(first_chunk_token_clip_threshold)
+        self._start_after_first_chunk = bool(start_after_first_chunk)
+        self._require_valid_hand_state = bool(require_valid_hand_state)
+        self._valid_hand_state_timeout_sec = max(0.0, float(valid_hand_state_timeout_sec))
+        self._hand_state_saturation_fraction_threshold = float(hand_state_saturation_fraction_threshold)
+        self._invalid_hand_state_fallback_mode = str(invalid_hand_state_fallback)
+        self._invalid_hand_state_fallback = parse_hand_state_fallback(
+            self._invalid_hand_state_fallback_mode,
+            hand_state_fallback_values,
+        )
+        self._invalid_hand_state_fallback_count = 0
+        self._last_policy_state_for_sanity = None
+        self._send_recording_frames = bool(send_recording_frames)
+        self._max_recording_frames = max(1, int(max_recording_frames))
 
         # Initialize components
         self._camera = RSCamera(host=camera_host, port=camera_port)
@@ -428,18 +679,24 @@ class TokenPolicyClient:
 
         self._pending_chunk: np.ndarray | None = None  # latest chunk from inference worker
         self._pending_chunk_seq = 0
+        self._pending_chunk_parent_id: int | None = None
+        self._pending_chunk_source = "regular"
         self._regular_request_inflight = False
+        self._regular_request_parent_id: int | None = None
+        self._regular_request_label = "regular"
         self._chunk_lock = threading.Lock()
         self._prefetch_lock = threading.Lock()
         self._prefetch_inflight = False
         self._prefetch_chunk: np.ndarray | None = None
         self._prefetch_elapsed_ticks: int | None = None
+        self._prefetch_chunk_id: int | None = None
         self._prefetch_start_time = 0.0
         self._prefetch_start_step: int | None = None
         self._prefetch_freeze_ticks = 0
         self._last_rtc_elapsed_ticks: int | None = None
 
         self.image_buffer = deque(maxlen=IMAGE_BUFFER_SIZE)
+        self._recording_frames = deque(maxlen=self._max_recording_frames)
         self.image_buffer_lock = threading.Lock()
 
     def start(self):
@@ -473,14 +730,21 @@ class TokenPolicyClient:
 
         with self.image_buffer_lock:
             self.image_buffer.append(frame_rgb)
+            if self._send_recording_frames:
+                self._recording_frames.append(frame_rgb.copy())
 
     def _request_next_chunk(self, label="regular"):
         with self._chunk_lock:
             if self._regular_request_inflight:
                 return False
             self._regular_request_inflight = True
+            self._regular_request_parent_id = self._rtc_state.active_chunk_id
+            self._regular_request_label = str(label)
             self._sequence_done_event.set()
-        print(f"[Inference] Requested {label} policy chunk.")
+        print(
+            f"[Inference] Requested {label} policy chunk "
+            f"parent_chunk_id={self._regular_request_parent_id}."
+        )
         return True
 
     def _latest_image_from_buffer(self):
@@ -490,6 +754,72 @@ class TokenPolicyClient:
         self._get_image()
         with self.image_buffer_lock:
             return self.image_buffer[-1].copy()
+
+    def _get_policy_state(self):
+        deadline = None
+        if self._valid_hand_state_timeout_sec > 0:
+            deadline = time.perf_counter() + self._valid_hand_state_timeout_sec
+        last_log = 0.0
+        while self._running.is_set():
+            state = self._state_reader.get_state()
+            if not self._require_valid_hand_state:
+                self._last_policy_state_for_sanity = state
+                return state
+            report = hand_state_health_report(
+                state,
+                saturation_fraction_threshold=self._hand_state_saturation_fraction_threshold,
+            )
+            if report.ok:
+                self._last_policy_state_for_sanity = state
+                return state
+            if state is not None and self._invalid_hand_state_fallback is not None:
+                patched = state_with_hand_fallback(state, self._invalid_hand_state_fallback)
+                patched_report = hand_state_health_report(
+                    patched,
+                    saturation_fraction_threshold=self._hand_state_saturation_fraction_threshold,
+                )
+                if patched_report.ok:
+                    self._invalid_hand_state_fallback_count += 1
+                    self._last_policy_state_for_sanity = patched
+                    print(
+                        "[WBCState] Replacing invalid WBC hand state for policy request "
+                        f"with {self._invalid_hand_state_fallback_mode} fallback. "
+                        f"original_reason={report.reason} original_range={report.hand_range} "
+                        f"fallback_count={self._invalid_hand_state_fallback_count}"
+                    )
+                    return patched
+                print(
+                    "[WBCState] Configured hand fallback is still invalid; refusing it. "
+                    f"fallback_mode={self._invalid_hand_state_fallback_mode} "
+                    f"fallback_reason={patched_report.reason}"
+                )
+            now = time.perf_counter()
+            if deadline is not None and now >= deadline:
+                print(
+                    "[WBCState] Invalid hand state timeout; refusing policy request. "
+                    f"reason={report.reason} saturation_fraction={report.saturation_fraction} "
+                    f"startup_sentinel_l2={report.startup_sentinel_l2} hand_range={report.hand_range}"
+                )
+                return None
+            if now - last_log >= 1.0:
+                print(
+                    "[WBCState] Waiting for valid measured hand state before policy request. "
+                    f"reason={report.reason} saturation_fraction={report.saturation_fraction} "
+                    f"startup_sentinel_l2={report.startup_sentinel_l2} hand_range={report.hand_range}"
+                )
+                last_log = now
+            time.sleep(0.05)
+        return None
+
+    def _pop_recording_frames(self):
+        if not self._send_recording_frames:
+            return None
+        with self.image_buffer_lock:
+            if not self._recording_frames:
+                return None
+            frames = np.stack([frame.copy() for frame in self._recording_frames], axis=0)
+            self._recording_frames.clear()
+        return frames
 
     def _get_policy_chunk(self, frame_indices, rtc_metadata=None, latest_only=False):
         """
@@ -505,11 +835,59 @@ class TokenPolicyClient:
             if len(frame_indices) == 1:
                 selected = selected[0]  # (H, W, 3)
 
-        state = self._state_reader.get_state()
-        assert state is not None
+        state = self._get_policy_state()
+        if state is None:
+            print("[Inference] No valid WBC state available for policy request.")
+            return None
+        self._last_policy_state_for_sanity = state
 
-        action = self._policy_client.get_action(selected, state, rtc_metadata=rtc_metadata)
+        recording_frames = self._pop_recording_frames()
+        if recording_frames is not None:
+            print(f"[Recording] Sending {len(recording_frames)} continuous frames with policy request.")
+        action = self._policy_client.get_action(
+            selected,
+            state,
+            rtc_metadata=rtc_metadata,
+            recording_frames=recording_frames,
+        )
         return action
+
+    def _adopt_chunk(self, chunk, adopt_idx=0, source="regular", chunk_seq=None):
+        active_id = self._rtc_state.adopt_chunk()
+        idx = int(np.clip(adopt_idx, 0, max(0, len(chunk) - 1)))
+        if chunk_seq is not None:
+            with self._chunk_lock:
+                self._pending_chunk_seq = max(self._pending_chunk_seq, int(chunk_seq))
+        print(
+            f"[Chunk] Adopted chunk_id={active_id} source={source} "
+            f"adopt_idx={idx} shape={getattr(chunk, 'shape', None)}"
+        )
+        if idx >= self._rtc_prefetch_step:
+            self._maybe_start_rtc_prefetch(idx, len(chunk))
+        return chunk, idx
+
+    def _maybe_start_rtc_prefetch(self, executed_steps, chunk_len):
+        if not self._enable_rtc_prefetch:
+            return False
+        if not self._rtc_state.should_start(executed_steps, chunk_len):
+            return False
+        exec_steps = int(np.clip(executed_steps, 1, chunk_len))
+        return self._start_rtc_prefetch(exec_steps)
+
+    def _expire_rtc_prefetch_if_needed(self):
+        with self._prefetch_lock:
+            expired = self._rtc_state.timeout_expired(time.perf_counter())
+            if not expired:
+                return False
+            chunk_id = self._prefetch_chunk_id
+            self._prefetch_inflight = False
+            self._prefetch_chunk = None
+            self._prefetch_elapsed_ticks = None
+            self._prefetch_chunk_id = None
+            self._prefetch_start_step = None
+            self._prefetch_freeze_ticks = 0
+        print(f"[RTC] Prefetch timeout chunk_id={chunk_id}; allowing fallback.")
+        return True
 
     def _start_rtc_prefetch(self, exec_steps):
         if not self._enable_rtc_prefetch:
@@ -521,10 +899,12 @@ class TokenPolicyClient:
         with self._prefetch_lock:
             if self._prefetch_inflight or self._prefetch_chunk is not None:
                 return False
+            chunk_id = self._rtc_state.mark_started(time.perf_counter())
             self._prefetch_inflight = True
             self._prefetch_chunk = None
             self._prefetch_elapsed_ticks = None
-            self._prefetch_start_time = time.perf_counter()
+            self._prefetch_chunk_id = chunk_id
+            self._prefetch_start_time = self._rtc_state.start_time
             self._prefetch_start_step = exec_steps
             self._prefetch_freeze_ticks = 0
 
@@ -537,7 +917,7 @@ class TokenPolicyClient:
             rtc_metadata["rtc_client_elapsed_ticks"] = int(self._last_rtc_elapsed_ticks)
 
         print(
-            f"[RTC] Prefetch start step={exec_steps} "
+            f"[RTC] Prefetch start chunk_id={chunk_id} step={exec_steps} "
             f"prev_elapsed_ticks={rtc_metadata.get('rtc_client_elapsed_ticks')}"
         )
 
@@ -552,18 +932,24 @@ class TokenPolicyClient:
                 if not isinstance(chunk, np.ndarray) or chunk.ndim != 2 or chunk.shape[0] != ACTION_HORIZON:
                     raise RuntimeError(f"RTC prefetch returned invalid chunk shape: {getattr(chunk, 'shape', None)}")
                 with self._prefetch_lock:
+                    if not self._rtc_state.mark_ready(chunk_id):
+                        print(f"[RTC] Dropping stale prefetch result chunk_id={chunk_id}")
+                        return
                     self._prefetch_chunk = chunk
                     self._prefetch_elapsed_ticks = elapsed_ticks
                     self._prefetch_inflight = False
                 print(
-                    f"[RTC] Prefetch ready elapsed_ticks={elapsed_ticks} "
+                    f"[RTC] Prefetch ready chunk_id={chunk_id} elapsed_ticks={elapsed_ticks} "
                     f"shape={chunk.shape}"
                 )
             except Exception as e:
                 with self._prefetch_lock:
+                    self._rtc_state.inflight = False
+                    self._rtc_state.inflight_chunk_id = None
                     self._prefetch_inflight = False
                     self._prefetch_chunk = None
                     self._prefetch_elapsed_ticks = None
+                    self._prefetch_chunk_id = None
                 print(f"[RTC] Prefetch failed: {e}")
 
         thread = threading.Thread(target=_worker, daemon=True)
@@ -571,18 +957,31 @@ class TokenPolicyClient:
         return True
 
     def _has_rtc_prefetch_inflight(self):
+        self._expire_rtc_prefetch_if_needed()
         with self._prefetch_lock:
             return self._prefetch_inflight
 
     def _consume_rtc_prefetch(self, current_idx, current_chunk_len):
+        self._expire_rtc_prefetch_if_needed()
         with self._prefetch_lock:
             if self._prefetch_chunk is None:
+                return None
+            if not self._rtc_state.consume_ready():
+                stale_id = self._prefetch_chunk_id
+                self._prefetch_chunk = None
+                self._prefetch_elapsed_ticks = None
+                self._prefetch_chunk_id = None
+                self._prefetch_start_step = None
+                self._prefetch_freeze_ticks = 0
+                print(f"[RTC] Dropping stale ready prefetch chunk_id={stale_id}")
                 return None
             chunk = self._prefetch_chunk
             elapsed_ticks = 0 if self._prefetch_elapsed_ticks is None else int(self._prefetch_elapsed_ticks)
             freeze_ticks = int(self._prefetch_freeze_ticks)
+            chunk_id = self._prefetch_chunk_id
             self._prefetch_chunk = None
             self._prefetch_elapsed_ticks = None
+            self._prefetch_chunk_id = None
             self._prefetch_start_step = None
             self._prefetch_freeze_ticks = 0
 
@@ -590,17 +989,43 @@ class TokenPolicyClient:
         ready_before_boundary = int(current_idx) < int(current_chunk_len)
         self._last_rtc_elapsed_ticks = elapsed_ticks
         print(
-            f"[RTC] Handoff elapsed_ticks={elapsed_ticks} handoff_idx={handoff_idx} "
+            f"[RTC] Handoff chunk_id={chunk_id} elapsed_ticks={elapsed_ticks} handoff_idx={handoff_idx} "
             f"ready_before_boundary={ready_before_boundary} freeze_ticks={freeze_ticks}"
         )
         return chunk, handoff_idx
 
     def _increment_rtc_freeze_ticks(self):
+        self._expire_rtc_prefetch_if_needed()
         with self._prefetch_lock:
             if self._prefetch_inflight:
                 self._prefetch_freeze_ticks += 1
                 return self._prefetch_freeze_ticks
             return self._prefetch_freeze_ticks
+
+    def _run_first_chunk_sanity(self, chunk):
+        mode = self._first_chunk_sanity
+        if mode == "off" or self._dry_run:
+            return True
+        state = self._last_policy_state_for_sanity
+        if state is None:
+            state = self._state_reader.get_state()
+        report = first_chunk_sanity_report(
+            chunk,
+            state,
+            hand_l2_threshold=self._first_chunk_hand_l2_threshold,
+            hand_max_threshold=self._first_chunk_hand_max_threshold,
+            token_clip_threshold=self._first_chunk_token_clip_threshold,
+        )
+        print(
+            "[FirstChunkSanity] "
+            f"ok={report.ok} reason={report.reason} "
+            f"hand_l2={report.hand_delta_l2} hand_max={report.hand_delta_max} "
+            f"token_clip_fraction={report.token_clip_fraction:.4f} token_range={report.token_range}"
+        )
+        if mode == "block" and not report.ok:
+            print("[FirstChunkSanity] Blocking first policy chunk before WBC start/publish.")
+            return False
+        return True
 
     def _log_action(self, actions: np.ndarray, dt: float) -> None:
 
@@ -634,6 +1059,9 @@ class TokenPolicyClient:
         while self._running.is_set():
             self._sequence_done_event.wait()
             try:
+                with self._chunk_lock:
+                    request_parent_id = self._regular_request_parent_id
+                    request_label = self._regular_request_label
                 # Step 0: initial single frame
                 if step == 0:
                     print(("=== Initial: frame [0] ==="))
@@ -654,6 +1082,8 @@ class TokenPolicyClient:
                     with self._chunk_lock:
                         self._pending_chunk = chunk
                         self._pending_chunk_seq += 1
+                        self._pending_chunk_parent_id = request_parent_id
+                        self._pending_chunk_source = request_label
                         self._regular_request_inflight = False
                     with self.image_buffer_lock:
                         self.image_buffer.clear()
@@ -685,14 +1115,30 @@ class TokenPolicyClient:
         while self._sequence_done_event.is_set() and self._running.is_set():
             time.sleep(0.05)
 
+        carried_chunk = None
+        carried_idx = 0
+        carried_source = "dry-run"
         while self._running.is_set():
-            with self._chunk_lock:
-                chunk = None if self._pending_chunk is None else self._pending_chunk.copy()
-                chunk_seq = self._pending_chunk_seq
-            if chunk is None:
-                print("[DryRun] No chunk available; stopping.")
-                self._running.clear()
-                return
+            if carried_chunk is None:
+                with self._chunk_lock:
+                    chunk = None if self._pending_chunk is None else self._pending_chunk.copy()
+                    chunk_seq = self._pending_chunk_seq
+                if chunk is None:
+                    print("[DryRun] No chunk available; stopping.")
+                    self._running.clear()
+                    return
+                start_idx = 0
+                source = "dry-run"
+            else:
+                chunk = carried_chunk
+                start_idx = carried_idx
+                source = carried_source
+                with self._chunk_lock:
+                    chunk_seq = self._pending_chunk_seq
+                carried_chunk = None
+                carried_idx = 0
+                carried_source = "dry-run"
+            chunk, start_idx = self._adopt_chunk(chunk, adopt_idx=start_idx, source=source)
 
             chunks_seen += 1
             print(
@@ -704,52 +1150,44 @@ class TokenPolicyClient:
                 self._running.clear()
                 return
 
-            next_chunk = None
-            for step in range(ACTION_HORIZON):
+            for step in range(start_idx, ACTION_HORIZON):
                 if not self._running.is_set():
                     return
                 t_start = time.perf_counter()
                 self._get_image()
                 exec_steps = step + 1
-                if self._enable_rtc_prefetch and exec_steps == min(self._rtc_prefetch_step, ACTION_HORIZON):
-                    self._start_rtc_prefetch(exec_steps)
+                self._maybe_start_rtc_prefetch(exec_steps, ACTION_HORIZON)
                 prefetched = self._consume_rtc_prefetch(exec_steps, ACTION_HORIZON)
                 if prefetched is not None:
-                    next_chunk, _ = prefetched
+                    carried_chunk, carried_idx = prefetched
+                    carried_source = "rtc_prefetch"
                     break
                 elapsed = time.perf_counter() - t_start
                 sleep_time = dt - elapsed
                 if sleep_time > 0:
                     time.sleep(sleep_time)
 
-            if next_chunk is not None:
-                with self._chunk_lock:
-                    self._pending_chunk = next_chunk
-                    self._pending_chunk_seq += 1
+            if carried_chunk is not None:
                 continue
 
             if self._enable_rtc_prefetch:
                 prefetched = self._consume_rtc_prefetch(ACTION_HORIZON, ACTION_HORIZON)
                 if prefetched is not None:
-                    next_chunk, _ = prefetched
-                    with self._chunk_lock:
-                        self._pending_chunk = next_chunk
-                        self._pending_chunk_seq += 1
+                    carried_chunk, carried_idx = prefetched
+                    carried_source = "rtc_prefetch"
                     continue
 
             if self._enable_rtc_prefetch and self._has_rtc_prefetch_inflight():
                 while self._running.is_set():
                     prefetched = self._consume_rtc_prefetch(ACTION_HORIZON, ACTION_HORIZON)
                     if prefetched is not None:
-                        next_chunk, _ = prefetched
-                        with self._chunk_lock:
-                            self._pending_chunk = next_chunk
-                            self._pending_chunk_seq += 1
+                        carried_chunk, carried_idx = prefetched
+                        carried_source = "rtc_prefetch"
                         break
                     freeze_ticks = self._increment_rtc_freeze_ticks()
                     print(f"[RTC] Dry-run waiting for prefetch freeze_ticks={freeze_ticks}")
                     time.sleep(dt)
-                if next_chunk is not None:
+                if carried_chunk is not None:
                     continue
 
             self._request_next_chunk("dry-run fallback")
@@ -772,9 +1210,11 @@ class TokenPolicyClient:
         assert self._token_publisher is not None
         assert self._encoder is not None
 
-        # Send start command first, then request first chunk, then publish
-        # immediately once it arrives (matches psi_sonic_client pattern).
-        self._token_publisher.send_command(start=True, stop=False, planner=True)
+        # FastWAM can take a moment to produce the first chunk. By default we
+        # wait until the first chunk passes sanity checks before telling WBC to
+        # start, so WBC does not move on stale/default policy input.
+        if not self._start_after_first_chunk:
+            self._token_publisher.send_command(start=True, stop=False, planner=True)
         print("[PublishLoop] Requesting first policy inference...")
         self._request_next_chunk("initial publish")
         while self._sequence_done_event.is_set() and self._running.is_set():
@@ -788,9 +1228,14 @@ class TokenPolicyClient:
             print("[PublishLoop] No initial chunk available; stopping.")
             self._running.clear()
             return
+        if not self._run_first_chunk_sanity(chunk):
+            self._running.clear()
+            self._token_publisher.send_command(start=False, stop=True, planner=False)
+            return
+        if self._start_after_first_chunk:
+            self._token_publisher.send_command(start=True, stop=False, planner=True)
 
-
-        idx = 0
+        chunk, idx = self._adopt_chunk(chunk, adopt_idx=0, source="initial", chunk_seq=chunk_seq)
         using_last_action = False
         frozen_action = None   # encoder-derived freeze token, set once when chunk exhausts
         print(f"[PublishLoop] First chunk: shape={chunk.shape}. Starting execution.")
@@ -802,7 +1247,11 @@ class TokenPolicyClient:
             if self._enable_rtc_prefetch:
                 prefetched = self._consume_rtc_prefetch(idx, len(chunk))
                 if prefetched is not None:
-                    chunk, idx = prefetched
+                    chunk, idx = self._adopt_chunk(
+                        prefetched[0],
+                        adopt_idx=prefetched[1],
+                        source="rtc_prefetch",
+                    )
                     frozen_action = None
 
             if idx < len(chunk):
@@ -843,7 +1292,11 @@ class TokenPolicyClient:
                 if self._enable_rtc_prefetch:
                     prefetched = self._consume_rtc_prefetch(idx, len(chunk))
                     if prefetched is not None:
-                        chunk, idx = prefetched
+                        chunk, idx = self._adopt_chunk(
+                            prefetched[0],
+                            adopt_idx=prefetched[1],
+                            source="rtc_prefetch",
+                        )
                         frozen_action = None
                         print(f"[PublishLoop] RTC chunk received: shape={chunk.shape}. Resuming execution.")
                     elif not self._has_rtc_prefetch_inflight():
@@ -851,13 +1304,29 @@ class TokenPolicyClient:
 
                 with self._chunk_lock:
                     regular_ready = self._pending_chunk_seq > chunk_seq
+                    pending_chunk = self._pending_chunk
+                    pending_seq = self._pending_chunk_seq
+                    pending_parent_id = self._pending_chunk_parent_id
+                    pending_source = self._pending_chunk_source
 
-                if regular_ready:
-                    with self._chunk_lock:
-                        chunk = self._pending_chunk
-                        chunk_seq = self._pending_chunk_seq
+                if regular_ready and pending_parent_id != self._rtc_state.active_chunk_id:
+                    chunk_seq = pending_seq
+                    print(
+                        f"[PublishLoop] Ignoring stale {pending_source} chunk "
+                        f"parent_id={pending_parent_id} active_id={self._rtc_state.active_chunk_id}."
+                    )
+                    action = frozen_action
+                    using_last_action = True
+                elif regular_ready:
+                    chunk = pending_chunk
+                    chunk_seq = pending_seq
                     frozen_action = None
-                    idx = 0
+                    chunk, idx = self._adopt_chunk(
+                        chunk,
+                        adopt_idx=0,
+                        source=pending_source,
+                        chunk_seq=chunk_seq,
+                    )
                     print(f"[PublishLoop] New chunk received: shape={chunk.shape}. "
                           f"Resuming execution.")
 
@@ -890,11 +1359,8 @@ class TokenPolicyClient:
 
             if not using_last_action:
                 self._get_image()
-                if (
-                    self._enable_rtc_prefetch
-                    and prefetch_step_after_capture == min(self._rtc_prefetch_step, len(chunk))
-                ):
-                    self._start_rtc_prefetch(prefetch_step_after_capture)
+                if prefetch_step_after_capture is not None:
+                    self._maybe_start_rtc_prefetch(prefetch_step_after_capture, len(chunk))
 
     def stop(self):
         """Stop the client."""
@@ -913,6 +1379,12 @@ class TokenPolicyClient:
         self._state_reader.close()
         if self._token_publisher is not None:
             self._token_publisher.stop()
+        reset_info = {}
+        recording_frames = self._pop_recording_frames()
+        if recording_frames is not None:
+            reset_info["recording/head"] = recording_frames
+            print(f"[Recording] Sending {len(recording_frames)} final frames with reset.")
+            self._policy_client.reset(reset_info)
         self._policy_client.close()
 
         print("[TokenPolicyClient] Stopped!")
@@ -964,6 +1436,34 @@ def main():
                        help="Start the next FastWAM inference mid-chunk with RTC metadata")
     parser.add_argument("--rtc-prefetch-step", type=int, default=15,
                        help="Action step at which to start RTC prefetch")
+    parser.add_argument("--rtc-prefetch-timeout-sec", type=float, default=1.0,
+                       help="Drop an inflight RTC prefetch after this many seconds and allow fallback")
+    parser.add_argument("--first-chunk-sanity", choices=("off", "warn", "block"), default="block",
+                       help="Check first policy action against current WBC state before publishing")
+    parser.add_argument("--first-chunk-hand-l2-threshold", type=float, default=2.0,
+                       help="First-chunk sanity hand L2 threshold")
+    parser.add_argument("--first-chunk-hand-max-threshold", type=float, default=1.0,
+                       help="First-chunk sanity max per-joint hand threshold")
+    parser.add_argument("--first-chunk-token-clip-threshold", type=float, default=0.95,
+                       help="First-chunk sanity token clip-fraction threshold")
+    parser.add_argument("--start-after-first-chunk", action=argparse.BooleanOptionalAction, default=True,
+                       help="Send WBC start only after the first policy chunk passes sanity checks")
+    parser.add_argument("--require-valid-hand-state", action=argparse.BooleanOptionalAction, default=True,
+                       help="Validate WBC hand state before policy requests")
+    parser.add_argument("--valid-hand-state-timeout-sec", type=float, default=5.0,
+                       help="Seconds to wait for a valid hand state before failing the policy request when fallback is disabled; 0 waits indefinitely")
+    parser.add_argument("--hand-state-saturation-fraction-threshold", type=float, default=0.6,
+                       help="Reject hand states with more than this fraction of joints near +/- hand limits")
+    parser.add_argument("--invalid-hand-state-fallback",
+                       choices=("none", "dataset_initial", "zeros", "custom"),
+                       default="dataset_initial",
+                       help="Replace invalid WBC fallback/default hand state before policy requests; dataset_initial is the 0422 first-frame median hand_joints")
+    parser.add_argument("--hand-state-fallback-values", default=None,
+                       help="14 comma-separated floats used when --invalid-hand-state-fallback=custom")
+    parser.add_argument("--send-recording-frames", action=argparse.BooleanOptionalAction, default=True,
+                       help="Send continuous record-only camera frames to FastWAM server for complete input_video.mp4")
+    parser.add_argument("--max-recording-frames", type=int, default=120,
+                       help="Maximum continuous record-only frames to batch into one policy/reset request")
 
     args = parser.parse_args()
 
@@ -972,7 +1472,18 @@ def main():
     if args.dry_run:
         print("[Main] Dry-run enabled: no WBC start/stop/token messages will be sent")
     if args.enable_rtc_prefetch:
-        print(f"[Main] RTC prefetch enabled: step={args.rtc_prefetch_step}")
+        print(
+            f"[Main] RTC prefetch enabled: step={args.rtc_prefetch_step} "
+            f"timeout={args.rtc_prefetch_timeout_sec}s"
+        )
+    if not args.dry_run:
+        print(
+            f"[Main] First chunk sanity={args.first_chunk_sanity}; "
+            f"start_after_first_chunk={args.start_after_first_chunk}; "
+            f"require_valid_hand_state={args.require_valid_hand_state}; "
+            f"invalid_hand_state_fallback={args.invalid_hand_state_fallback}; "
+            f"send_recording_frames={args.send_recording_frames}"
+        )
 
     # Create and start client
     client = TokenPolicyClient(
@@ -992,6 +1503,19 @@ def main():
         max_chunks=args.max_chunks,
         enable_rtc_prefetch=args.enable_rtc_prefetch,
         rtc_prefetch_step=args.rtc_prefetch_step,
+        rtc_prefetch_timeout_sec=args.rtc_prefetch_timeout_sec,
+        first_chunk_sanity=args.first_chunk_sanity,
+        first_chunk_hand_l2_threshold=args.first_chunk_hand_l2_threshold,
+        first_chunk_hand_max_threshold=args.first_chunk_hand_max_threshold,
+        first_chunk_token_clip_threshold=args.first_chunk_token_clip_threshold,
+        start_after_first_chunk=args.start_after_first_chunk,
+        require_valid_hand_state=args.require_valid_hand_state,
+        valid_hand_state_timeout_sec=args.valid_hand_state_timeout_sec,
+        hand_state_saturation_fraction_threshold=args.hand_state_saturation_fraction_threshold,
+        invalid_hand_state_fallback=args.invalid_hand_state_fallback,
+        hand_state_fallback_values=args.hand_state_fallback_values,
+        send_recording_frames=args.send_recording_frames,
+        max_recording_frames=args.max_recording_frames,
     )
 
     try:
