@@ -85,26 +85,14 @@ except ImportError:
     print("Warning: recording_manager not available. Data collection disabled.")
     RecordingManagerThread = None
 
-# Hand control via Manus glove + dex-retargeting (vendored in PSI-Teleop-PICO).
-# The YAMLs referenced by HandType use paths relative to the teleop directory,
-# so we also chdir there when building the retargeting object.
-_MANUS_TELEOP_DIR = "/home/xiawei/hongyi/Unitree_Robotics/PSI-Teleop-PICO/teleop"
-if _MANUS_TELEOP_DIR not in sys.path:
-    sys.path.insert(0, _MANUS_TELEOP_DIR)
+# Hand control via Pico controller trigger button → G1 gripper IK (no Manus glove).
 try:
-    from robot_control.hand_retargeting import HandRetargeting, HandType
-except ImportError as _retarget_err:
-    print(f"Warning: HandRetargeting not available: {_retarget_err}")
-    HandRetargeting = None
-    HandType = None
-
-# Frame conversion from Manus/Vuer frame to unitree-hand frame (mirrors vr_pico.py).
-M_to_unitree_hand = np.array(
-    [[0, 1, 0, 0], [0, 0, -1, 0], [1, 0, 0, 0], [0, 0, 0, 1]], dtype=np.float64
-)
-# M_to_unitree_hand = np.array(
-#     [[0, 1, 0, 0], [0, 0, 1, 0], [1, 0, 0, 0], [0, 0, 0, 1]], dtype=np.float64
-# )
+    from gear_sonic.utils.teleop.solver.hand.g1_gripper_ik_solver import (
+        G1GripperInverseKinematicsSolver,
+    )
+except ImportError:
+    print("Warning: G1GripperInverseKinematicsSolver not available.")
+    G1GripperInverseKinematicsSolver = None
 
 try:
     from gear_sonic.utils.teleop.vis.vr3pt_pose_visualizer import VR3PtPoseVisualizer
@@ -551,225 +539,54 @@ def process_smpl_joints(body_pose, global_orient, transl):
     }
 
 
-class ManusSkeletonReceiver:
-    """Pulls Manus skeleton from tcp://localhost:8000 (inlined from vr_pico.py).
-    get_latest() returns (left_xyz, right_xyz), each (25, 3) or (None, None) until both received."""
-
-    def __init__(
-        self,
-        address: str = "tcp://localhost:8000",
-        left_glove_sn: str = "265bba63",
-        right_glove_sn: str = "81d630d4",
-    ):
-        self.left_glove_sn = left_glove_sn
-        self.right_glove_sn = right_glove_sn
-
-        ctx = zmq.Context.instance()
-        self.socket = ctx.socket(zmq.PULL)
-        self.socket.setsockopt(zmq.CONFLATE, 1)
-        self.socket.connect(address)
-
-        self._lock = threading.Lock()
-        self._left_xyz = None   # (25, 3)
-        self._right_xyz = None  # (25, 3)
-        self._running = True
-
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-
-    @staticmethod
-    def _parse_skeleton_176(data_176) -> np.ndarray:
-        floats = list(map(float, data_176[1:]))
-        arr = np.asarray(floats, dtype=np.float32).reshape(25, 7)
-        xyz = arr[:, :3].copy()
-
-        # Apply X-axis flip to match humdex version (critical for correct joint orientation)
-        xyz[:, 0] *= -1.0  # Flip X axis
-
-        return xyz
-
-    def _loop(self) -> None:
-        while self._running:
-            try:
-                msg = self.socket.recv()
-            except zmq.error.ZMQError:
-                break
-            text = msg.decode("utf-8")
-            parts = text.split(",")
-            with self._lock:
-                if len(parts) == 176:
-                    sn = parts[0]
-                    xyz = self._parse_skeleton_176(parts)
-                    if sn == self.left_glove_sn:
-                        self._left_xyz = xyz
-                    elif sn == self.right_glove_sn:
-                        self._right_xyz = xyz
-                elif len(parts) == 352:
-                    left_parts = parts[0:176]
-                    right_parts = parts[176:352]
-                    left_sn = left_parts[0]
-                    right_sn = right_parts[0]
-                    left_xyz = self._parse_skeleton_176(left_parts)
-                    right_xyz = self._parse_skeleton_176(right_parts)
-                    if left_sn == self.left_glove_sn:
-                        self._left_xyz = left_xyz
-                    elif left_sn == self.right_glove_sn:
-                        self._right_xyz = left_xyz
-                    if right_sn == self.left_glove_sn:
-                        self._left_xyz = right_xyz
-                    elif right_sn == self.right_glove_sn:
-                        self._right_xyz = right_xyz
-
-    def get_latest(self):
-        with self._lock:
-            if self._left_xyz is None or self._right_xyz is None:
-                return None, None
-            return self._left_xyz.copy(), self._right_xyz.copy()
-
-    def stop(self) -> None:
-        self._running = False
-        try:
-            self.socket.close(0)
-        except Exception:
-            pass
-
-
-def init_manus_receiver(
-    address: str = "tcp://localhost:8000",
-    left_glove_sn: str = "265bba63",  # Actual working left glove SN (from C++ output)
-    right_glove_sn: str = "81d630d4",  # Actual working right glove SN (from C++ output)
-):
-    """Start the Manus ZMQ receiver (inlined; no external deps beyond zmq/numpy)."""
-    receiver = ManusSkeletonReceiver(
-        address=address,
-        left_glove_sn=left_glove_sn,
-        right_glove_sn=right_glove_sn,
-    )
-    print(f"[Manus] Receiver connected at {address}")
-    return receiver
-
-
-def init_hand_retargeting():
-    """Build the HandRetargeting (Unitree Dex3). YAMLs in HandType use relative paths,
-    so we chdir to the vendored teleop dir while constructing."""
-    if HandRetargeting is None or HandType is None:
-        return None
-    prev_cwd = os.getcwd()
-    try:
-        os.chdir(_MANUS_TELEOP_DIR)
-        hr = HandRetargeting(HandType.UNITREE_DEX3)
-    finally:
-        os.chdir(prev_cwd)
-    print("[Manus] HandRetargeting (UNITREE_DEX3) initialized")
-    return hr
-
-
-# ── Manus → 26-joint tracking dict (for Wuji retargeting) ──────────────────
-
-def _make_tracking_joint(pos: np.ndarray) -> list:
-    """Return [[x,y,z], [qw,qx,qy,qz]] with identity quaternion."""
-    p = np.asarray(pos, dtype=np.float32).reshape(3)
-    return [p.tolist(), [1.0, 0.0, 0.0, 0.0]]
-
-
-def _manus25_to_tracking26(xyz25: np.ndarray, side: str) -> dict:
-    """Convert Manus 25-node XYZ skeleton to wuji-retargeting 26D dict.
-
-    Node index mapping (ManusSkeletonReceiver layout):
-      0        = Wrist/Root
-      1–5      = Index  (Metacarpal, Proximal, Intermediate, Distal, Tip)
-      6–10     = Middle (Metacarpal, Proximal, Intermediate, Distal, Tip)
-      11–15    = Little/Pinky
-      16–20    = Ring
-      21–24    = Thumb (Metacarpal, Proximal, Distal, Tip)
+def generate_finger_data(hand: str, trigger: float, grip: float) -> np.ndarray:
     """
-    pfx = "Left" if side.lower() == "left" else "Right"
-    pts = xyz25  # (25, 3)
-    out = {}
-    out[f"{pfx}HandWrist"]              = _make_tracking_joint(pts[0])
-    out[f"{pfx}HandPalm"]               = _make_tracking_joint(pts[0])
-    out[f"{pfx}HandThumbMetacarpal"]    = _make_tracking_joint(pts[21])
-    out[f"{pfx}HandThumbProximal"]      = _make_tracking_joint(pts[22])
-    out[f"{pfx}HandThumbDistal"]        = _make_tracking_joint(pts[23])
-    out[f"{pfx}HandThumbTip"]           = _make_tracking_joint(pts[24])
-    out[f"{pfx}HandIndexMetacarpal"]    = _make_tracking_joint(pts[1])
-    out[f"{pfx}HandIndexProximal"]      = _make_tracking_joint(pts[2])
-    out[f"{pfx}HandIndexIntermediate"]  = _make_tracking_joint(pts[3])
-    out[f"{pfx}HandIndexDistal"]        = _make_tracking_joint(pts[4])
-    out[f"{pfx}HandIndexTip"]           = _make_tracking_joint(pts[5])
-    out[f"{pfx}HandMiddleMetacarpal"]   = _make_tracking_joint(pts[6])
-    out[f"{pfx}HandMiddleProximal"]     = _make_tracking_joint(pts[7])
-    out[f"{pfx}HandMiddleIntermediate"] = _make_tracking_joint(pts[8])
-    out[f"{pfx}HandMiddleDistal"]       = _make_tracking_joint(pts[9])
-    out[f"{pfx}HandMiddleTip"]          = _make_tracking_joint(pts[10])
-    out[f"{pfx}HandRingMetacarpal"]     = _make_tracking_joint(pts[16])
-    out[f"{pfx}HandRingProximal"]       = _make_tracking_joint(pts[17])
-    out[f"{pfx}HandRingIntermediate"]   = _make_tracking_joint(pts[18])
-    out[f"{pfx}HandRingDistal"]         = _make_tracking_joint(pts[19])
-    out[f"{pfx}HandRingTip"]            = _make_tracking_joint(pts[20])
-    out[f"{pfx}HandLittleMetacarpal"]   = _make_tracking_joint(pts[11])
-    out[f"{pfx}HandLittleProximal"]     = _make_tracking_joint(pts[12])
-    out[f"{pfx}HandLittleIntermediate"] = _make_tracking_joint(pts[13])
-    out[f"{pfx}HandLittleDistal"]       = _make_tracking_joint(pts[14])
-    out[f"{pfx}HandLittleTip"]          = _make_tracking_joint(pts[15])
-    return out
+    Generate finger position data from Pico controller button states.
+
+    Args:
+        hand: "left" or "right"
+        trigger: Trigger button value (0-1)
+        grip: Grip button value (0-1)
+
+    Returns:
+        Array of shape [25, 4, 4] representing fingertip positions
+    """
+    fingertips = np.zeros([25, 4, 4])
+
+    thumb = 0
+    middle = 10
+    # Control thumb based on shoulder button state (index 4 is thumb tip)
+    fingertips[4 + thumb, 0, 3] = 1.0  # open thumb
+    if trigger > 0.5:
+        fingertips[4 + middle, 0, 3] = 1.0  # close middle
+
+    return fingertips
 
 
-def compute_hand_joints_from_manus(
-    hand_retargeting,
-    manus_receiver,
+def init_hand_ik_solvers():
+    """Initialize hand IK solvers if available."""
+    if G1GripperInverseKinematicsSolver is not None:
+        left_solver = G1GripperInverseKinematicsSolver(side="left")
+        right_solver = G1GripperInverseKinematicsSolver(side="right")
+        print("Hand IK solvers initialized")
+        return left_solver, right_solver
+    print("Warning: Hand IK solvers not available")
+    return None, None
+
+
+def compute_hand_joints_from_inputs(
+    left_solver, right_solver, left_trigger, left_grip, right_trigger, right_grip
 ) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Compute left/right 7-DOF Dex3 hand joints from Manus glove skeletons.
-    Mirrors vr_pico.VuerPreprocessor.process: frame-convert Manus xyz into
-    unitree-hand frame, pick thumb/index/middle tips, feed retargeter, then
-    reorder by right_dex_retargeting_to_hardware (matches vr_pico behavior).
-    Returns two arrays shaped (1, 7). Zero-arrays when data is unavailable.
-    """
-    zero = np.zeros((1, 7), dtype=np.float32)
-    if hand_retargeting is None or manus_receiver is None:
-        return zero, zero.copy()
-
-    manus_left, manus_right = manus_receiver.get_latest()
-    if manus_left is None or manus_right is None:
-        return zero, zero.copy()
-
-    left_homog = np.concatenate(
-        [manus_left.copy().T, np.ones((1, manus_left.shape[0]))], axis=0
-    )
-    right_homog = np.concatenate(
-        [manus_right.copy().T, np.ones((1, manus_right.shape[0]))], axis=0
-    )
-    unitree_left_hand = (M_to_unitree_hand @ left_homog)[0:3, :].T
-    unitree_right_hand = (M_to_unitree_hand @ right_homog)[0:3, :].T
-
-    tip_idx = [24, 5, 10]  # thumb, index, middle (Manus 25-node layout)
-    ref_left = unitree_left_hand[tip_idx].copy()
-    ref_right = unitree_right_hand[tip_idx].copy()
-
-    ref_left[0, 2]  *= -0.8                                                         
-    ref_right[0, 2] *= -0.8
-
-    # THUMB_OPPOSITION_GAIN = 0.9                                 
-    # ref_left[0, 1]  *= THUMB_OPPOSITION_GAIN                                      
-    # ref_right[0, 1] *= THUMB_OPPOSITION_GAIN
-
-    # Per-tip scaling from vr_pico.py
-    ref_left[0] *= 1.15
-    ref_left[1] *= 1.05
-    ref_left[2] *= 0.95
-    ref_right[0] *= 1.15
-    ref_right[1] *= 1.05
-    ref_right[2] *= 0.95
-
-    # NOTE: vr_pico uses right_dex_retargeting_to_hardware for both hands; mirror that.
-    reorder = hand_retargeting.right_dex_retargeting_to_hardware
-    left_q = hand_retargeting.left_retargeting.retarget(ref_left)[reorder]
-    right_q = hand_retargeting.right_retargeting.retarget(ref_right)[reorder]
-    return (
-        left_q.reshape(1, -1).astype(np.float32),
-        right_q.reshape(1, -1).astype(np.float32),
-    )
+    """Compute left/right hand joints using IK solvers, or zeros if unavailable."""
+    if left_solver is not None and right_solver is not None:
+        left_finger_data = generate_finger_data("left", left_trigger, left_grip)
+        right_finger_data = generate_finger_data("right", right_trigger, right_grip)
+        left_hand_joints = left_solver({"position": left_finger_data})
+        right_hand_joints = right_solver({"position": right_finger_data})
+    else:
+        left_hand_joints = np.zeros((1, 7), dtype=np.float32)
+        right_hand_joints = np.zeros((1, 7), dtype=np.float32)
+    return left_hand_joints, right_hand_joints
 
 
 # Joystick deadzone threshold
@@ -1054,8 +871,6 @@ def _pose_stream_common(
     with_g1_robot: bool = True,
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
-    hand_type: str = "manus_dex3",
-    wuji_hand_port: int = 5559,
     enable_neck_pub: bool = True,
     neck_pub_port: int = 5570,
     neck_retarget_scale: float = 1.5,
@@ -1079,20 +894,13 @@ def _pose_stream_common(
         log_prefix=log_prefix,
     )
 
-    # Hand control: Manus glove -> dex-retargeting -> 7-DOF Dex3 joints
-    manus_receiver = init_manus_receiver()
-    hand_retargeting = init_hand_retargeting() if hand_type == "manus_dex3" else None
+    # Hand control: Pico controller trigger -> G1 gripper IK -> 7-DOF hand joints
+    left_hand_ik_solver, right_hand_ik_solver = init_hand_ik_solvers()
 
-    # Wuji hand: create PUB socket for 26D tracking data
-    wuji_hand_pub = None
     neck_pub = None
     ctx = None
-    if hand_type == "wuji" or enable_neck_pub:
+    if enable_neck_pub:
         ctx = zmq.Context()
-    if hand_type == "wuji":
-        wuji_hand_pub = ctx.socket(zmq.PUB)
-        wuji_hand_pub.bind(f"tcp://*:{wuji_hand_port}")
-        print(f"[{log_prefix}] Wuji hand PUB bound to port {wuji_hand_port}")
     if enable_neck_pub and _human_head_to_robot_neck is not None:
         neck_pub = ctx.socket(zmq.PUB)
         neck_pub.setsockopt(zmq.SNDHWM, 1)
@@ -1112,9 +920,8 @@ def _pose_stream_common(
         record_dir=record_dir,
         record_format=record_format,
         log_prefix=log_prefix,
-        manus_receiver=manus_receiver,
-        hand_retargeting=hand_retargeting,
-        wuji_hand_pub=wuji_hand_pub,
+        left_hand_ik_solver=left_hand_ik_solver,
+        right_hand_ik_solver=right_hand_ik_solver,
         neck_pub=neck_pub,
         neck_retarget_scale=neck_retarget_scale,
     )
@@ -1131,10 +938,6 @@ def _pose_stream_common(
         # Cleanup resources
         reader.stop()
         three_point.close()
-        if manus_receiver is not None:
-            manus_receiver.stop()
-        if wuji_hand_pub is not None:
-            wuji_hand_pub.close()
         if neck_pub is not None:
             neck_pub.close()
 
@@ -1449,9 +1252,8 @@ class PoseStreamer:
         record_dir: str,
         record_format: str,
         log_prefix: str = "PoseLoop",
-        manus_receiver=None,
-        hand_retargeting=None,
-        wuji_hand_pub=None,
+        left_hand_ik_solver=None,
+        right_hand_ik_solver=None,
         neck_pub=None,
         neck_retarget_scale: float = 1.5,
     ):
@@ -1465,9 +1267,8 @@ class PoseStreamer:
         # Injected dependencies
         self.reader = reader
         self.three_point = three_point
-        self.manus_receiver = manus_receiver
-        self.hand_retargeting = hand_retargeting
-        self.wuji_hand_pub = wuji_hand_pub  # ZMQ PUB socket for wuji 26D tracking
+        self.left_hand_ik_solver = left_hand_ik_solver
+        self.right_hand_ik_solver = right_hand_ik_solver
         self.neck_pub = neck_pub            # ZMQ PUB socket for neck [yaw, pitch] JSON
         self.neck_retarget_scale = float(neck_retarget_scale)
         self._last_neck_publish_time = 0.0
@@ -1582,33 +1383,13 @@ class PoseStreamer:
     def run_once(self):
         """Execute one iteration of the pose streaming loop."""
         sample = self.reader.get_latest()
-
-        # Publish Wuji hand tracking data (rate limited to 50Hz)
-        # Do this BEFORE the sample check so hand data is published even without body tracking
         current_time = time.time()
-        if self.wuji_hand_pub is not None and self.manus_receiver is not None:
-            if not hasattr(self, '_last_wuji_publish_time'):
-                self._last_wuji_publish_time = 0
-            wuji_publish_interval = 1.0 / 50.0  # 50Hz
-            if current_time - self._last_wuji_publish_time >= wuji_publish_interval:
-                manus_left, manus_right = self.manus_receiver.get_latest()
-                if manus_left is not None and manus_right is not None:
-                    tracking_msg = msgpack.packb({
-                        "left": _manus25_to_tracking26(manus_left, "left"),
-                        "right": _manus25_to_tracking26(manus_right, "right"),
-                        "timestamp": current_time,
-                    }, use_bin_type=True)
-                    self.wuji_hand_pub.send(b"wuji_hand" + tracking_msg)
-                    self._last_wuji_publish_time = current_time
-                    if not hasattr(self, '_wuji_success_printed'):
-                        print(f"[{self.log_prefix}] Publishing Wuji hand tracking at 50Hz")
-                        self._wuji_success_printed = True
 
         if sample is None:
             time.sleep(0.005)
             return
 
-        # Neck angle publish (50Hz, same cadence as Wuji). Done before the
+        # Neck angle publish (50Hz). Done before the
         # heavier compute_from_body_poses call so a slow downstream step
         # doesn't starve the neck driver.
         self.publish_neck_once(sample["body_poses_np"], current_time=current_time)
@@ -1634,9 +1415,13 @@ class PoseStreamer:
         self.toggle_data_collection_last = toggle_data_collection_tmp
         self.toggle_data_abort_last = toggle_data_abort_tmp
 
-        left_hand_joints, right_hand_joints = compute_hand_joints_from_manus(
-            self.hand_retargeting,
-            self.manus_receiver,
+        left_hand_joints, right_hand_joints = compute_hand_joints_from_inputs(
+            self.left_hand_ik_solver,
+            self.right_hand_ik_solver,
+            left_trigger,
+            left_grip,
+            right_trigger,
+            right_grip,
         )
 
         smpl_pose_np = (
@@ -1844,8 +1629,6 @@ def run_pico(
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
     skip_body_tracking: bool = False,  # If True, skip waiting. If False, auto-detect with timeout
-    hand_type: str = "manus_dex3",
-    wuji_hand_port: int = 5559,
     enable_neck_pub: bool = True,
     neck_pub_port: int = 5570,
     neck_retarget_scale: float = 1.5,
@@ -1897,8 +1680,6 @@ def run_pico(
             with_g1_robot=with_g1_robot,
             enable_waist_tracking=enable_waist_tracking,
             enable_smpl_vis=enable_smpl_vis,
-            hand_type=hand_type,
-            wuji_hand_port=wuji_hand_port,
             enable_neck_pub=enable_neck_pub,
             neck_pub_port=neck_pub_port,
             neck_retarget_scale=neck_retarget_scale,
@@ -1985,8 +1766,8 @@ class PlannerStreamer:
         poll_hz: int = 20,
         zmq_feedback_host: str = "localhost",
         zmq_feedback_port: int = 5557,
-        manus_receiver=None,
-        hand_retargeting=None,
+        left_hand_ik_solver=None,
+        right_hand_ik_solver=None,
     ):
         self.socket = socket
         self.reader = reader
@@ -2005,9 +1786,9 @@ class PlannerStreamer:
         self.last_send = time.time()
         self.last_xrt_timestamp = None
 
-        # Manus-driven hand retargeting (replaces trigger-based open/close)
-        self.manus_receiver = manus_receiver
-        self.hand_retargeting = hand_retargeting
+        # Hand IK solvers for trigger-controlled hand open/close in VR 3PT mode
+        self.left_hand_ik_solver = left_hand_ik_solver
+        self.right_hand_ik_solver = right_hand_ik_solver
 
     def reset_yaw(self):
         """Called when entering planner mode. Resets state for fresh start."""
@@ -2114,10 +1895,22 @@ class PlannerStreamer:
                     vr_3pt_position = (vr_3pt_pose[:, :3].flatten()).tolist()
                     vr_3pt_orientation = vr_3pt_pose[:, 3:].flatten().tolist()
 
-                # Hand joints come from the Manus glove + dex-retargeting pipeline
-                lh_joints, rh_joints = compute_hand_joints_from_manus(
-                    self.hand_retargeting,
-                    self.manus_receiver,
+                # Compute hand joints from trigger/grip inputs so operator can
+                # control hand open/close while in VR 3PT mode
+                (
+                    left_menu_button,
+                    left_trigger,
+                    right_trigger,
+                    left_grip,
+                    right_grip,
+                ) = get_controller_inputs()
+                lh_joints, rh_joints = compute_hand_joints_from_inputs(
+                    self.left_hand_ik_solver,
+                    self.right_hand_ik_solver,
+                    left_trigger,
+                    left_grip,
+                    right_trigger,
+                    right_grip,
                 )
                 left_hand_position = lh_joints.reshape(-1).astype(np.float32).tolist()
                 right_hand_position = rh_joints.reshape(-1).astype(np.float32).tolist()
@@ -2165,8 +1958,6 @@ def run_pico_manager(
     with_g1_robot: bool = True,
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
-    hand_type: str = "manus_dex3",
-    wuji_hand_port: int = 5559,
     skip_body_tracking: bool = False,  # If True, skip waiting. If False, auto-detect with timeout
     enable_neck_pub: bool = True,
     neck_pub_port: int = 5570,
@@ -2225,18 +2016,8 @@ def run_pico_manager(
         log_prefix="PoseLoop",
     )
 
-    # Hand control: Manus glove -> retargeting -> hand joints
-    manus_receiver = init_manus_receiver()
-    # Dex3 retargeting only needed for manus_dex3 mode
-    hand_retargeting = init_hand_retargeting() if hand_type == "manus_dex3" else None
-
-    # Wuji mode: create a separate PUB socket to stream raw 26D hand tracking
-    # to wuji_hand_server.py (which runs wuji-retargeting + wujihandpy independently)
-    wuji_hand_pub = None
-    if hand_type == "wuji":
-        wuji_hand_pub = context.socket(zmq.PUB)
-        wuji_hand_pub.bind(f"tcp://*:{wuji_hand_port}")
-        print(f"[Manager] Wuji hand tracking PUB bound to port {wuji_hand_port}")
+    # Hand control: Pico controller trigger -> G1 gripper IK -> hand joints
+    left_hand_ik_solver, right_hand_ik_solver = init_hand_ik_solvers()
 
     # Neck command stream (JSON [yaw, pitch]) — same wire format as
     # pose_publisher.py so realsense_server.py --pose-zmq subscribes unchanged.
@@ -2260,9 +2041,8 @@ def run_pico_manager(
         record_dir=record_dir,
         record_format=record_format,
         log_prefix="PoseLoop",
-        manus_receiver=manus_receiver,
-        hand_retargeting=hand_retargeting,
-        wuji_hand_pub=wuji_hand_pub,
+        left_hand_ik_solver=left_hand_ik_solver,
+        right_hand_ik_solver=right_hand_ik_solver,
         neck_pub=neck_pub,
         neck_retarget_scale=neck_retarget_scale,
     )
@@ -2273,8 +2053,8 @@ def run_pico_manager(
         poll_hz=20,
         zmq_feedback_host=zmq_feedback_host,
         zmq_feedback_port=zmq_feedback_port,
-        manus_receiver=manus_receiver,
-        hand_retargeting=hand_retargeting,
+        left_hand_ik_solver=left_hand_ik_solver,
+        right_hand_ik_solver=right_hand_ik_solver,
     )
 
     # State machine diagram:
@@ -2307,10 +2087,6 @@ def run_pico_manager(
     # Track which mode VR_3PT was entered from, so left_axis_click returns to it.
     # Will be either PLANNER or PLANNER_FROZEN_UPPER_BODY.
     vr3pt_parent_mode = StreamMode.PLANNER
-
-    # Rate limiting for Wuji hand data publishing (50Hz to match humdex version)
-    last_wuji_publish_time = 0.0
-    wuji_publish_interval = 1.0 / 50.0  # 50Hz
 
     try:
         prev_ax_pressed = False
@@ -2423,23 +2199,7 @@ def run_pico_manager(
                     # (read via g1_debug feedback + FK) to prevent sudden jumps
                     planner_streamer.recalibrate_for_vr3pt()
 
-            # Publish Wuji hand tracking data in all modes (not just POSE)
-            # Rate limited to 50Hz to match humdex version and prevent hardware jitter
             current_time = time.time()
-            if pose_streamer.wuji_hand_pub is not None and pose_streamer.manus_receiver is not None:
-                if current_time - last_wuji_publish_time >= wuji_publish_interval:
-                    manus_left, manus_right = pose_streamer.manus_receiver.get_latest()
-                    if manus_left is not None and manus_right is not None:
-                        tracking_msg = msgpack.packb({
-                            "left": _manus25_to_tracking26(manus_left, "left"),
-                            "right": _manus25_to_tracking26(manus_right, "right"),
-                            "timestamp": current_time,
-                        }, use_bin_type=True)
-                        pose_streamer.wuji_hand_pub.send(b"wuji_hand" + tracking_msg)
-                        last_wuji_publish_time = current_time
-                        if not hasattr(pose_streamer, '_wuji_success_printed'):
-                            print(f"[Wuji] Publishing hand tracking data at 50Hz ({len(tracking_msg)} bytes)")
-                            pose_streamer._wuji_success_printed = True
 
             # Publish neck angles in all modes (not just POSE) — keeps the head
             # tracking the operator while the user is in PLANNER, etc.
@@ -2489,16 +2249,12 @@ def run_pico_manager(
         reader.stop()
         three_point.close()
         socket.close()
-        if wuji_hand_pub is not None:
-            wuji_hand_pub.close()
         if neck_pub is not None:
             neck_pub.close()
         context.term()
         # Stop recording manager
         if rec_manager is not None:
             rec_manager.stop()
-        if manus_receiver is not None:
-            manus_receiver.stop()
         print("[Manager] Shutdown complete")
 
 
@@ -2587,22 +2343,9 @@ if __name__ == "__main__":
         help="Enable SMPL body joint visualization (24 joint spheres) in the VR3pt viewer",
     )
     parser.add_argument(
-        "--hand_type",
-        type=str,
-        default="manus_dex3",
-        choices=["manus_dex3", "wuji", "none"],
-        help="Hand type: 'manus_dex3' (default Dex3 retargeting), 'wuji' (publish 26D for wuji_hand_server.py), 'none' (no hand control)",
-    )
-    parser.add_argument(
-        "--wuji_hand_port",
-        type=int,
-        default=5559,
-        help="ZMQ PUB port for wuji 26D hand tracking (used when --hand_type wuji, default: 5559)",
-    )
-    parser.add_argument(
         "--skip_body_tracking",
         action="store_true",
-        help="Skip waiting for body tracking data (run with Manus only)",
+        help="Skip waiting for body tracking data",
     )
     # Neck-motor publishing — drives the G1 NeckMotor over the same wire format
     # as pose_publisher.py. Default-on so a single process drives both hand and
@@ -2619,7 +2362,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--neck_pub_port", type=int, default=5570,
-        help="ZMQ PUB port for neck [yaw, pitch] JSON (default: 5570 — kept clear of the Wuji 5559-5561 block: 5559 wuji_hand, 5560 wuji_state, 5561 wuji_replay cmd)",
+        help="ZMQ PUB port for neck [yaw, pitch] JSON (default: 5570)",
     )
     parser.add_argument(
         "--neck_retarget_scale", type=float, default=1.5,
@@ -2665,8 +2408,6 @@ if __name__ == "__main__":
             with_g1_robot=with_g1_robot,
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
-            hand_type=args.hand_type,
-            wuji_hand_port=args.wuji_hand_port,
             skip_body_tracking=args.skip_body_tracking,
             enable_neck_pub=args.enable_neck_pub,
             neck_pub_port=args.neck_pub_port,
@@ -2687,8 +2428,6 @@ if __name__ == "__main__":
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
             skip_body_tracking=args.skip_body_tracking,
-            hand_type=args.hand_type,
-            wuji_hand_port=args.wuji_hand_port,
             enable_neck_pub=args.enable_neck_pub,
             neck_pub_port=args.neck_pub_port,
             neck_retarget_scale=args.neck_retarget_scale,

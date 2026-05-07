@@ -15,7 +15,7 @@ Usage:
 """
 
 # ── Hard-coded defaults ───────────────────────────────────────────────────────
-DEFAULT_EPISODE_DIR = "/home/xiawei/hongyi/Unitree_Robotics/Humanoid-Teleop/teleop/data/g1_1001/Basic/Put_toys_into_box_and_lift_it_and_turn_and_put_on_the_chair/episode_41"
+DEFAULT_EPISODE_DIR = "/home/xiawei/data/walk_towards_a_desk_and_pick_up_the_boiling_pot_from_its_base/episode_30"
 # ──────────────────────────────────────────────────────────────────────────────
 
 import argparse
