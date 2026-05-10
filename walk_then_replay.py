@@ -24,16 +24,21 @@ import time
 import numpy as np
 
 # ── USER CONFIG ────────────────────────────────────────────────────────────────
-EPISODE_DIR = "/home/xiawei/hongyi/Unitree_Robotics/Humanoid-Teleop/teleop/data/g1_1001/Basic/Pick_toys_into_box_and_lift_and_turn_and_put_on_the_chair_new/episode_40"
+# EPISODE_DIR = "/home/xiawei/hongyi/Unitree_Robotics/Humanoid-Teleop/teleop/data/g1_1001/Basic/Pick_toys_into_box_and_lift_and_turn_and_put_on_the_chair_new/episode_40"
+EPISODE_DIR = "/home/xiawei/hongyi/Unitree_Robotics/Humanoid-Teleop/teleop/data/g1_1001/Basic/Pick_bottle_and_turn_and_pour_into_cup/episode_15"
+# EPISODE_DIR = "/home/xiawei/data/HE_RAW/Locomanip/walk_towards_a_desk_and_place_a_cube_on_a_tray/episode_4"
+# EPISODE_DIR = "/home/xiawei/hongyi/Unitree_Robotics/Humanoid-Teleop/teleop/data/g1_1001/Basic/Spray_the_bowl_and_wipe_it_and_stack_it_up/episode_10"
 
 # Body-frame walk thresholds (m/s, max(|vx|,|vy|)). Hysteresis: enter walk
 # above ENTER, exit below EXIT.
 ENTER_THR = 0.10
 EXIT_THR  = 0.05
 
-# Fixed walking speed sent to planner. Dominant local-vel axis → ±WALK_SPEED,
-# the other axis scales proportionally (e.g. (0.5,0.1) → planner gets (0.3,0.06)).
-WALK_SPEED = 0.3
+# Fixed walking speed sent to planner (chosen at load time by sol_q dim:
+# 14 → 0.3, 29 → 0.2, else 0.3). Dominant local-vel axis → ±WALK_SPEED, the
+# other axis scales proportionally (e.g. (0.5,0.1) → planner gets (0.3,0.06)).
+WALK_SPEED_BY_SOL_DIM = {14: 0.3, 29: 0.2}
+WALK_SPEED_DEFAULT    = 0.3
 
 # Yaw-rate (deg/s) thresholds for the turn-in-place phase: planner gets
 # target_vel=0 + facing_dir tracking data yaw delta in real time, so feet
@@ -77,14 +82,39 @@ from walk_forward_token import (
 def load_full_episode(episode_dir):
     """Returns (qpos_isaac, hands_or_None, imu_quat, body_vel).
 
-    Note on body_vel: this is `odometry.velocity` from data, which is already
-    in body frame (Unitree convention) — vx = forward (+X), vy = lateral left
-    (+Y), vz = up. No rotation needed.
+    Joint sources by sol_q dimension (probed from frame 0):
+      - sol_q is 14-d → arm command only. Use it for upper body (overrides
+        states.arm_state); legs come from states.leg_state.
+      - sol_q is 29-d → full body command. Use it for both legs and arms
+        (cleaner than states; no controller tracking error).
+      - sol_q missing/other → fall back to states for everything.
+
+    IMU quaternion and body velocity always come from states (action has no
+    measured IMU/velocity).
+
+    body_vel is `states.odometry.velocity`, already body-frame (Unitree
+    convention): vx = forward, vy = lateral left, vz = up. No rotation needed.
     """
     with open(os.path.join(episode_dir, "data.json")) as f:
         d = json.load(f)
     frames = d if isinstance(d, list) else d["frames"]
     n = len(frames)
+
+    a0 = frames[0].get("actions") or {}
+    sol0 = a0.get("sol_q")
+    sol_dim = len(sol0) if sol0 is not None else 0
+    if sol_dim == 14:
+        body_src = "arm-from-action, leg-from-states"
+    elif sol_dim == 29:
+        body_src = "full-body-from-action"
+    else:
+        body_src = "full-body-from-states"
+    has_action_hands = (
+        a0.get("left_angles") is not None and a0.get("right_angles") is not None
+        and len(a0["left_angles"]) == 7 and len(a0["right_angles"]) == 7
+    )
+    hand_src = "action(left+right_angles)" if has_action_hands else "states.hand_state"
+    print(f"[load] sol_q dim={sol_dim} → {body_src}; hands → {hand_src}")
 
     qpos_mj = np.zeros((n, 29), dtype=np.float32)
     hands = np.zeros((n, 14), dtype=np.float32)
@@ -94,15 +124,31 @@ def load_full_episode(episode_dir):
 
     for i, fr in enumerate(frames):
         s = fr["states"]
-        leg = np.asarray(s.get("leg_states", s.get("leg_state")), dtype=np.float32).reshape(-1)[:15]
-        arm = np.asarray(s.get("arm_states", s.get("arm_state")), dtype=np.float32).reshape(-1)[:14]
-        qpos_mj[i, :15] = leg
-        qpos_mj[i, 15:] = arm
+        a = fr.get("actions") or {}
+        sol_q = a.get("sol_q")
 
-        h = s.get("hand_state")
-        if h is not None and len(h) >= 14:
-            hands[i] = np.asarray(h[:14], dtype=np.float32)
+        if sol_dim == 29 and sol_q is not None:
+            qpos_mj[i] = np.asarray(sol_q, dtype=np.float32).reshape(-1)[:29]
+        else:
+            leg = np.asarray(s.get("leg_states", s.get("leg_state")), dtype=np.float32).reshape(-1)[:15]
+            qpos_mj[i, :15] = leg
+            if sol_dim == 14 and sol_q is not None:
+                qpos_mj[i, 15:] = np.asarray(sol_q, dtype=np.float32).reshape(-1)[:14]
+            else:
+                arm = np.asarray(s.get("arm_states", s.get("arm_state")), dtype=np.float32).reshape(-1)[:14]
+                qpos_mj[i, 15:] = arm
+
+        if has_action_hands:
+            la = np.asarray(a.get("left_angles"), dtype=np.float32).reshape(-1)[:7]
+            ra = np.asarray(a.get("right_angles"), dtype=np.float32).reshape(-1)[:7]
+            hands[i, :7] = la
+            hands[i, 7:] = ra
             hands_valid = True
+        else:
+            h = s.get("hand_state")
+            if h is not None and len(h) >= 14:
+                hands[i] = np.asarray(h[:14], dtype=np.float32)
+                hands_valid = True
 
         q = np.asarray(s["imu"]["quaternion"], dtype=np.float32).reshape(4)
         q = q / max(np.linalg.norm(q), 1e-8)
@@ -113,7 +159,7 @@ def load_full_episode(episode_dir):
         body_vel[i] = np.asarray(s["odometry"]["velocity"], dtype=np.float32).reshape(3)
 
     qpos_isaac = qpos_mj[:, _MUJOCO_TO_ISAACLAB_DOF].astype(np.float32)
-    return qpos_isaac, hands if hands_valid else None, imu_quat, body_vel
+    return qpos_isaac, hands if hands_valid else None, imu_quat, body_vel, sol_dim
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -167,12 +213,26 @@ def build_data_window(qpos_50, quat_50, pub_frame):
 
 def main():
     # CLI is intentionally minimal — tweak EPISODE_DIR / thresholds at top of file
-    episode_dir = sys.argv[1] if len(sys.argv) > 1 else EPISODE_DIR
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    episode_dir = args[0] if args else EPISODE_DIR
     no_wbc = "--no-wbc" in sys.argv
 
+    # --record-tokens [path] : write data_sonic.json after replay finishes.
+    # Saves every published 50Hz token, then samples back to 30Hz to align with
+    # the original data.json frames. If no path given, writes to
+    # <episode_dir>/data_sonic.json.
+    record_tokens_path = None
+    if "--record-tokens" in sys.argv:
+        i = sys.argv.index("--record-tokens")
+        nxt = sys.argv[i + 1] if i + 1 < len(sys.argv) and not sys.argv[i + 1].startswith("--") else None
+        record_tokens_path = nxt or os.path.join(episode_dir, "data_sonic.json")
+        print(f"[main] recording tokens → {record_tokens_path}")
+
     print(f"[main] loading {episode_dir}")
-    qpos_30, hands_30, imu_q_30, body_vel_30 = load_full_episode(episode_dir)
+    qpos_30, hands_30, imu_q_30, body_vel_30, sol_dim = load_full_episode(episode_dir)
     n_30 = len(qpos_30)
+    walk_speed = WALK_SPEED_BY_SOL_DIM.get(sol_dim, WALK_SPEED_DEFAULT)
+    print(f"[main] WALK_SPEED={walk_speed} (sol_q dim={sol_dim})")
 
     qpos_50 = resample_30hz_to_50hz(qpos_30)
     quat_50 = resample_30hz_to_50hz(imu_q_30)
@@ -282,6 +342,9 @@ def main():
     dt = 1.0 / CONTROL_HZ
     n_pub = 0
 
+    # Token recording: capture every published 50Hz token; downsample to 30Hz at end.
+    tokens_50 = np.zeros((n_50, 64), dtype=np.float32) if record_tokens_path else None
+
     print(f"[main] start phase A. walk thr={ENTER_THR}/{EXIT_THR} m/s, "
           f"turn thr={TURN_RATE_ENTER}/{TURN_RATE_EXIT} °/s")
 
@@ -327,7 +390,7 @@ def main():
                         mvmt_dir=facing, facing_dir=facing,
                     )
                 elif phase == "B":
-                    speed, vd = scale_velocity_xy(body_vel_xy_smooth[pub_frame], WALK_SPEED)
+                    speed, vd = scale_velocity_xy(body_vel_xy_smooth[pub_frame], walk_speed)
                     cy, sy = np.cos(current_target_yaw), np.sin(current_target_yaw)
                     mvmt = np.array([cy*vd[0] - sy*vd[1],
                                      sy*vd[0] + cy*vd[1], 0.0], dtype=np.float32)
@@ -371,6 +434,8 @@ def main():
                 hand_joints = hand_50[min(pub_frame, len(hand_50) - 1)]
 
             tok = fsq_quantize(encoder.encode(joint_pos=jp, joint_vel=jv, body_quat=bq)).astype(np.float32)
+            if tokens_50 is not None:
+                tokens_50[pub_frame] = tok
             pub.publish(hand_joints_14=hand_joints, token_64=tok, body_quat_w=bq[0])
             pub_frame += 1
             n_pub += 1
@@ -389,6 +454,72 @@ def main():
             if wbc is not None:
                 wbc.close()
             print(f"[main] stopped after {n_pub} tokens")
+            if tokens_50 is not None and record_tokens_path is not None:
+                # If we exited before consuming all frames, hold the last valid
+                # token for the rest (avoids zeroed frames at tail).
+                if pub_frame < n_50 and pub_frame > 0:
+                    tokens_50[pub_frame:] = tokens_50[pub_frame - 1]
+                idx_30_to_50 = np.round(np.arange(n_30) * 5.0 / 3.0).astype(int).clip(0, n_50 - 1)
+                tokens_30 = tokens_50[idx_30_to_50]
+                write_sonic_json(episode_dir, record_tokens_path, tokens_30)
+
+
+def write_sonic_json(episode_dir, out_path, tokens_30):
+    """Write data_sonic.json next to original data.json. Per-frame structure
+    matches the sonic format expected by replay_token.py:
+        timestamp, states:{qpos, quat, hand_joints},
+                   actions:{hand_joints, token}, image
+    All raw fields come straight from the original data.json (NOT from any
+    sol_q/action substitution used internally for token computation):
+        states.qpos        = states.leg_state + states.arm_state (29-d)
+        states.quat        = states.imu.quaternion (4-d)
+        states.hand_joints = states.hand_state (14-d)
+        actions.hand_joints = action.left_angles + action.right_angles
+                              (fallback to states.hand_state if action missing)
+    `tokens_30` length must equal the number of frames in data.json.
+    """
+    with open(os.path.join(episode_dir, "data.json")) as f:
+        d = json.load(f)
+    frames = d if isinstance(d, list) else d["frames"]
+    n = len(frames)
+    if len(tokens_30) != n:
+        raise ValueError(f"tokens_30 has {len(tokens_30)} but data has {n} frames")
+
+    out = []
+    for i, fr in enumerate(frames):
+        s = fr["states"]
+        a = fr.get("actions") or {}
+        leg = list(s.get("leg_states", s.get("leg_state", [])))[:15]
+        arm = list(s.get("arm_states", s.get("arm_state", [])))[:14]
+        qpos = leg + arm
+        quat = list(s["imu"]["quaternion"])[:4]
+        state_hands = list(s.get("hand_state") or [0.0] * 14)[:14]
+        if (a.get("left_angles") is not None and a.get("right_angles") is not None
+                and len(a["left_angles"]) == 7 and len(a["right_angles"]) == 7):
+            action_hands = list(a["left_angles"]) + list(a["right_angles"])
+        else:
+            action_hands = state_hands
+
+        frame_out = {
+            "states": {
+                "qpos":        qpos,
+                "quat":        quat,
+                "hand_joints": state_hands,
+            },
+            "actions": {
+                "hand_joints": action_hands,
+                "token":       tokens_30[i].tolist(),
+            },
+            "image": fr.get("image", ""),
+        }
+        t = fr.get("time")
+        if isinstance(t, (int, float)):
+            frame_out["timestamp"] = int(t * 1e9)
+        out.append(frame_out)
+
+    with open(out_path, "w") as f:
+        json.dump(out, f)
+    print(f"[main] wrote {n} frames → {out_path}")
 
 
 if __name__ == "__main__":

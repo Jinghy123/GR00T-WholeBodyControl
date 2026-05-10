@@ -68,6 +68,14 @@ DEFAULT_ZMQ_HOST = "*"
 DEFAULT_ZMQ_PORT = 5556
 DEFAULT_ZMQ_TOPIC = "pose"
 
+# Neck publisher configuration (to G1 NeckMotor, matches pose_publisher.py wire format)
+DEFAULT_NECK_PUB_HOST = "*"
+DEFAULT_NECK_PUB_PORT = 5570
+
+# Neck state subscriber (ZMQ SUB ← realsense_server.py on the robot, port 5560)
+# JSON `[yaw_rad, pitch_rad]` of the Dynamixel present-position read each tick.
+DEFAULT_NECK_STATE_ZMQ = "tcp://192.168.123.164:5560"
+
 # Policy server configuration
 DEFAULT_POLICY_HOST = "localhost"
 DEFAULT_POLICY_PORT = 5000
@@ -89,8 +97,13 @@ FSQ_LEVELS = 21
 RELATIVE_OFFSETS = [-23 - 1, -16 - 1, -8 - 1, 0 - 1]
 ACTION_HORIZON = 24
 
-    # g1_sonic action layout: hand_joints(14) + token(64) = 78
-ACTION_DIM = 78
+# g1_sonic action layout (default):     hand_joints(14) + token(64)         = 78
+# g1_sonic action layout (--include-neck): hand_joints(14) + neck(2) + token(64) = 80
+ACTION_DIM_DEFAULT = 78
+ACTION_DIM_NECK = 80
+HAND_DIM = 14
+NECK_DIM = 2
+TOKEN_DIM = 64
 
 # Image buffer
 IMAGE_BUFFER_SIZE = 100
@@ -227,12 +240,18 @@ class WBCStateReader:
 class TokenPublisher:
     """ZMQ publisher for token-only streaming (Protocol v4)."""
 
-    def __init__(self, host="*", port=5556, topic="pose"):
+    def __init__(self, host="*", port=5556, topic="pose", include_neck=False):
         self._context = zmq.Context()
         self._socket = self._context.socket(zmq.PUB)
         self._socket.bind(f"tcp://{host}:{port}")
         self._topic = topic
         self._frame_index = 0
+        self._include_neck = include_neck
+        # In neck mode the action layout is hand(14) + neck(2) + token(64),
+        # so the token slice starts at index 16 rather than 14. The neck
+        # 2-dim slot itself is forwarded on a separate channel (NeckPublisher),
+        # not in this Protocol v4 message.
+        self._token_start = HAND_DIM + (NECK_DIM if include_neck else 0)
 
     def send_command(self, start=False, stop=False, planner=False):
         msg = build_command_message(start=start, stop=stop, planner=planner)
@@ -244,13 +263,17 @@ class TokenPublisher:
         Publish action-only message (Protocol v4).
 
         Args:
-            action: np.ndarray of shape (14+64,) - latent vector from encoder
+            action: np.ndarray of shape (78,) (default) or (80,) (--include-neck).
+                    Default layout: hand_joints(14) + token(64).
+                    Neck layout:    hand_joints(14) + neck(2) + token(64).
+                    Hand slice is always [:14]; token slice starts at self._token_start.
             body_quat_w: optional np.ndarray of shape (4,) or (1,4), (w,x,y,z).
                          If provided, included in message so WBC holds current heading.
         """
         action = action.reshape(1, -1)
+        token_start = self._token_start
         pose_data = {
-            "token_state": action[:, 14:],       # (1, 64)
+            "token_state": action[:, token_start:token_start + TOKEN_DIM],  # (1, 64)
             "left_hand_joints": action[:, :7],    # (1, 7)
             "right_hand_joints": action[:, 7:14], # (1, 7)
         }
@@ -268,6 +291,88 @@ class TokenPublisher:
             self._context.term()
 
 
+class NeckStateReader:
+    """Subscribes to realsense_server.py's neck present-position stream.
+
+    realsense_server.py reads ADDR_PRESENT_POSITION from both Dynamixels each
+    control tick and publishes JSON `[yaw_rad, pitch_rad]` on a PUB socket
+    (default `tcp://*:5560`). CONFLATE keeps only the newest sample so we
+    always read the freshest reading without backlog.
+    """
+
+    def __init__(self, addr: str):
+        self._ctx = zmq.Context.instance()
+        self._sock = self._ctx.socket(zmq.SUB)
+        self._sock.setsockopt(zmq.CONFLATE, 1)
+        self._sock.setsockopt(zmq.SUBSCRIBE, b"")
+        self._sock.setsockopt(zmq.LINGER, 0)
+        self._sock.connect(addr)
+        self._latest = None
+        print(f"[NeckState] SUB connected to {addr}")
+
+    def get_latest(self):
+        try:
+            raw = self._sock.recv(flags=zmq.NOBLOCK)
+        except zmq.Again:
+            return self._latest
+        try:
+            msg = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return self._latest
+        if isinstance(msg, (list, tuple)) and len(msg) >= 2:
+            self._latest = [float(msg[0]), float(msg[1])]
+        return self._latest
+
+    def close(self):
+        try:
+            self._sock.close(linger=0)
+        except Exception:
+            pass
+
+
+class NeckPublisher:
+    """ZMQ PUB of `[neck_yaw, neck_pitch]` JSON for the G1 NeckMotor.
+
+    Wire format matches pose_publisher.py exactly (SNDHWM=1, LINGER=0,
+    payload = json.dumps([float(yaw), float(pitch)]).encode()), so the
+    NeckMotor subscriber consumes this stream without any change.
+    NOTE: stop pose_publisher.py / pico_manus_thread_server.py before
+    running this client or the bind on port 5570 will collide.
+    """
+
+    def __init__(self, host=DEFAULT_NECK_PUB_HOST, port=DEFAULT_NECK_PUB_PORT):
+        self._ctx = zmq.Context()
+        self._sock = self._ctx.socket(zmq.PUB)
+        self._sock.setsockopt(zmq.SNDHWM, 1)
+        self._sock.setsockopt(zmq.LINGER, 0)
+        bind_addr = f"tcp://{host}:{port}"
+        try:
+            self._sock.bind(bind_addr)
+        except zmq.ZMQError as e:
+            self._sock.close(linger=0)
+            self._ctx.term()
+            raise RuntimeError(
+                f"NeckPublisher bind failed on {bind_addr}: {e}. "
+                f"Is pose_publisher.py still running? `pkill -f pose_publisher.py`"
+            ) from e
+        print(f"[NeckPublisher] PUB bound to {bind_addr}")
+        self._last = None
+
+    def publish(self, yaw, pitch):
+        msg = json.dumps([float(yaw), float(pitch)]).encode("utf-8")
+        self._sock.send(msg)
+        self._last = (float(yaw), float(pitch))
+
+    def publish_last(self):
+        """Re-publish the last sent value (used while holding the final token)."""
+        if self._last is not None:
+            self.publish(*self._last)
+
+    def stop(self):
+        self._sock.close(linger=0)
+        self._ctx.term()
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Policy Client Manager
 # ──────────────────────────────────────────────────────────────────────────────
@@ -275,7 +380,7 @@ class TokenPublisher:
 class PolicyClientManager:
     """Manages communication with autonomous policy server."""
 
-    def __init__(self, host, port, prompt, action_only=False):
+    def __init__(self, host, port, prompt, action_only=False, include_neck=False):
         if not POLICY_CLIENT_AVAILABLE:
             raise RuntimeError("Policy client not available!")
 
@@ -283,6 +388,7 @@ class PolicyClientManager:
         self._port = port
         self._prompt = prompt
         self._action_only = action_only
+        self._include_neck = include_neck
         self._client = None
         self._session_id = None
 
@@ -309,16 +415,20 @@ class PolicyClientManager:
             print(f"[PolicyClient] Action-only mode: ON")
         print(f"[PolicyClient] Connected successfully!")
 
-    def get_action(self, images, state):
+    def get_action(self, images, state, neck_state=None):
         """
         Send observation to policy server and get action.
 
         Args:
             images: RGB images (T, H, W, 3) or (H, W, 3)
             state: dict with robot state
+            neck_state: optional list/array of length 2, [yaw_rad, pitch_rad]
+                        from realsense_server.py's neck PUB. Only used when
+                        include_neck=True. None falls back to zeros so the
+                        obs key shape stays stable.
 
         Returns:
-            action dict with 'token' and 'hand_states'
+            action np.ndarray of shape (N, 78) default, or (N, 80) with neck.
         """
         if self._client is None:
             raise RuntimeError("Not connected to policy server")
@@ -331,6 +441,13 @@ class PolicyClientManager:
             "prompt": self._prompt,
             "session_id": self._session_id,
         }
+        if self._include_neck:
+            neck_obs = (
+                np.asarray(neck_state, dtype=np.float32).reshape(NECK_DIM)
+                if neck_state is not None
+                else np.zeros(NECK_DIM, dtype=np.float32)
+            )
+            obs["observation/neck"] = neck_obs
         if self._action_only:
             obs["action_only_inference"] = True
             obs["action_attend_to_noisy_video"] = False
@@ -342,17 +459,31 @@ class PolicyClientManager:
             end = time.time()
             print(f"[PolicyClient] Inference time: {end - start:.4f} seconds")
 
-            hand_joints = action_from_policy[:, :14] # (N, 14)
-            token_ori = action_from_policy[:, 14:] # (N, 64)
+            if self._include_neck:
+                # Neck layout: hand_joints(14) + neck(2) + token(64) → 80
+                hand_joints = action_from_policy[:, :HAND_DIM]                                          # (N, 14)
+                neck        = action_from_policy[:, HAND_DIM:HAND_DIM + NECK_DIM]                       # (N, 2)
+                token_ori   = action_from_policy[:, HAND_DIM + NECK_DIM:HAND_DIM + NECK_DIM + TOKEN_DIM]  # (N, 64)
 
-            
-            # 量化token到FSQ级别
-            token_qtz = fsq_quantize(token_ori) # (N, 64)
-            print(f"[PolicyClient] Token quantized: shape={token_ori.shape}, "
-                    f"original_range=[{token_ori.min():.4f},{token_ori.max():.4f}], "
-                    f"quantized_range=[{token_qtz.min():.4f},{token_qtz.max():.4f}]")
+                token_qtz = fsq_quantize(token_ori)  # (N, 64)
+                print(f"[PolicyClient] Token quantized: shape={token_ori.shape}, "
+                        f"original_range=[{token_ori.min():.4f},{token_ori.max():.4f}], "
+                        f"quantized_range=[{token_qtz.min():.4f},{token_qtz.max():.4f}]")
+                print(f"[PolicyClient] Neck: shape={neck.shape}, "
+                        f"range=[{neck.min():.4f},{neck.max():.4f}]")
 
-            action = np.concatenate([hand_joints, token_qtz], axis=-1) # (N, 14+64)
+                action = np.concatenate([hand_joints, neck, token_qtz], axis=-1)  # (N, 80)
+            else:
+                # Default layout: hand_joints(14) + token(64) → 78
+                hand_joints = action_from_policy[:, :HAND_DIM]                                 # (N, 14)
+                token_ori   = action_from_policy[:, HAND_DIM:HAND_DIM + TOKEN_DIM]              # (N, 64)
+
+                token_qtz = fsq_quantize(token_ori)  # (N, 64)
+                print(f"[PolicyClient] Token quantized: shape={token_ori.shape}, "
+                        f"original_range=[{token_ori.min():.4f},{token_ori.max():.4f}], "
+                        f"quantized_range=[{token_qtz.min():.4f},{token_qtz.max():.4f}]")
+
+                action = np.concatenate([hand_joints, token_qtz], axis=-1)  # (N, 78)
 
             return action
         except Exception as e:
@@ -386,12 +517,28 @@ class TokenPolicyClient:
                  zmq_host, zmq_port, zmq_topic,
                  camera_host, camera_port,
                  wbc_host, wbc_port, wbc_topic,
-                 action_only=False):
+                 neck_pub_host, neck_pub_port,
+                 neck_state_zmq,
+                 action_only=False,
+                 include_neck=False):
+        self._include_neck = include_neck
+
         # Initialize components
         self._camera = RSCamera(host=camera_host, port=camera_port)
         self._state_reader = WBCStateReader(host=wbc_host, port=wbc_port, topic=wbc_topic)
-        self._token_publisher = TokenPublisher(host=zmq_host, port=zmq_port, topic=zmq_topic)
-        self._policy_client = PolicyClientManager(host=policy_host, port=policy_port, prompt=prompt, action_only=action_only)
+        self._token_publisher = TokenPublisher(host=zmq_host, port=zmq_port, topic=zmq_topic,
+                                               include_neck=include_neck)
+        # Neck I/O only spun up in neck mode so the default 78-dim path is
+        # byte-for-byte identical to the pre-neck client (no extra binds, no
+        # extra subs).
+        if include_neck:
+            self._neck_publisher = NeckPublisher(host=neck_pub_host, port=neck_pub_port)
+            self._neck_state_reader = NeckStateReader(neck_state_zmq)
+        else:
+            self._neck_publisher = None
+            self._neck_state_reader = None
+        self._policy_client = PolicyClientManager(host=policy_host, port=policy_port, prompt=prompt,
+                                                  action_only=action_only, include_neck=include_neck)
         self._encoder = EncoderClient(ENCODER_MODEL, mode=0)
 
         # Threading components
@@ -451,7 +598,13 @@ class TokenPolicyClient:
         state = self._state_reader.get_state()
         assert state is not None
 
-        action = self._policy_client.get_action(selected, state)
+        neck_state = None
+        if self._include_neck:
+            neck_state = self._neck_state_reader.get_latest()
+            if neck_state is None:
+                print("[VLA] neck state not received yet — sending zeros for observation/neck")
+
+        action = self._policy_client.get_action(selected, state, neck_state=neck_state)
         return action
 
     def _log_action(self, actions: np.ndarray, dt: float) -> None:
@@ -567,8 +720,17 @@ class TokenPolicyClient:
                         body_quat = np.tile(base_quat, (10, 1)).astype(np.float32)  # (10, 4)
 
                         enc_token = self._encoder.encode(joint_pos, joint_vel, body_quat)  # (64,)
-                        # keep hand joints from last action, replace body token
-                        frozen_action = np.concatenate([last_action[:14], enc_token])
+                        if self._include_neck:
+                            # Layout: hand(14) + neck(2) + token(64). Keep hand
+                            # and neck from last action; replace body token.
+                            frozen_action = np.concatenate([
+                                last_action[:HAND_DIM],
+                                last_action[HAND_DIM:HAND_DIM + NECK_DIM],
+                                enc_token,
+                            ])
+                        else:
+                            # Layout: hand(14) + token(64). Original behavior.
+                            frozen_action = np.concatenate([last_action[:HAND_DIM], enc_token])
                         print(f"[PublishLoop] Chunk done ({len(chunk)} tokens), "
                               f"encoder freeze token computed.")
                     else:
@@ -595,7 +757,16 @@ class TokenPolicyClient:
                     using_last_action = True
 
             self._token_publisher.publish_token(action)
-            
+
+            if self._include_neck:
+                # Publish neck on its own channel (port 5570, JSON [yaw,pitch],
+                # same wire format as pose_publisher.py / replay_token.py).
+                # During the latency/freeze phase `action` is `frozen_action`
+                # whose neck slice is copied from the last fresh action, so we
+                # naturally hold the last neck value (mirrors hand_joints).
+                neck_slice = action[HAND_DIM:HAND_DIM + NECK_DIM]
+                self._neck_publisher.publish(neck_slice[0], neck_slice[1])
+
             # Maintain 30 Hz with relative delay
             elapsed = time.perf_counter() - t_start
             sleep_time = dt - elapsed
@@ -620,6 +791,10 @@ class TokenPolicyClient:
         self._camera.close()
         self._state_reader.close()
         self._token_publisher.stop()
+        if self._neck_publisher is not None:
+            self._neck_publisher.stop()
+        if self._neck_state_reader is not None:
+            self._neck_state_reader.close()
         self._policy_client.close()
 
         print("[TokenPolicyClient] Stopped!")
@@ -658,13 +833,28 @@ def main():
                        help="WBC state publisher port (default: 5557)")
     parser.add_argument("--wbc-topic", type=str, default=WBC_TOPIC,
                        help="WBC state topic (default: g1_debug)")
+    parser.add_argument("--neck-pub-host", type=str, default=DEFAULT_NECK_PUB_HOST,
+                       help=f"Neck PUB bind host (default: {DEFAULT_NECK_PUB_HOST})")
+    parser.add_argument("--neck-pub-port", type=int, default=DEFAULT_NECK_PUB_PORT,
+                       help=f"Neck PUB port (default: {DEFAULT_NECK_PUB_PORT})")
+    parser.add_argument("--neck-state-zmq", type=str, default=DEFAULT_NECK_STATE_ZMQ,
+                       help=f"Neck-state SUB address (realsense_server.py's neck "
+                            f"present-position PUB, default: {DEFAULT_NECK_STATE_ZMQ})")
     parser.add_argument("--action-only", action="store_true",
                        help="Enable action-only inference (skip video denoising for faster speed)")
+    parser.add_argument("--include-neck", action="store_true",
+                       help="g1_sonic_neck variant: action 80-dim (hand14 + neck2 + token64), "
+                            "state +observation/neck(2). Server must be launched with the same "
+                            "--include-neck flag and a neck ckpt. Default (off) keeps the legacy "
+                            "78-dim hand+token path with no neck I/O.")
 
     args = parser.parse_args()
 
     if args.action_only:
         print("[Main] Action-only mode enabled: video denoising will be skipped")
+
+    action_dim = ACTION_DIM_NECK if args.include_neck else ACTION_DIM_DEFAULT
+    print(f"[Main] include_neck={args.include_neck}, action_dim={action_dim}")
 
     # Create and start client
     client = TokenPolicyClient(
@@ -679,7 +869,11 @@ def main():
         wbc_host=args.wbc_host,
         wbc_port=args.wbc_port,
         wbc_topic=args.wbc_topic,
+        neck_pub_host=args.neck_pub_host,
+        neck_pub_port=args.neck_pub_port,
+        neck_state_zmq=args.neck_state_zmq,
         action_only=args.action_only,
+        include_neck=args.include_neck,
     )
 
     try:

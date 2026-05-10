@@ -17,7 +17,7 @@ Usage:
 """
 
 # ── Hard-coded defaults (edit these instead of passing CLI args) ───────────────
-DEFAULT_EPISODE_DIR    = "/home/xiawei/data/demonstration_2026-04-14_19-46-09/episode_0"
+DEFAULT_EPISODE_DIR    = "/home/xiawei/hongyi/Unitree_Robotics/Humanoid-Teleop/teleop/data/g1_1001/Basic/Pick_bottle_and_turn_and_pour_into_cup/episode_15"
 DEFAULT_ZMQ_HOST        = "*"
 DEFAULT_ZMQ_PUB_PORT    = 5556
 DEFAULT_ZMQ_TOPIC      = "pose"
@@ -148,10 +148,10 @@ def _extract_neck(frame):
 # ── Load episode (new format: list of dict) ─────────────────────────────────
 
 def load_episode(episode_dir):
-    """Load episode from data.json (new format: list of dict)."""
-    json_path = os.path.join(episode_dir, "data.json")
+    """Load episode from data_sonic.json (new format: list of dict)."""
+    json_path = os.path.join(episode_dir, "data_sonic.json")
     if not os.path.exists(json_path):
-        raise FileNotFoundError(f"data.json not found in {episode_dir}")
+        raise FileNotFoundError(f"data_sonic.json not found in {episode_dir}")
 
     with open(json_path, "r") as f:
         data = json.load(f)
