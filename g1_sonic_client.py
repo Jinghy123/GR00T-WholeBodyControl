@@ -146,6 +146,42 @@ class RSCamera:
             self.context.term()
 
 
+class ZedNeckCamera:
+    """ZED ego camera client for the neck-mounted ZED (--include-neck mode).
+
+    Connects to realsense_server.py running with `--zed-only --enable-neck-motor`
+    (the neck-mounted ZED on the robot, bound at tcp://192.168.123.164:5558).
+    The server reply is a 4-part multipart message:
+      [ego_rgb_jpeg, ego_stereo_jpeg, left_wrist_jpeg, right_wrist_jpeg]
+    Only ego_rgb (slot 0) is consumed here — the receive pattern mirrors
+    g1_data_server.py's RealSenseClient.
+    """
+
+    def __init__(self, host=REALSENSE_HOST, port=REALSENSE_PORT):
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REQ)
+        self.socket.connect(f"tcp://{host}:{port}")
+        print(f"[ZedNeckCamera] Connected to {host}:{port}")
+
+    def get_frame(self):
+        """Get BGR ego frame from the neck-mounted ZED."""
+        self.socket.send(b"get_frame")
+        parts = self.socket.recv_multipart()
+        while len(parts) < 4:
+            parts.append(b"")
+        ego_rgb_jpeg = parts[0]
+        if not ego_rgb_jpeg:
+            return None
+        arr = np.frombuffer(ego_rgb_jpeg, dtype=np.uint8)
+        return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+    def close(self):
+        if self.socket:
+            self.socket.close()
+        if self.context:
+            self.context.term()
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # WBC State Subscriber
 # ──────────────────────────────────────────────────────────────────────────────
@@ -523,8 +559,14 @@ class TokenPolicyClient:
                  include_neck=False):
         self._include_neck = include_neck
 
-        # Initialize components
-        self._camera = RSCamera(host=camera_host, port=camera_port)
+        # Initialize components. In neck mode the camera is the neck-mounted ZED
+        # served by realsense_server.py --zed-only --enable-neck-motor (4-part
+        # multipart, ego_rgb slot only). In default mode keep the original
+        # client_AR-style 3-part RSCamera.
+        if include_neck:
+            self._camera = ZedNeckCamera(host=camera_host, port=camera_port)
+        else:
+            self._camera = RSCamera(host=camera_host, port=camera_port)
         self._state_reader = WBCStateReader(host=wbc_host, port=wbc_port, topic=wbc_topic)
         self._token_publisher = TokenPublisher(host=zmq_host, port=zmq_port, topic=zmq_topic,
                                                include_neck=include_neck)
@@ -577,6 +619,8 @@ class TokenPolicyClient:
 
     def _get_image(self,):
         frame = self._camera.get_frame()
+        if frame is None:
+            return
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
         with self.image_buffer_lock:
