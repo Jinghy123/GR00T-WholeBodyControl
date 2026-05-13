@@ -4,19 +4,29 @@ For datasets where the robot never walks/turns (all phase A in walk_then_replay)
 token computation has no sim/WBC/planner dependency — it's a pure offline
 transform of data.json.
 
-Robot type is auto-detected from frame 0's `robot_type` key:
+Input auto-detection (each positional arg):
+  * directory containing data.json           → single episode
+  * directory containing episode_* subdirs   → task (all its episodes)
+  * directory containing task subdirs        → category (all tasks × all episodes);
+                                               writes conversion_status.txt here
+
+Robot type per episode is auto-detected from frame 0's `robot_type` key:
   * present → G1 path: reuses walk_then_replay.load_full_episode + write_sonic_json.
   * absent  → H1 path:
-      - legs   : forced to G1_DEFAULT_ANGLES_MUJOCO[:15]
-      - arms   : H1 actions.sol_q (14d, mujoco arm order)
-      - quat   : identity
-      - hands  : action.left_angles / right_angles via the sonic 1.7-x mapping
-                 → 6d per side → pad each with a 0 → 14d (left_7 + right_7)
+      - legs  : forced to G1_DEFAULT_ANGLES_MUJOCO[:15]
+      - arms  : H1 actions.sol_q (14d, mujoco arm order)
+      - quat  : identity
+      - hands : action.left_angles / right_angles via the sonic 1.7-x mapping
+                → 6d per side → pad each with a 0 → 14d (left_7 + right_7)
       - states.hand_joints: H1 states.hand_state (12d right-first) → swap and
                             pad → 14d
 
+On first failure: writes the error to conversion_status.txt and exits with
+non-zero (stops at the first broken episode).
+
 Usage:
-  python orchestration/offline_record.py /path/to/ep1 /path/to/ep2 [...]
+  python orchestration/offline_record.py /hfm/data/HE_RAW/Articulated
+  python orchestration/offline_record.py /path/to/single/episode_0
 """
 
 from __future__ import annotations
@@ -183,36 +193,129 @@ def encode_episode(episode_dir: Path, encoder: EncoderClient, out_path: Path) ->
     _log(f"{episode_dir.name}: done ({time.perf_counter()-t0:.1f}s, {n_50} frames)")
 
 
+# ── Input walking (episode / task / category auto-detect) ───────────────────
+
+def _looks_like_task(p: Path) -> bool:
+    """Task = dir that contains at least one episode_* subdir with data.json."""
+    if not p.is_dir():
+        return False
+    for sub in p.iterdir():
+        if sub.is_dir() and sub.name.startswith("episode") and (sub / "data.json").is_file():
+            return True
+    return False
+
+
+def _list_episodes(task_dir: Path) -> list[Path]:
+    eps = [p for p in task_dir.iterdir()
+           if p.is_dir() and p.name.startswith("episode") and (p / "data.json").is_file()]
+    return sorted(eps, key=lambda p: p.name)
+
+
+def _list_tasks(category_dir: Path) -> list[Path]:
+    return sorted([p for p in category_dir.iterdir() if _looks_like_task(p)],
+                  key=lambda p: p.name)
+
+
+def classify(path: Path) -> str:
+    """Returns 'episode' | 'task' | 'category'."""
+    if (path / "data.json").is_file():
+        return "episode"
+    if _looks_like_task(path):
+        return "task"
+    return "category"
+
+
+# ── Status file (live progress / errors, per category) ───────────────────────
+
+class StatusWriter:
+    """Append-only, auto-flushed status log. Disabled for single-episode runs."""
+
+    def __init__(self, path: Path | None):
+        self.path = path
+        self.fh = open(path, "a") if path is not None else None
+        if self.fh is not None:
+            self.fh.write("\n")
+
+    def _ts(self) -> str:
+        return time.strftime("%Y-%m-%d %H:%M:%S")
+
+    def write(self, line: str) -> None:
+        msg = f"[{self._ts()}] {line}\n"
+        if self.fh is not None:
+            self.fh.write(msg)
+            self.fh.flush()
+
+    def close(self) -> None:
+        if self.fh is not None:
+            self.fh.close()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("episodes", nargs="+", help="Episode dirs (each must contain data.json)")
+    ap.add_argument("paths", nargs="+",
+                    help="Category dir, task dir, or single episode dir (auto-detect)")
     ap.add_argument("--out-name", type=str, default="data_sonic.json")
+    ap.add_argument("--status-name", type=str, default="conversion_status.txt")
     args = ap.parse_args()
 
-    episodes = [Path(p).resolve() for p in args.episodes]
-    for ep in episodes:
-        if not (ep / "data.json").exists():
-            _log(f"no data.json in {ep}")
+    paths = [Path(p).resolve() for p in args.paths]
+    for p in paths:
+        if not p.is_dir():
+            _log(f"not a directory: {p}")
             return 1
 
     _log(f"loading encoder {ENCODER_MODEL}")
     encoder = EncoderClient(ENCODER_MODEL, mode=0)
 
-    results = []
-    for idx, ep in enumerate(episodes):
-        _log(f"[{idx+1}/{len(episodes)}] {ep}")
-        try:
-            encode_episode(ep, encoder, ep / args.out_name)
-            results.append((str(ep), True))
-        except Exception as e:  # noqa: BLE001
-            _log(f"FAIL {type(e).__name__}: {e}")
-            results.append((str(ep), False))
+    overall_ok = True
+    for p in paths:
+        kind = classify(p)
+        _log(f"input {p} → kind={kind}")
 
-    print()
-    _log(f"{sum(1 for _,ok in results if ok)}/{len(results)} succeeded")
-    for ep, ok in results:
-        print(f"  [{'OK ' if ok else 'FAIL'}] {ep}")
-    return 0 if all(ok for _, ok in results) else 2
+        if kind == "episode":
+            status = StatusWriter(None)
+            tasks = [(p.parent.name, [p])]
+        elif kind == "task":
+            status = StatusWriter(None)
+            tasks = [(p.name, _list_episodes(p))]
+        else:  # category
+            status_path = p / args.status_name
+            status = StatusWriter(status_path)
+            tlist = _list_tasks(p)
+            tasks = [(t.name, _list_episodes(t)) for t in tlist]
+            n_total_eps = sum(len(eps) for _, eps in tasks)
+            status.write(f"STARTED — {p.name} ({len(tasks)} tasks, {n_total_eps} episodes)")
+            _log(f"category {p.name}: {len(tasks)} tasks, {n_total_eps} episodes; "
+                 f"status → {status_path}")
+
+        stopped = False
+        for task_name, eps in tasks:
+            if not eps:
+                status.write(f"SKIP   {task_name} (no episodes with data.json)")
+                continue
+            t_task = time.perf_counter()
+            for ep in eps:
+                try:
+                    encode_episode(ep, encoder, ep / args.out_name)
+                except Exception as e:  # noqa: BLE001
+                    status.write(f"FAILED {task_name}/{ep.name}: {type(e).__name__}: {e}")
+                    status.write("STOPPED — first failure")
+                    _log(f"STOPPED — {task_name}/{ep.name} failed: {type(e).__name__}: {e}")
+                    overall_ok = False
+                    stopped = True
+                    break
+            if stopped:
+                break
+            status.write(f"DONE   {task_name} ({len(eps)} episodes, "
+                         f"{time.perf_counter()-t_task:.1f}s)")
+
+        if not stopped and kind == "category":
+            status.write(f"FINISHED — {p.name}")
+        status.close()
+        if stopped:
+            return 2
+
+    return 0 if overall_ok else 2
 
 
 if __name__ == "__main__":
