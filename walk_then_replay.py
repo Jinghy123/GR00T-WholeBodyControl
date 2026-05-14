@@ -20,6 +20,7 @@ import os
 import signal
 import sys
 import time
+from pathlib import Path
 
 import numpy as np
 
@@ -450,9 +451,10 @@ def main():
         finally:
             if async_planner is not None:
                 async_planner.stop()
-            pub.close()
-            if wbc is not None:
-                wbc.close()
+            # Write the output BEFORE tearing down ZMQ/wbc — some libzmq
+            # versions hit an assertion in pub.close() shutdown race that
+            # aborts the process; saving the JSON first means the work
+            # survives the crash.
             print(f"[main] stopped after {n_pub} tokens")
             if tokens_50 is not None and record_tokens_path is not None:
                 # If we exited before consuming all frames, hold the last valid
@@ -462,6 +464,9 @@ def main():
                 idx_30_to_50 = np.round(np.arange(n_30) * 5.0 / 3.0).astype(int).clip(0, n_50 - 1)
                 tokens_30 = tokens_50[idx_30_to_50]
                 write_sonic_json(episode_dir, record_tokens_path, tokens_30)
+            pub.close()
+            if wbc is not None:
+                wbc.close()
 
 
 def write_sonic_json(episode_dir, out_path, tokens_30):
@@ -517,8 +522,13 @@ def write_sonic_json(episode_dir, out_path, tokens_30):
             frame_out["timestamp"] = int(t * 1e9)
         out.append(frame_out)
 
-    with open(out_path, "w") as f:
+    # Write to a temp path then atomic-rename, so a crash mid-write never
+    # leaves a partial file at out_path (which would falsely pass --skip-existing).
+    out_path = Path(out_path)
+    tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+    with open(tmp_path, "w") as f:
         json.dump(out, f)
+    os.replace(tmp_path, out_path)
     print(f"[main] wrote {n} frames → {out_path}")
 
 

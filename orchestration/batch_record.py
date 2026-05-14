@@ -356,14 +356,21 @@ def main() -> int:
                     except KeyboardInterrupt:
                         _terminate(walk_proc, "walk_then_replay", 2.0)
                         raise
-                    ok = walk_rc == 0 and out_path.exists()
+                    out_exists = out_path.exists()
+                    # Accept rc != 0 as long as the output JSON got written —
+                    # walk_then_replay can hit a libzmq shutdown abort AFTER
+                    # writing the data; the work survived even if rc=-6.
+                    ok = out_exists
                     _log("episode", f"{task_name}/{ep.name} rc={walk_rc} "
-                                    f"out_exists={out_path.exists()}")
+                                    f"out_exists={out_exists}")
+                    if ok and walk_rc != 0:
+                        _log("episode", f"  (rc={walk_rc} but file written — "
+                                        f"treating as success)")
                     global_idx += 1
                     if not ok:
                         failed_ref = f"{task_name}/{ep.name}"
                         status.write(f"FAILED {failed_ref} "
-                                     f"(rc={walk_rc}, out_exists={out_path.exists()})")
+                                     f"(rc={walk_rc}, out_exists={out_exists})")
                         status.write("STOPPED — first failure")
                         stopped = True
                         break
