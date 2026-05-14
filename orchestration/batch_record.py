@@ -190,6 +190,8 @@ def main() -> int:
                     help="Output filename inside each episode dir.")
     ap.add_argument("--status-name", type=str, default="conversion_status.txt",
                     help="Status filename written inside each category dir.")
+    ap.add_argument("--skip-existing", action="store_true",
+                    help="Skip episodes whose out-name file already exists (resume mode).")
     ap.add_argument("--settle-secs", type=float, default=5.0,
                     help="After initial drop, wait this long for robot to stand up before first Enter.")
     ap.add_argument("--reset-settle-secs", type=float, default=2.0,
@@ -213,6 +215,7 @@ def main() -> int:
 
     groups: List[dict] = []
     total_eps = 0
+    total_skipped = 0
     for p in paths:
         kind = classify(p)
         if kind == "episode":
@@ -224,15 +227,30 @@ def main() -> int:
         else:  # category
             tasks = [(t.name, _list_episodes(t)) for t in _list_tasks(p)]
             status_path = p / args.status_name
+
+        if args.skip_existing:
+            filtered = []
+            for task_name, eps in tasks:
+                kept = [ep for ep in eps if not (ep / args.out_name).exists()]
+                skipped = len(eps) - len(kept)
+                if skipped:
+                    total_skipped += skipped
+                    _log("init", f"  {task_name}: skipping {skipped} already-done "
+                                 f"({len(kept)} remaining)")
+                filtered.append((task_name, kept))
+            tasks = filtered
+
         n_eps = sum(len(eps) for _, eps in tasks)
         total_eps += n_eps
-        _log("init", f"{p} → kind={kind} ({len(tasks)} tasks, {n_eps} episodes)")
+        _log("init", f"{p} → kind={kind} ({len(tasks)} tasks, {n_eps} episodes"
+                     + (f", {total_skipped} skipped" if args.skip_existing else "") + ")")
         groups.append({"root": p, "kind": kind, "status_path": status_path,
                        "tasks": tasks})
 
     if total_eps == 0:
-        _log("init", "no episodes to process")
-        return 1
+        _log("init", "no episodes to process"
+                     + (" (all already done)" if args.skip_existing and total_skipped else ""))
+        return 0 if args.skip_existing else 1
 
     sim_proc: Optional[subprocess.Popen] = None
     deploy_proc: Optional[subprocess.Popen] = None
