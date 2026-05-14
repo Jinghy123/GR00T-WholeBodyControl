@@ -3,6 +3,15 @@
 Shares one sim + one deploy across N episodes — TRT engine is loaded once,
 saving ~30s per episode vs single-shot orchestrator.
 
+Input auto-detection (each positional arg):
+  * directory containing data.json           → single episode
+  * directory containing episode_* subdirs   → task (all its episodes)
+  * directory containing task subdirs        → category (all tasks × all episodes);
+                                               writes conversion_status.txt here
+
+On first walk_then_replay failure: writes FAILED + STOPPED to the category
+status file, tears down sim/deploy, exits non-zero.
+
 Flow:
   ┌─ first time only ─┐         ┌──── per episode ────────────────┐
   start sim                     │ (if not first):                 │
@@ -24,13 +33,9 @@ loaded-motion between episodes lets the robot recover to a clean standing
 pose on its own — no re-hanging the band needed.
 
 Usage:
-  python orchestration/batch_record.py \\
-      /path/to/episode_15 /path/to/episode_16 \\
-      [--out-name data_sonic.json]              \\
-      [--settle-secs 5]                         \\
-      [--reset-settle-secs 2]                   \\
-      [--pre-episode-secs 1.5]                  \\
-      [--deploy-mode sim]
+  python orchestration/batch_record.py /hfm/data/HE_RAW/Articulated
+  python orchestration/batch_record.py /path/to/task_folder
+  python orchestration/batch_record.py /path/to/episode_15 /path/to/episode_16
 """
 
 from __future__ import annotations
@@ -58,6 +63,62 @@ DEPLOY_READY_MARKER = "Init Done"
 
 def _log(tag: str, msg: str) -> None:
     print(f"[batch] {tag}: {msg}", flush=True)
+
+
+# ── input auto-detection ─────────────────────────────────────────────────────
+
+def _looks_like_task(p: Path) -> bool:
+    """Task = dir that contains at least one episode_* subdir with data.json."""
+    if not p.is_dir():
+        return False
+    for sub in p.iterdir():
+        if sub.is_dir() and sub.name.startswith("episode") and (sub / "data.json").is_file():
+            return True
+    return False
+
+
+def _list_episodes(task_dir: Path) -> List[Path]:
+    eps = [p for p in task_dir.iterdir()
+           if p.is_dir() and p.name.startswith("episode") and (p / "data.json").is_file()]
+    return sorted(eps, key=lambda p: p.name)
+
+
+def _list_tasks(category_dir: Path) -> List[Path]:
+    return sorted([p for p in category_dir.iterdir() if _looks_like_task(p)],
+                  key=lambda p: p.name)
+
+
+def classify(path: Path) -> str:
+    """Returns 'episode' | 'task' | 'category'."""
+    if (path / "data.json").is_file():
+        return "episode"
+    if _looks_like_task(path):
+        return "task"
+    return "category"
+
+
+class StatusWriter:
+    """Append-only, auto-flushed status log. Disabled (no-op) when path is None."""
+
+    def __init__(self, path: Optional[Path]):
+        self.path = path
+        self.fh = open(path, "a") if path is not None else None
+        if self.fh is not None:
+            self.fh.write("\n")
+
+    def _ts(self) -> str:
+        return time.strftime("%Y-%m-%d %H:%M:%S")
+
+    def write(self, line: str) -> None:
+        msg = f"[{self._ts()}] {line}\n"
+        if self.fh is not None:
+            self.fh.write(msg)
+            self.fh.flush()
+
+    def close(self) -> None:
+        if self.fh is not None:
+            self.fh.close()
+            self.fh = None
 
 
 class _PipePump:
@@ -123,9 +184,12 @@ def _terminate(proc: Optional[subprocess.Popen], name: str, grace: float = 5.0) 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("episodes", nargs="+", help="Episode dirs (each must contain data.json)")
+    ap.add_argument("paths", nargs="+",
+                    help="Category dir, task dir, or single episode dir (auto-detect)")
     ap.add_argument("--out-name", type=str, default="data_sonic.json",
                     help="Output filename inside each episode dir.")
+    ap.add_argument("--status-name", type=str, default="conversion_status.txt",
+                    help="Status filename written inside each category dir.")
     ap.add_argument("--settle-secs", type=float, default=5.0,
                     help="After initial drop, wait this long for robot to stand up before first Enter.")
     ap.add_argument("--reset-settle-secs", type=float, default=2.0,
@@ -140,11 +204,35 @@ def main() -> int:
     ap.add_argument("--deploy-ready-timeout", type=float, default=120.0)
     args = ap.parse_args()
 
-    episodes = [Path(p).resolve() for p in args.episodes]
-    for ep in episodes:
-        if not (ep / "data.json").exists():
-            _log("init", f"no data.json in {ep}")
+    # Expand each path into a "group" = (root, kind, status_path, [(task_name, [eps])]).
+    paths = [Path(p).resolve() for p in args.paths]
+    for p in paths:
+        if not p.is_dir():
+            _log("init", f"not a directory: {p}")
             return 1
+
+    groups: List[dict] = []
+    total_eps = 0
+    for p in paths:
+        kind = classify(p)
+        if kind == "episode":
+            tasks = [(p.parent.name, [p])]
+            status_path = None
+        elif kind == "task":
+            tasks = [(p.name, _list_episodes(p))]
+            status_path = None
+        else:  # category
+            tasks = [(t.name, _list_episodes(t)) for t in _list_tasks(p)]
+            status_path = p / args.status_name
+        n_eps = sum(len(eps) for _, eps in tasks)
+        total_eps += n_eps
+        _log("init", f"{p} → kind={kind} ({len(tasks)} tasks, {n_eps} episodes)")
+        groups.append({"root": p, "kind": kind, "status_path": status_path,
+                       "tasks": tasks})
+
+    if total_eps == 0:
+        _log("init", "no episodes to process")
+        return 1
 
     sim_proc: Optional[subprocess.Popen] = None
     deploy_proc: Optional[subprocess.Popen] = None
@@ -208,46 +296,72 @@ def main() -> int:
         deploy_proc.stdin.flush()
         time.sleep(1.0)
 
-        # ---- per-episode loop ----
-        results: List[tuple[str, int, bool]] = []
-        for idx, ep in enumerate(episodes):
-            _log("episode", f"[{idx+1}/{len(episodes)}] {ep.name}")
+        # ---- per-group loop (stop-on-first-failure) ----
+        global_idx = 0
+        for g in groups:
+            status = StatusWriter(g["status_path"])
+            if g["kind"] == "category":
+                n_eps_in_g = sum(len(eps) for _, eps in g["tasks"])
+                status.write(f"STARTED — {g['root'].name} "
+                             f"({len(g['tasks'])} tasks, {n_eps_in_g} episodes)")
 
-            if idx > 0:
-                _log("reset", "Enter -> loaded reference motion")
-                deploy_proc.stdin.write("\n")
-                deploy_proc.stdin.flush()
-                _log("reset", f"settling {args.reset_settle_secs}s")
-                time.sleep(args.reset_settle_secs)
-                _log("reset", "Enter -> ZMQ streaming ON")
-                deploy_proc.stdin.write("\n")
-                deploy_proc.stdin.flush()
-                time.sleep(args.pre_episode_secs)
+            stopped = False
+            failed_ref: Optional[str] = None
+            for task_name, eps in g["tasks"]:
+                if not eps:
+                    status.write(f"SKIP   {task_name} (no episodes with data.json)")
+                    continue
+                t_task = time.perf_counter()
+                for ep in eps:
+                    if global_idx > 0:
+                        _log("reset", "Enter -> loaded reference motion")
+                        deploy_proc.stdin.write("\n")
+                        deploy_proc.stdin.flush()
+                        _log("reset", f"settling {args.reset_settle_secs}s")
+                        time.sleep(args.reset_settle_secs)
+                        _log("reset", "Enter -> ZMQ streaming ON")
+                        deploy_proc.stdin.write("\n")
+                        deploy_proc.stdin.flush()
+                        time.sleep(args.pre_episode_secs)
 
-            out_path = ep / args.out_name
-            _log("episode", f"running walk_then_replay -> {out_path}")
-            walk_proc = subprocess.Popen(
-                [sys.executable, "-u", str(WALK_THEN_REPLAY),
-                 str(ep), "--record-tokens", str(out_path)],
-                cwd=str(REPO_ROOT),
-                preexec_fn=os.setsid,
-            )
-            try:
-                walk_rc = walk_proc.wait()
-            except KeyboardInterrupt:
-                _terminate(walk_proc, "walk_then_replay", 2.0)
-                raise
-            ok = walk_rc == 0 and out_path.exists()
-            _log("episode", f"{ep.name} rc={walk_rc} out_exists={out_path.exists()}")
-            results.append((str(ep), walk_rc, ok))
+                    out_path = ep / args.out_name
+                    _log("episode", f"[{global_idx+1}/{total_eps}] "
+                                    f"{task_name}/{ep.name} → {out_path}")
+                    walk_proc = subprocess.Popen(
+                        [sys.executable, "-u", str(WALK_THEN_REPLAY),
+                         str(ep), "--record-tokens", str(out_path)],
+                        cwd=str(REPO_ROOT),
+                        preexec_fn=os.setsid,
+                    )
+                    try:
+                        walk_rc = walk_proc.wait()
+                    except KeyboardInterrupt:
+                        _terminate(walk_proc, "walk_then_replay", 2.0)
+                        raise
+                    ok = walk_rc == 0 and out_path.exists()
+                    _log("episode", f"{task_name}/{ep.name} rc={walk_rc} "
+                                    f"out_exists={out_path.exists()}")
+                    global_idx += 1
+                    if not ok:
+                        failed_ref = f"{task_name}/{ep.name}"
+                        status.write(f"FAILED {failed_ref} "
+                                     f"(rc={walk_rc}, out_exists={out_path.exists()})")
+                        status.write("STOPPED — first failure")
+                        stopped = True
+                        break
+                if stopped:
+                    break
+                status.write(f"DONE   {task_name} ({len(eps)} episodes, "
+                             f"{time.perf_counter()-t_task:.1f}s)")
 
-        # ---- summary ----
-        print()
-        _log("summary", f"{sum(1 for _,_,ok in results if ok)}/{len(results)} succeeded")
-        for ep, rc, ok in results:
-            mark = "OK " if ok else "FAIL"
-            print(f"  [{mark}] rc={rc}  {ep}")
-        return 0 if all(ok for _, _, ok in results) else 2
+            if not stopped and g["kind"] == "category":
+                status.write(f"FINISHED — {g['root'].name}")
+            status.close()
+            if stopped:
+                _log("error", f"stopped at {failed_ref}")
+                return 2
+
+        return 0
 
     except KeyboardInterrupt:
         _log("error", "interrupted by user")
