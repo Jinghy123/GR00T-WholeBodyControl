@@ -98,8 +98,6 @@ if _XR_RETARGET_DIR not in sys.path:
     sys.path.insert(0, _XR_RETARGET_DIR)
 try:
     from hand_retargeting import HandRetargeting, HandType
-    import hand_retargeting as _hr_mod
-    print(f"[Manus] hand_retargeting loaded from: {_hr_mod.__file__}")
 except ImportError as _retarget_err:
     print(f"Warning: HandRetargeting not available: {_retarget_err}")
     HandRetargeting = None
@@ -718,9 +716,6 @@ def _manus25_to_tracking26(xyz25: np.ndarray, side: str) -> dict:
     return out
 
 
-_MANUS_DEBUG_COUNT = 0
-
-
 def compute_hand_joints_from_manus(
     hand_retargeting,
     manus_receiver,
@@ -786,29 +781,6 @@ def compute_hand_joints_from_manus(
     ref_right[3] *= THUMB_WRIST_GAIN
     ref_right[4] *= INDEX_WRIST_GAIN
     ref_right[5] *= MIDDLE_WRIST_GAIN
-
-    # Periodic axis-direction debug.
-    # In the unitree hand frame, the URDF convention for dex3 is:
-    #   +X = "forward" (palm normal, fingertips pointing forward)
-    #   +Y = thumb side (positive Y is where the thumb naturally opposes to)
-    #   +Z = up (back of hand)
-    # When you hold an OPEN PALM (all fingers spread, thumb fully abducted):
-    #   wrist->middle_tip should be ~ ( +X large, ~0, ~0 )
-    #   wrist->thumb_tip  should be ~ ( +X medium, +Y medium, ~0 )
-    # If thumb's dominant axis is Z (instead of Y) or has the wrong sign,
-    # the dex3 IK will need to curl the thumb inward to chase a target that
-    # is physically impossible — that's exactly the "thumb stuck folded" bug.
-    global _MANUS_DEBUG_COUNT
-    _MANUS_DEBUG_COUNT += 1
-    if _MANUS_DEBUG_COUNT % 60 == 1:  # ~once per 2s at 30Hz
-        wt = ref_left[3]  # wrist->thumb_tip
-        wi = ref_left[4]  # wrist->index_tip
-        wm = ref_left[5]  # wrist->middle_tip
-        print(
-            f"[Manus axes] L wrist->thumb=({wt[0]:+.3f},{wt[1]:+.3f},{wt[2]:+.3f})  "
-            f"index=({wi[0]:+.3f},{wi[1]:+.3f},{wi[2]:+.3f})  "
-            f"middle=({wm[0]:+.3f},{wm[1]:+.3f},{wm[2]:+.3f})"
-        )
 
     # NOTE: vr_pico uses right_dex_retargeting_to_hardware for both hands; mirror that.
     reorder = hand_retargeting.right_dex_retargeting_to_hardware
