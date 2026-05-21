@@ -85,14 +85,21 @@ except ImportError:
     print("Warning: recording_manager not available. Data collection disabled.")
     RecordingManagerThread = None
 
-# Hand control via Manus glove + dex-retargeting (vendored in PSI-Teleop-PICO).
-# The YAMLs referenced by HandType use paths relative to the teleop directory,
-# so we also chdir there when building the retargeting object.
-_MANUS_TELEOP_DIR = "/home/xiawei/hongyi/Unitree_Robotics/PSI-Teleop-PICO/teleop"
-if _MANUS_TELEOP_DIR not in sys.path:
-    sys.path.insert(0, _MANUS_TELEOP_DIR)
+# Hand control via Manus glove + dex-retargeting. Uses a locally-vendored copy
+# of the xr_teleoperate retargeting pipeline (under external_dependencies/
+# xr_hand_retargeting/) so this script no longer depends on the PSI-Teleop-PICO
+# checkout being present. HandType paths are absolute (resolved from __file__).
+_XR_RETARGET_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "..", "..", "external_dependencies", "xr_hand_retargeting",
+)
+_XR_RETARGET_DIR = os.path.normpath(_XR_RETARGET_DIR)
+if _XR_RETARGET_DIR not in sys.path:
+    sys.path.insert(0, _XR_RETARGET_DIR)
 try:
-    from robot_control.hand_retargeting import HandRetargeting, HandType
+    from hand_retargeting import HandRetargeting, HandType
+    import hand_retargeting as _hr_mod
+    print(f"[Manus] hand_retargeting loaded from: {_hr_mod.__file__}")
 except ImportError as _retarget_err:
     print(f"Warning: HandRetargeting not available: {_retarget_err}")
     HandRetargeting = None
@@ -650,16 +657,12 @@ def init_manus_receiver(
 
 
 def init_hand_retargeting():
-    """Build the HandRetargeting (Unitree Dex3). YAMLs in HandType use relative paths,
-    so we chdir to the vendored teleop dir while constructing."""
+    """Build the HandRetargeting (Unitree Dex3) from the locally-vendored
+    xr_teleoperate copy. Paths inside the package are absolute, so no
+    chdir is needed."""
     if HandRetargeting is None or HandType is None:
         return None
-    prev_cwd = os.getcwd()
-    try:
-        os.chdir(_MANUS_TELEOP_DIR)
-        hr = HandRetargeting(HandType.UNITREE_DEX3)
-    finally:
-        os.chdir(prev_cwd)
+    hr = HandRetargeting(HandType.UNITREE_DEX3)
     print("[Manus] HandRetargeting (UNITREE_DEX3) initialized")
     return hr
 
@@ -715,6 +718,9 @@ def _manus25_to_tracking26(xyz25: np.ndarray, side: str) -> dict:
     return out
 
 
+_MANUS_DEBUG_COUNT = 0
+
+
 def compute_hand_joints_from_manus(
     hand_retargeting,
     manus_receiver,
@@ -743,24 +749,66 @@ def compute_hand_joints_from_manus(
     unitree_left_hand = (M_to_unitree_hand @ left_homog)[0:3, :].T
     unitree_right_hand = (M_to_unitree_hand @ right_homog)[0:3, :].T
 
-    tip_idx = [24, 5, 10]  # thumb, index, middle (Manus 25-node layout)
-    ref_left = unitree_left_hand[tip_idx].copy()
-    ref_right = unitree_right_hand[tip_idx].copy()
+    # Thumb LATERAL mirror: without this, the Manus thumb-tip lands on the
+    # wrong side of the palm (outside of index → inside of middle finger
+    # after retargeting). The flip mirrors the thumb along the in-palm-plane
+    # lateral axis so it sits on the correct side. Note: this is NOT meant
+    # to lift the thumb out of palm plane — that's a separate axis.
+    unitree_left_hand[24, 2]  *= -1
+    unitree_right_hand[24, 2] *= -1
 
-    ref_left[0, 2]  *= -0.8                                                         
-    ref_right[0, 2] *= -0.8
+    # Build the 6 DexPilot reference vectors expected by unitree_dex3.yml
+    # (target_link_human_indices_dexpilot = [[9,14,14,0,0,0], [4,4,9,4,9,14]]).
+    # Those indices are for the VR/MediaPipe-style 25-pt layout where
+    # wrist=0, thumb_tip=4, index_tip=9, middle_tip=14.
+    # The Manus 25-node layout is different: wrist=0, index_tip=5,
+    # middle_tip=10, thumb_tip=24. Remap accordingly so the 6 inter-keypoint
+    # vectors (3 inter-finger + 3 wrist-to-tip) are semantically the same.
+    manus_dex_origin = np.array([5, 10, 10, 0, 0, 0])
+    manus_dex_task   = np.array([24, 24, 5, 24, 5, 10])
+    ref_left  = unitree_left_hand[manus_dex_task]  - unitree_left_hand[manus_dex_origin]
+    ref_right = unitree_right_hand[manus_dex_task] - unitree_right_hand[manus_dex_origin]
 
-    # THUMB_OPPOSITION_GAIN = 0.9                                 
-    # ref_left[0, 1]  *= THUMB_OPPOSITION_GAIN                                      
-    # ref_right[0, 1] *= THUMB_OPPOSITION_GAIN
+    # DexPilot wrist→tip weights are fixed at 6 (vs inter-finger weight 1 normal,
+    # 200 when pinching). With Manus, the wrist→thumb_tip vector's palm-normal
+    # component is small (~2 cm in opposition pose), so the IK has no incentive
+    # to drive thumb_0 (opposition) to a high angle even though dex3 can do ±60°.
+    # Inter-finger (pinch) gestures still work because of the weight-200 boost.
+    # Amplify wrist→thumb_tip (vector index 3) to "stretch" the thumb target away
+    # from the wrist; the optimizer then has to crank up thumb opposition to reach
+    # it. Values mirror the spirit of vr_pico.py's per-tip scaling.
+    THUMB_WRIST_GAIN  = 1.15
+    INDEX_WRIST_GAIN  = 1.05
+    MIDDLE_WRIST_GAIN = 0.95
+    ref_left[3]  *= THUMB_WRIST_GAIN
+    ref_left[4]  *= INDEX_WRIST_GAIN
+    ref_left[5]  *= MIDDLE_WRIST_GAIN
+    ref_right[3] *= THUMB_WRIST_GAIN
+    ref_right[4] *= INDEX_WRIST_GAIN
+    ref_right[5] *= MIDDLE_WRIST_GAIN
 
-    # Per-tip scaling from vr_pico.py
-    ref_left[0] *= 1.15
-    ref_left[1] *= 1.05
-    ref_left[2] *= 0.95
-    ref_right[0] *= 1.15
-    ref_right[1] *= 1.05
-    ref_right[2] *= 0.95
+    # Periodic axis-direction debug.
+    # In the unitree hand frame, the URDF convention for dex3 is:
+    #   +X = "forward" (palm normal, fingertips pointing forward)
+    #   +Y = thumb side (positive Y is where the thumb naturally opposes to)
+    #   +Z = up (back of hand)
+    # When you hold an OPEN PALM (all fingers spread, thumb fully abducted):
+    #   wrist->middle_tip should be ~ ( +X large, ~0, ~0 )
+    #   wrist->thumb_tip  should be ~ ( +X medium, +Y medium, ~0 )
+    # If thumb's dominant axis is Z (instead of Y) or has the wrong sign,
+    # the dex3 IK will need to curl the thumb inward to chase a target that
+    # is physically impossible — that's exactly the "thumb stuck folded" bug.
+    global _MANUS_DEBUG_COUNT
+    _MANUS_DEBUG_COUNT += 1
+    if _MANUS_DEBUG_COUNT % 60 == 1:  # ~once per 2s at 30Hz
+        wt = ref_left[3]  # wrist->thumb_tip
+        wi = ref_left[4]  # wrist->index_tip
+        wm = ref_left[5]  # wrist->middle_tip
+        print(
+            f"[Manus axes] L wrist->thumb=({wt[0]:+.3f},{wt[1]:+.3f},{wt[2]:+.3f})  "
+            f"index=({wi[0]:+.3f},{wi[1]:+.3f},{wi[2]:+.3f})  "
+            f"middle=({wm[0]:+.3f},{wm[1]:+.3f},{wm[2]:+.3f})"
+        )
 
     # NOTE: vr_pico uses right_dex_retargeting_to_hardware for both hands; mirror that.
     reorder = hand_retargeting.right_dex_retargeting_to_hardware
