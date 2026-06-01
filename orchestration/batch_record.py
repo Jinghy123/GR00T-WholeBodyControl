@@ -199,6 +199,12 @@ def main() -> int:
                          " to self-stabilize under the reference motion before re-enabling streaming.")
     ap.add_argument("--pre-episode-secs", type=float, default=1.5,
                     help="After streaming re-enabled, wait this long before launching walk_then_replay.")
+    ap.add_argument("--episode-timeout", type=float, default=600.0,
+                    help="Max seconds for an episode to produce its output before it's "
+                         "killed as stuck (genuine mid-run hang → FAILED).")
+    ap.add_argument("--teardown-grace", type=float, default=15.0,
+                    help="Once the output file appears, wait this long for the process to "
+                         "exit cleanly before killing it (handles libzmq teardown hangs).")
     ap.add_argument("--deploy-mode", type=str, default="sim")
     ap.add_argument("--viewer", action="store_true",
                     help="Show mujoco viewer (debug only; default headless).")
@@ -351,8 +357,43 @@ def main() -> int:
                         cwd=str(REPO_ROOT),
                         preexec_fn=os.setsid,
                     )
+                    # Watchdog: walk_then_replay writes its output (atomic
+                    # rename) right before tearing down ZMQ/WBC. That teardown
+                    # occasionally HANGS (libzmq shutdown race) instead of
+                    # exiting, which would block the whole batch forever on a
+                    # plain wait(). So poll instead:
+                    #   * output appeared but proc still alive past
+                    #     --teardown-grace → work done, stuck in teardown → kill
+                    #     it and treat as success.
+                    #   * no output past --episode-timeout → genuinely stuck
+                    #     mid-run → kill it and let it fall through to FAILED.
+                    deadline = time.perf_counter() + args.episode_timeout
+                    out_seen_at: Optional[float] = None
+                    walk_rc: Optional[int] = None
                     try:
-                        walk_rc = walk_proc.wait()
+                        while True:
+                            try:
+                                walk_rc = walk_proc.wait(timeout=2.0)
+                                break  # exited on its own
+                            except subprocess.TimeoutExpired:
+                                now = time.perf_counter()
+                                if out_path.exists():
+                                    if out_seen_at is None:
+                                        out_seen_at = now
+                                    elif now - out_seen_at >= args.teardown_grace:
+                                        _log("episode", f"output written but proc still "
+                                                        f"alive {args.teardown_grace:.0f}s "
+                                                        f"later — killing (teardown hang)")
+                                        _terminate(walk_proc, "walk_then_replay", 3.0)
+                                        walk_rc = walk_proc.returncode
+                                        break
+                                elif now > deadline:
+                                    _log("episode", f"no output after "
+                                                    f"{args.episode_timeout:.0f}s — "
+                                                    f"killing (stuck mid-run)")
+                                    _terminate(walk_proc, "walk_then_replay", 3.0)
+                                    walk_rc = walk_proc.returncode
+                                    break
                     except KeyboardInterrupt:
                         _terminate(walk_proc, "walk_then_replay", 2.0)
                         raise
