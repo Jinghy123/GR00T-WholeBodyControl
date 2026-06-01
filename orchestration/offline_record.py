@@ -166,7 +166,10 @@ def write_sonic_json_h1(episode_dir: Path, out_path: Path, tokens_30) -> None:
 
 def encode_episode(episode_dir: Path, encoder: EncoderClient, out_path: Path) -> None:
     if is_g1_episode(episode_dir):
-        qpos_30, _h, imu_q_30, _v, sol_dim = load_full_episode(str(episode_dir))
+        # _cmd (torso_vx/vy + target_yaw) is unused here — offline episodes are
+        # all phase A (no walking), so motion-command detection never matters.
+        # Just absorb the 6th return value and drop it.
+        qpos_30, _h, imu_q_30, _v, sol_dim, _cmd = load_full_episode(str(episode_dir))
         tag = f"G1 sol_dim={sol_dim}"
         writer = lambda toks: write_sonic_json(str(episode_dir), str(out_path), toks)
     else:

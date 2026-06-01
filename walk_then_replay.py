@@ -26,7 +26,7 @@ import numpy as np
 
 # ── USER CONFIG ────────────────────────────────────────────────────────────────
 # EPISODE_DIR = "/home/xiawei/hongyi/Unitree_Robotics/Humanoid-Teleop/teleop/data/g1_1001/Basic/Pick_toys_into_box_and_lift_and_turn_and_put_on_the_chair_new/episode_40"
-EPISODE_DIR = "/home/xiawei/hongyi/Unitree_Robotics/Humanoid-Teleop/teleop/data/g1_1001/Basic/Pick_bottle_and_turn_and_pour_into_cup/episode_15"
+EPISODE_DIR = "/home/xiawei/hongyi/Unitree_Robotics/Humanoid-Teleop/teleop/data/g1_1001/Basic/Pick_toys_into_box_and_lift_and_turn_and_put_on_the_chair_new/episode_28"
 # EPISODE_DIR = "/home/xiawei/data/HE_RAW/Locomanip/walk_towards_a_desk_and_place_a_cube_on_a_tray/episode_4"
 # EPISODE_DIR = "/home/xiawei/hongyi/Unitree_Robotics/Humanoid-Teleop/teleop/data/g1_1001/Basic/Spray_the_bowl_and_wipe_it_and_stack_it_up/episode_10"
 
@@ -46,6 +46,13 @@ WALK_SPEED_DEFAULT    = 0.3
 # actually step around instead of dragging.
 TURN_RATE_ENTER = 8.0
 TURN_RATE_EXIT  = 4.0
+
+# Absolute cap on waist_pitch (states.leg_state[14], mujoco order, degrees) when
+# loading the episode. Teleop data often has sustained 8-14° forward lean for
+# manipulation, which destabilizes the WBC controller (robot takes small
+# compensating forward steps in phase A). Set to None to disable.
+WAIST_PITCH_CAP_DEG = 2.0
+
 # ───────────────────────────────────────────────────────────────────────────────
 
 # ── Internal constants (don't usually need tuning) ─────────────────────────────
@@ -81,7 +88,7 @@ from walk_forward_token import (
 # ── Episode loader ────────────────────────────────────────────────────────────
 
 def load_full_episode(episode_dir):
-    """Returns (qpos_isaac, hands_or_None, imu_quat, body_vel).
+    """Returns (qpos_isaac, hands_or_None, imu_quat, body_vel, sol_dim, cmd_or_None).
 
     Joint sources by sol_q dimension (probed from frame 0):
       - sol_q is 14-d → arm command only. Use it for upper body (overrides
@@ -90,11 +97,15 @@ def load_full_episode(episode_dir):
         (cleaner than states; no controller tracking error).
       - sol_q missing/other → fall back to states for everything.
 
-    IMU quaternion and body velocity always come from states (action has no
-    measured IMU/velocity).
+    IMU quaternion always comes from states (needed for the encoder window).
 
     body_vel is `states.odometry.velocity`, already body-frame (Unitree
-    convention): vx = forward, vy = lateral left, vz = up. No rotation needed.
+    convention): vx = forward, vy = lateral left, vz = up.
+
+    cmd: if every frame has numeric `actions.torso_vx`, `actions.torso_vy`,
+    `actions.target_yaw`, returns (cmd_vel (n,3), cmd_yaw (n,)). Phase detection
+    then uses these clean teleop-command signals (no IMU noise / step osc).
+    Otherwise None and the caller falls back to body_vel + IMU yaw.
     """
     with open(os.path.join(episode_dir, "data.json")) as f:
         d = json.load(f)
@@ -104,10 +115,8 @@ def load_full_episode(episode_dir):
     a0 = frames[0].get("actions") or {}
     sol0 = a0.get("sol_q")
     sol_dim = len(sol0) if sol0 is not None else 0
-    if sol_dim == 14:
+    if sol_dim in (14, 29):
         body_src = "arm-from-action, leg-from-states"
-    elif sol_dim == 29:
-        body_src = "full-body-from-action"
     else:
         body_src = "full-body-from-states"
     has_action_hands = (
@@ -121,23 +130,28 @@ def load_full_episode(episode_dir):
     hands = np.zeros((n, 14), dtype=np.float32)
     imu_quat = np.zeros((n, 4), dtype=np.float32)
     body_vel = np.zeros((n, 3), dtype=np.float32)
+    cmd_vel = np.zeros((n, 3), dtype=np.float32)
+    cmd_yaw = np.zeros(n, dtype=np.float32)
     hands_valid = False
+    cmd_valid = True
 
     for i, fr in enumerate(frames):
         s = fr["states"]
         a = fr.get("actions") or {}
         sol_q = a.get("sol_q")
 
-        if sol_dim == 29 and sol_q is not None:
-            qpos_mj[i] = np.asarray(sol_q, dtype=np.float32).reshape(-1)[:29]
+        leg = np.asarray(s.get("leg_states", s.get("leg_state")), dtype=np.float32).reshape(-1)[:15]
+        if WAIST_PITCH_CAP_DEG is not None:
+            cap = np.radians(WAIST_PITCH_CAP_DEG)
+            leg[14] = np.clip(leg[14], -cap, +cap)   # waist_pitch (mujoco order)
+        qpos_mj[i, :15] = leg
+        if sol_dim in (14, 29) and sol_q is not None:
+            # 14-d sol_q = arm only; 29-d sol_q = full body — take the arm slice (last 14).
+            arm_action = np.asarray(sol_q, dtype=np.float32).reshape(-1)[-14:]
+            qpos_mj[i, 15:] = arm_action
         else:
-            leg = np.asarray(s.get("leg_states", s.get("leg_state")), dtype=np.float32).reshape(-1)[:15]
-            qpos_mj[i, :15] = leg
-            if sol_dim == 14 and sol_q is not None:
-                qpos_mj[i, 15:] = np.asarray(sol_q, dtype=np.float32).reshape(-1)[:14]
-            else:
-                arm = np.asarray(s.get("arm_states", s.get("arm_state")), dtype=np.float32).reshape(-1)[:14]
-                qpos_mj[i, 15:] = arm
+            arm = np.asarray(s.get("arm_states", s.get("arm_state")), dtype=np.float32).reshape(-1)[:14]
+            qpos_mj[i, 15:] = arm
 
         if has_action_hands:
             la = np.asarray(a.get("left_angles"), dtype=np.float32).reshape(-1)[:7]
@@ -159,8 +173,18 @@ def load_full_episode(episode_dir):
 
         body_vel[i] = np.asarray(s["odometry"]["velocity"], dtype=np.float32).reshape(3)
 
+        if cmd_valid:
+            tvx = a.get("torso_vx"); tvy = a.get("torso_vy"); ty = a.get("target_yaw")
+            if isinstance(tvx, (int, float)) and isinstance(tvy, (int, float)) and isinstance(ty, (int, float)):
+                cmd_vel[i, 0] = tvx
+                cmd_vel[i, 1] = tvy
+                cmd_yaw[i] = ty
+            else:
+                cmd_valid = False
+
     qpos_isaac = qpos_mj[:, _MUJOCO_TO_ISAACLAB_DOF].astype(np.float32)
-    return qpos_isaac, hands if hands_valid else None, imu_quat, body_vel, sol_dim
+    cmd = (cmd_vel, cmd_yaw) if cmd_valid else None
+    return qpos_isaac, hands if hands_valid else None, imu_quat, body_vel, sol_dim, cmd
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -230,7 +254,7 @@ def main():
         print(f"[main] recording tokens → {record_tokens_path}")
 
     print(f"[main] loading {episode_dir}")
-    qpos_30, hands_30, imu_q_30, body_vel_30, sol_dim = load_full_episode(episode_dir)
+    qpos_30, hands_30, imu_q_30, body_vel_30, sol_dim, cmd_30 = load_full_episode(episode_dir)
     n_30 = len(qpos_30)
     walk_speed = WALK_SPEED_BY_SOL_DIM.get(sol_dim, WALK_SPEED_DEFAULT)
     print(f"[main] WALK_SPEED={walk_speed} (sol_q dim={sol_dim})")
@@ -239,8 +263,19 @@ def main():
     quat_50 = resample_30hz_to_50hz(imu_q_30)
     quat_50 /= np.linalg.norm(quat_50, axis=1, keepdims=True).clip(1e-8)
     hand_50 = resample_30hz_to_50hz(hands_30) if hands_30 is not None else None
-    body_vel_50 = resample_30hz_to_50hz(body_vel_30)
     n_50 = len(qpos_50)
+
+    # Detection signal source: prefer teleop commands (torso_vx/vy + target_yaw)
+    # when present — clean step signals, no IMU/odometry noise. Fall back to
+    # measured states.odometry.velocity + IMU yaw when commands are missing.
+    if cmd_30 is not None:
+        cmd_vel_30, cmd_yaw_30 = cmd_30
+        body_vel_50 = resample_30hz_to_50hz(cmd_vel_30)
+        det_src = "cmd(torso_vx,torso_vy,target_yaw)"
+    else:
+        body_vel_50 = resample_30hz_to_50hz(body_vel_30)
+        det_src = "states(odometry.velocity, imu.yaw)"
+    print(f"[main] detection signals ← {det_src}")
 
     dwell = max(1, int(MIN_DWELL_SECS * CONTROL_HZ))
     vx_smooth = smooth_1d(body_vel_50[:, 0], int(SMOOTH_SECS * CONTROL_HZ))
@@ -251,9 +286,12 @@ def main():
         ENTER_THR, EXIT_THR, dwell,
     )
 
-    # Yaw + yaw-rate from data IMU (1s smooth on yaw, gradient → rad/s).
+    # Yaw + yaw-rate. Source matches detection: target_yaw (cmd) or IMU yaw.
     # Walk takes priority — planner can't cleanly do walk+turn together.
-    yaw_50 = np.unwrap([quat_wxyz_to_yaw(q) for q in quat_50]).astype(np.float32)
+    if cmd_30 is not None:
+        yaw_50 = np.unwrap(resample_30hz_to_50hz(cmd_yaw_30)).astype(np.float32)
+    else:
+        yaw_50 = np.unwrap([quat_wxyz_to_yaw(q) for q in quat_50]).astype(np.float32)
     yaw_rate_50 = (np.gradient(smooth_1d(yaw_50, CONTROL_HZ)) * CONTROL_HZ).astype(np.float32)
     turning_mask = hysteresis_mask(
         np.abs(yaw_rate_50),
@@ -282,19 +320,20 @@ def main():
     pub.send_command(start=True, stop=False, planner=False)
 
     # ── Planner state ────────────────────────────────────────────────────────
-    # Lazy init: planner is only initialized when we first leave phase A. After
-    # that it stays alive across all remaining transitions (mode flipped per
-    # phase), so the 50Hz buffer is continuous and indexed by:
-    #     planner_frame_local = pub_frame - first_handover_pub_frame
+    # Eager init: planner is initialized BEFORE the main loop (during WBC settle
+    # time, so the sync warmup blocking is free). Async planner runs in IDLE
+    # mode throughout phase A — its internal context stays primed, so the first
+    # A→active transition has no ramp-from-standing artifact, no sync warmup
+    # blocking, and no need for a warmup pause. The buffer is indexed by
+    # `pub_frame` directly (continuous since startup).
     motion_buffer = None
     async_planner = None
-    first_handover_pub_frame = None
     last_replan_local = 0
-    planner_started = False
 
     # current_target_yaw is the absolute world yaw the planner is being told
     # to face. Updated:
-    #   - At every A→active transition: re-anchored to current WBC IMU
+    #   - Set at startup from initial WBC quat (used for phase A IDLE)
+    #   - At every A→active transition: re-anchored to current WBC quat
     #   - During phase C: incrementally += data yaw delta
     #   - During phase B: held constant (lock)
     current_target_yaw = None
@@ -312,20 +351,29 @@ def main():
         return s["qpos"] if s is not None else G1_DEFAULT_ANGLES_MUJOCO.copy()
 
     def _init_planner():
-        """First-time planner setup. Sync warmup buffer from current WBC pose;
-        subsequent phase transitions just hot-swap params, no re-warmup."""
+        """Pre-init planner at startup. Fills motion_buffer with 4 generations
+        of stand-in-place content (target_vel=0) and starts AsyncPlannerThread
+        in IDLE mode. By the time the first A→active transition happens, the
+        planner has been running async for several seconds in IDLE — its
+        internal context is primed and replans pick up new mode params (B or C)
+        immediately, no ramp-from-standing artifact.
+
+        Yaw at startup is used only for the warmup direction. The actual lock
+        yaw for active phases is set at each A→active transition (so it
+        reflects current WBC orientation, not stale startup yaw).
+        """
         nonlocal motion_buffer, async_planner, current_target_yaw
         cur_quat = _wbc_quat()
         current_target_yaw = quat_wxyz_to_yaw(cur_quat)
         fwd = np.array([np.cos(current_target_yaw), np.sin(current_target_yaw), 0.0], dtype=np.float32)
-        print(f"[main] first handover: lock yaw={np.degrees(current_target_yaw):.1f}°")
+        print(f"[main] pre-init planner: startup yaw={np.degrees(current_target_yaw):.1f}°, warmup vel=0 (idle)")
         planner.initialize_context(cur_quat, _wbc_qpos())
         motion_buffer = Motion50HzBuffer()
         for w in range(4):
             gen = 0 if w == 0 else max(0, motion_buffer.length - 10)
             if w > 0:
                 planner.set_context(motion_buffer.build_context_locked(gen))
-            pred = planner.step(mode=PLANNER_MODE, target_vel=ENTER_THR,
+            pred = planner.step(mode=PLANNER_MODE, target_vel=0.0,
                                 movement_dir=fwd, facing_dir=fwd, height=HEIGHT)
             motion_buffer.splice_at(gen, *resample_pred_30hz_to_50hz(pred))
         async_planner = AsyncPlannerThread(
@@ -333,6 +381,8 @@ def main():
             mode=PlannerOnnx.IDLE, speed=0.0, height=HEIGHT,
             mvmt_dir=fwd, facing_dir=fwd,
         )
+
+    _init_planner()
 
     REPLAN_INTERVAL = int(round(CONTROL_HZ / 10))
     pub_frame = 0
@@ -359,15 +409,13 @@ def main():
             # ── Phase transitions ────────────────────────────────────────────
             if new_phase != phase:
                 if phase == "A" and new_phase != "A":
-                    # First time leaving A → init planner once; subsequent
-                    # A→active transitions just re-anchor target yaw to WBC
-                    if not planner_started:
-                        _init_planner()
-                        first_handover_pub_frame = pub_frame
-                        last_replan_local = 0
-                        planner_started = True
-                    else:
-                        current_target_yaw = quat_wxyz_to_yaw(_wbc_quat())
+                    # Re-anchor target yaw to current WBC at every A→active.
+                    # Planner is pre-initialized at startup, so no init here.
+                    # Force-trigger a replan next tick so async overwrites the
+                    # tail IDLE content with new-phase (walk/turn) content ASAP
+                    # — saves ~100ms vs waiting for the next REPLAN_INTERVAL.
+                    current_target_yaw = quat_wxyz_to_yaw(_wbc_quat())
+                    last_replan_local = pub_frame - REPLAN_INTERVAL
 
                 if new_phase == "C":
                     c_data_yaw_anchor = float(yaw_50[pub_frame])
@@ -381,41 +429,38 @@ def main():
                 delta = float(yaw_50[pub_frame] - c_data_yaw_anchor)
                 current_target_yaw = c_locked_yaw + delta
 
-            # ── Hot-swap planner params (only if planner is alive) ──────────
-            if planner_started:
-                facing = np.array([np.cos(current_target_yaw),
-                                   np.sin(current_target_yaw), 0.0], dtype=np.float32)
-                if phase == "A":
-                    async_planner.set_planner_params(
-                        mode=PlannerOnnx.IDLE, speed=0.0,
-                        mvmt_dir=facing, facing_dir=facing,
-                    )
-                elif phase == "B":
-                    speed, vd = scale_velocity_xy(body_vel_xy_smooth[pub_frame], walk_speed)
-                    cy, sy = np.cos(current_target_yaw), np.sin(current_target_yaw)
-                    mvmt = np.array([cy*vd[0] - sy*vd[1],
-                                     sy*vd[0] + cy*vd[1], 0.0], dtype=np.float32)
-                    async_planner.set_planner_params(
-                        mode=PLANNER_MODE, speed=speed,
-                        mvmt_dir=mvmt, facing_dir=facing,
-                    )
-                else:  # phase C: turn in place toward target yaw
-                    async_planner.set_planner_params(
-                        mode=PLANNER_MODE, speed=0.0,
-                        mvmt_dir=facing, facing_dir=facing,
-                    )
+            # ── Hot-swap planner params (planner is always alive) ───────────
+            facing = np.array([np.cos(current_target_yaw),
+                               np.sin(current_target_yaw), 0.0], dtype=np.float32)
+            if phase == "A":
+                async_planner.set_planner_params(
+                    mode=PlannerOnnx.IDLE, speed=0.0,
+                    mvmt_dir=facing, facing_dir=facing,
+                )
+            elif phase == "B":
+                speed, vd = scale_velocity_xy(body_vel_xy_smooth[pub_frame], walk_speed)
+                cy, sy = np.cos(current_target_yaw), np.sin(current_target_yaw)
+                mvmt = np.array([cy*vd[0] - sy*vd[1],
+                                 sy*vd[0] + cy*vd[1], 0.0], dtype=np.float32)
+                async_planner.set_planner_params(
+                    mode=PLANNER_MODE, speed=speed,
+                    mvmt_dir=mvmt, facing_dir=facing,
+                )
+            else:  # phase C: turn in place toward target yaw
+                async_planner.set_planner_params(
+                    mode=PLANNER_MODE, speed=0.0,
+                    mvmt_dir=facing, facing_dir=facing,
+                )
 
-                local_frame = pub_frame - first_handover_pub_frame
-                if local_frame - last_replan_local >= REPLAN_INTERVAL:
-                    async_planner.request_replan(local_frame + MOTION_LOOK_AHEAD_50HZ)
-                    last_replan_local = local_frame
+            if pub_frame - last_replan_local >= REPLAN_INTERVAL:
+                async_planner.request_replan(pub_frame + MOTION_LOOK_AHEAD_50HZ)
+                last_replan_local = pub_frame
 
             # ── Build encoder window ─────────────────────────────────────────
             if phase == "A":
                 jp, jv, bq = build_data_window(qpos_50, quat_50, pub_frame)
             else:
-                local_frame = pub_frame - first_handover_pub_frame
-                window = motion_buffer.read_encoder_window(local_frame, ENCODER_NUM_FRAMES, ENCODER_STEP_50HZ)
+                window = motion_buffer.read_encoder_window(pub_frame, ENCODER_NUM_FRAMES, ENCODER_STEP_50HZ)
                 if window is None:
                     time.sleep(0.005)
                     continue
