@@ -133,8 +133,12 @@ def main():
                     v = body_frame.get(name)
                     return None if v is None else np.round(
                         np.asarray(v[1], dtype=float).reshape(4), 3).tolist()
-                print(f"[diag] Head={_q('Head')}  Spine3={_q('Spine3')}  "
-                      f"Neck={_q('Neck')}  RightHand={_q('RightHand')}")
+                # 沿脊柱从下到上看 quat 在哪一级开始“塌缩”成相同值 ——
+                # 那一级以上就是没有 tracker、被 fallback 的部分（典型是缺头部来源）。
+                print("[diag] 脊柱链 quat(wxyz)：")
+                for nm in ("Hips", "Spine", "Spine1", "Spine2", "Spine3", "Neck", "Head"):
+                    print(f"    {nm:8s}= {_q(nm)}")
+                print(f"    RightHand= {_q('RightHand')}  (参考：身体在动则它会变)")
                 last_diag = tnow
 
             yp = neck_yaw_pitch_deg(body_frame)
