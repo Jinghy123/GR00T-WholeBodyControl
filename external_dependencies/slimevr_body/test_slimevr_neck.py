@@ -101,6 +101,7 @@ def main():
     warned_nodata = False
     warned_zero = False
     last_print = 0.0
+    last_diag = 0.0
     start_t = time.time()
     last_data = time.time()
     yaw_min = pitch_min = 1e9
@@ -119,6 +120,23 @@ def main():
             warned_nodata = False
 
             body_frame = res["body_frame"]
+
+            # 诊断：每 2 秒打印关键关节的原始四元数（wxyz），用来区分：
+            #   - RightHand 一直 [1,0,0,0] 不变 → 完全没收到 VMC
+            #       （多半 UDP 39539 被正在跑的主 server 占了；测脖子要先停主 server）
+            #   - Head 和 Spine3 几乎相等 / Head 不随转头变 → 没有独立头部 tracker
+            #       （Head 回退到躯干，脖子自然恒 0）
+            #   - Head 随转头明显变、且和 Spine3 不同，但 yaw/pitch 仍 0 → 再找我
+            tnow = time.time()
+            if tnow - last_diag > 2.0:
+                def _q(name):
+                    v = body_frame.get(name)
+                    return None if v is None else np.round(
+                        np.asarray(v[1], dtype=float).reshape(4), 3).tolist()
+                print(f"[diag] Head={_q('Head')}  Spine3={_q('Spine3')}  "
+                      f"Neck={_q('Neck')}  RightHand={_q('RightHand')}")
+                last_diag = tnow
+
             yp = neck_yaw_pitch_deg(body_frame)
             if yp is None:
                 if not warned_missing:
