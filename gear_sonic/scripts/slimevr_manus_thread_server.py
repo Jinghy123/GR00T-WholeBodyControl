@@ -237,7 +237,8 @@ class SlimevrManusGMRServer:
         self._lhbuf = deque(maxlen=self.nsend)
         self._rhbuf = deque(maxlen=self.nsend)
         self._fidx = 0
-        self._frame_time = 0.95 / max(1, int(TARGET_FPS))
+        # 满周期 sleep（不补偿处理时间），与 humdex stage_step_rate_limiter 一致。
+        self._frame_time = 1.0 / max(1, int(TARGET_FPS))
         # hold snapshot
         self._last_jp = None
         self._last_bq = None
@@ -361,9 +362,12 @@ class SlimevrManusGMRServer:
                 self._stat_n += 1
                 self._maybe_log(t)
 
-                elapsed = time.time() - t
-                if elapsed < self._frame_time:
-                    time.sleep(self._frame_time - elapsed)
+                # 关键：与 humdex stage_step_rate_limiter 完全一致 —— 每帧无条件
+                # sleep 整个周期，不减去处理时间。补偿式（sleep(period-elapsed)）
+                # 会让发送频率明显高于 humdex，deploy 订阅端消费跟不上 → 接收/
+                # 回放队列积压 → ~1s 滞后（PUB 端的 CONFLATE 管不到 SUB 积压）。
+                if self._frame_time > 0:
+                    time.sleep(self._frame_time)
         except KeyboardInterrupt:
             print("\nStopping...")
         finally:
