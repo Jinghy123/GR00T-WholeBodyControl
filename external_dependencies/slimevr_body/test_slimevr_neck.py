@@ -35,14 +35,20 @@ VMC_PORT      = 39539       # 必须和 SlimeVR app 里 VMC 发送端口一致
 VMC_BVH_SCALE = 0.01
 BVH_PATH      = ""          # 留空=用自带 assets/bvh-recording.bvh
 PRINT_HZ      = 10          # 打印频率
+# 脖子用哪两个关节算“头相对躯干”。标准是 Head/Spine3；但 SlimeVR 无 HMD 时
+# 头部 tracker 的数据落在 Neck/Spine3 段（C 段），躯干在 Spine/Spine1/Spine2 段
+# （B 段），所以这里用 Neck(C) 相对 Spine1(B)。若以后用 HMD 提供真 Head，
+# 改回 NECK_HEAD_JOINT="Head", NECK_BASE_JOINT="Spine3"。
+NECK_HEAD_JOINT = "Neck"    # 头数据所在关节（C 段）
+NECK_BASE_JOINT = "Spine1"  # 躯干参考关节（B 段）
 # ============================================================================
 
 
 def neck_yaw_pitch_deg(body_frame):
     """与 slimevr_manus_thread_server._human_head_to_robot_neck 完全一致的公式，
     只是输出改成角度。返回 (yaw_deg, pitch_deg) 或 None。"""
-    head = body_frame.get("Head")
-    spine = body_frame.get("Spine3")
+    head = body_frame.get(NECK_HEAD_JOINT)
+    spine = body_frame.get(NECK_BASE_JOINT)
     if head is None or spine is None:
         return None
 

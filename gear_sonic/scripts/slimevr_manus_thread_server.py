@@ -72,6 +72,11 @@ RIGHT_GLOVE_SN      = "81d630d4"      # 右手套 SN，改成你们的
 ENABLE_NECK_PUB     = True            # False=关闭脖子 [yaw,pitch] PUB
 NECK_PUB_PORT       = 5570            # 脖子 PUB 端口
 NECK_RETARGET_SCALE = 1.5            # 缩放脖子运动幅度
+# 用哪两个关节算“头相对躯干”。标准是 Head/Spine3；但 SlimeVR 无 HMD 时头部
+# tracker 的数据落在 Neck/Spine3 段（C 段），躯干在 Spine/Spine1/Spine2 段（B 段），
+# 故默认用 Neck(C) 相对 Spine1(B)。若改用 HMD 提供真 Head，改回 "Head"/"Spine3"。
+NECK_HEAD_JOINT     = "Neck"          # 头数据所在关节（C 段）
+NECK_BASE_JOINT     = "Spine1"        # 躯干参考关节（B 段）
 
 # --- 键盘 gating（k=送/停, p=hold, q=退, e=急停）---
 ENABLE_KEYBOARD     = True            # False=一直发送、无 gating
@@ -141,8 +146,8 @@ def _human_head_to_robot_neck(body_frame):
     body_frame values are [pos, quat_wxyz]; same convention/result as the neck
     stream in pico_manus_thread_server.py. Returns None if Head/Spine3 missing.
     """
-    head = body_frame.get("Head")
-    spine = body_frame.get("Spine3")
+    head = body_frame.get(NECK_HEAD_JOINT)
+    spine = body_frame.get(NECK_BASE_JOINT)
     if head is None or spine is None:
         return None
     hq = np.asarray(head[1], dtype=np.float64).reshape(4)
