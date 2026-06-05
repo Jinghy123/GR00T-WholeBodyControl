@@ -199,6 +199,12 @@ class SlimevrManusGMRServer:
         # ── ZMQ: pose (v1) on :5556, neck [yaw,pitch] on :5570 ────────────────
         ctx = zmq.Context()
         self.sock = ctx.socket(zmq.PUB)
+        # Match humdex zmq_pose_publisher exactly: only keep the latest frame,
+        # never backlog. Without CONFLATE the PUB default HWM (1000) queues old
+        # frames and the subscriber lags ~1s as the queue drains. MUST be set
+        # before bind().
+        self.sock.setsockopt(zmq.SNDHWM, 1)
+        self.sock.setsockopt(zmq.CONFLATE, 1)
         self.sock.setsockopt(zmq.LINGER, 0)
         self.sock.bind(POSE_ADDR)
         self.topic = POSE_TOPIC
