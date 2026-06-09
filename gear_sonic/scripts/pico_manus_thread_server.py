@@ -654,12 +654,59 @@ def init_manus_receiver(
     return receiver
 
 
+def _dump_retargeting_env():
+    """Print which interpreter, which module files, and which versions are
+    actually being used for dex-retargeting. Run this on both machines and
+    diff the output to find the mismatch."""
+    import importlib
+
+    print("=" * 70)
+    print("[retarget-diag] python   :", sys.executable)
+    print("[retarget-diag] prefix   :", sys.prefix)  # the active venv
+    print("[retarget-diag] cwd      :", os.getcwd())
+
+    # Modules whose *resolved file* matters (vendored vs pip). yourdfpy is
+    # vendored *inside* dex_retargeting (from . import yourdfpy), so probe it
+    # as a submodule — a top-level `import yourdfpy` would falsely fail.
+    for name in ("hand_retargeting", "dex_retargeting", "dex_retargeting.yourdfpy"):
+        try:
+            mod = importlib.import_module(name)
+            ver = getattr(mod, "__version__", "n/a")
+            path = getattr(mod, "__file__", "n/a")
+            print(f"[retarget-diag] {name:<24} v{ver:<10} <- {path}")
+        except Exception as e:
+            print(f"[retarget-diag] {name:<24} NOT IMPORTABLE: {e!r}")
+
+    # Backend libs loaded from the active venv (NOT vendored). These are the
+    # usual culprits for a working-on-one-box / broken-on-another mismatch.
+    for name in ("numpy", "scipy", "nlopt", "torch", "trimesh", "sapien"):
+        try:
+            mod = importlib.import_module(name)
+            ver = getattr(mod, "__version__", "n/a")
+            print(f"[retarget-diag] {name:<16} v{ver:<10} <- {getattr(mod, '__file__', 'n/a')}")
+        except Exception as e:
+            print(f"[retarget-diag] {name:<16} NOT IMPORTABLE: {e!r}")
+
+    # pinocchio imports as `pin` in some envs, `pinocchio` in others.
+    for name in ("pinocchio", "pin"):
+        try:
+            mod = importlib.import_module(name)
+            print(f"[retarget-diag] {name:<16} v{getattr(mod, '__version__', 'n/a'):<10} <- {getattr(mod, '__file__', 'n/a')}")
+            break
+        except Exception as e:
+            print(f"[retarget-diag] {name:<16} NOT IMPORTABLE: {e!r}")
+    print("=" * 70)
+
+
 def init_hand_retargeting():
     """Build the HandRetargeting (Unitree Dex3) from the locally-vendored
     xr_teleoperate copy. Paths inside the package are absolute, so no
     chdir is needed."""
     if HandRetargeting is None or HandType is None:
+        print(f"[Manus] HandRetargeting unavailable, import error was: {_retarget_err!r}")
+        _dump_retargeting_env()
         return None
+    _dump_retargeting_env()
     hr = HandRetargeting(HandType.UNITREE_DEX3)
     print("[Manus] HandRetargeting (UNITREE_DEX3) initialized")
     return hr
