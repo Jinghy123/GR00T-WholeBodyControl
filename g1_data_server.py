@@ -304,9 +304,13 @@ class WBCStateReader:
                 qpos = np.array(data["body_q_measured"],    dtype=np.float32)
                 quat = np.array(data["base_quat_measured"], dtype=np.float32)
 
-                # hand states (measured)
-                left_hand_q = np.array(data.get("left_hand_q_measured", [0]*7), dtype=np.float32)
-                right_hand_q = np.array(data.get("right_hand_q_measured", [0]*7), dtype=np.float32)
+                # hand states (measured) — read the REAL Dex3 encoder feedback the
+                # deploy logs from dex3_hands_.getState(). NOTE: the *_measured keys
+                # (left_hand_q_measured/right_hand_q_measured) are NOT measured — the
+                # deploy fills them from the hand command buffer, so they echo the
+                # action. Use left_hand_q/right_hand_q (from the state logger) instead.
+                left_hand_q = np.array(data.get("left_hand_q", [0]*7), dtype=np.float32)
+                right_hand_q = np.array(data.get("right_hand_q", [0]*7), dtype=np.float32)
 
                 # action: actual motor q_target sent to robot this tick
                 qpos_action = np.array(data["body_q_action"], dtype=np.float32)
