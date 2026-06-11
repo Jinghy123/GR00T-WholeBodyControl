@@ -585,12 +585,12 @@ if __name__ == "__main__":
     parser.add_argument("--camera-address", type=str, default="tcp://192.168.123.164:5558",
                         help="Camera ZMQ address")
     parser.add_argument("--episode-dir", type=str,
-                        default="/home/xiawei/data/multi-task/pick_place_1/episode_0",
+                        default="/home/xiawei/data/multi-task/put_chip_can_into_plate/episode_0",
                         help="Episode folder containing color/ and color_subgoal/ for subgoal images")
     parser.add_argument("--prompts-json", type=str,
                         default="/home/xiawei/data/multi-task/prompts.json",
                         help="JSON mapping task-key -> {task_description, subtasks[]}")
-    parser.add_argument("--task-key", type=str, default="pick_place_1",
+    parser.add_argument("--task-key", type=str, default="put_chip_can_into_plate",
                         help="Key into prompts.json (e.g. pick_place_1); selects the "
                              "task_description and the per-stage subtask prompts.")
     parser.add_argument("--instruction", type=str, default=None,
