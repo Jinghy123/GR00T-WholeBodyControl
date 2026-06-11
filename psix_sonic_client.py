@@ -30,6 +30,7 @@ json_numpy.patch()
 
 # ---------------- Configuration ----------------
 TASK_INSTRUCTION = "grasp the pink chip can and place it into the orange plate"
+# TASK_INSTRUCTION = "pick up the grapes and place in the bowl"
 
 # FSQ configuration (must match g1_sonic_client / encoder)
 FSQ_MIN = -0.625
@@ -316,8 +317,10 @@ class PsixSonicClient:
         assert state is not None, "Robot state not available"
 
         body_q = np.array(state["body_q_measured"], dtype=np.float32)        # (29,) = [leg/base(15) | arm(14)]
-        left_hand_states = np.array(state["left_hand_q"], dtype=np.float32)   # (7,)
-        right_hand_states = np.array(state["right_hand_q"], dtype=np.float32)  # (7,)
+        # left_hand_states = np.array(state["left_hand_q"], dtype=np.float32)   # (7,)
+        # right_hand_states = np.array(state["right_hand_q"], dtype=np.float32)  # (7,)
+        left_hand_states = np.array(state["left_hand_q_measured"], dtype=np.float32)   # (7,)
+        right_hand_states = np.array(state["right_hand_q_measured"], dtype=np.float32)  # (7,)
 
         # Model expects state.joint_positions = [hand(L7,R7) | arm(14) | leg(15)].
         leg_states = body_q[:15]    # base/leg
