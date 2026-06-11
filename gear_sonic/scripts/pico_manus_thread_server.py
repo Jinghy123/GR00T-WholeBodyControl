@@ -85,6 +85,16 @@ except ImportError:
     print("Warning: recording_manager not available. Data collection disabled.")
     RecordingManagerThread = None
 
+# Hand IK solver for the legacy Pico-controller hand path (trigger -> open/close).
+# Only used when --use_pico_hand is set; the default hand path is the Manus glove.
+try:
+    from gear_sonic.utils.teleop.solver.hand.g1_gripper_ik_solver import (
+        G1GripperInverseKinematicsSolver,
+    )
+except ImportError:
+    print("Warning: G1GripperInverseKinematicsSolver not available.")
+    G1GripperInverseKinematicsSolver = None
+
 # Hand control via Manus glove + dex-retargeting. Uses a locally-vendored copy
 # of the xr_teleoperate retargeting pipeline (under external_dependencies/
 # xr_hand_retargeting/) so this script no longer depends on the PSI-Teleop-PICO
@@ -763,6 +773,60 @@ def _manus25_to_tracking26(xyz25: np.ndarray, side: str) -> dict:
     return out
 
 
+# ── Legacy Pico-controller hand path (trigger -> open/close) ───────────────
+# Resurrected from pico_manager_thread_server.py. Active only when
+# --use_pico_hand is passed; otherwise the Manus glove path below is used.
+
+def generate_finger_data(hand: str, trigger: float, grip: float) -> np.ndarray:
+    """
+    Generate finger position data from Pico controller button states.
+
+    Args:
+        hand: "left" or "right"
+        trigger: Trigger button value (0-1)
+        grip: Grip button value (0-1)
+
+    Returns:
+        Array of shape [25, 4, 4] representing fingertip positions
+    """
+    fingertips = np.zeros([25, 4, 4])
+
+    thumb = 0
+    middle = 10
+    # Control thumb based on shoulder button state (index 4 is thumb tip)
+    fingertips[4 + thumb, 0, 3] = 1.0  # open thumb
+    if trigger > 0.5:
+        fingertips[4 + middle, 0, 3] = 1.0  # close middle
+
+    return fingertips
+
+
+def init_hand_ik_solvers():
+    """Initialize hand IK solvers if available."""
+    if G1GripperInverseKinematicsSolver is not None:
+        left_solver = G1GripperInverseKinematicsSolver(side="left")
+        right_solver = G1GripperInverseKinematicsSolver(side="right")
+        print("Hand IK solvers initialized")
+        return left_solver, right_solver
+    print("Warning: Hand IK solvers not available")
+    return None, None
+
+
+def compute_hand_joints_from_inputs(
+    left_solver, right_solver, left_trigger, left_grip, right_trigger, right_grip
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute left/right hand joints using IK solvers, or zeros if unavailable."""
+    if left_solver is not None and right_solver is not None:
+        left_finger_data = generate_finger_data("left", left_trigger, left_grip)
+        right_finger_data = generate_finger_data("right", right_trigger, right_grip)
+        left_hand_joints = left_solver({"position": left_finger_data})
+        right_hand_joints = right_solver({"position": right_finger_data})
+    else:
+        left_hand_joints = np.zeros((1, 7), dtype=np.float32)
+        right_hand_joints = np.zeros((1, 7), dtype=np.float32)
+    return left_hand_joints, right_hand_joints
+
+
 def compute_hand_joints_from_manus(
     hand_retargeting,
     manus_receiver,
@@ -1126,6 +1190,7 @@ def _pose_stream_common(
     enable_neck_pub: bool = True,
     neck_pub_port: int = 5570,
     neck_retarget_scale: float = 1.5,
+    use_pico_hand: bool = False,
 ):
     """Shared pose streaming loop used by run_pico."""
     if xrt is None:
@@ -1146,9 +1211,17 @@ def _pose_stream_common(
         log_prefix=log_prefix,
     )
 
-    # Hand control: Manus glove -> dex-retargeting -> 7-DOF Dex3 joints
+    # Hand control: Manus glove -> dex-retargeting -> 7-DOF Dex3 joints (default),
+    # or legacy Pico-controller trigger -> open/close when use_pico_hand is set.
     manus_receiver = init_manus_receiver()
-    hand_retargeting = init_hand_retargeting() if hand_type == "manus_dex3" else None
+    hand_retargeting = (
+        init_hand_retargeting()
+        if (hand_type == "manus_dex3" and not use_pico_hand)
+        else None
+    )
+    left_hand_solver, right_hand_solver = (
+        init_hand_ik_solvers() if use_pico_hand else (None, None)
+    )
 
     # Wuji hand: create PUB socket for 26D tracking data
     wuji_hand_pub = None
@@ -1184,6 +1257,9 @@ def _pose_stream_common(
         wuji_hand_pub=wuji_hand_pub,
         neck_pub=neck_pub,
         neck_retarget_scale=neck_retarget_scale,
+        use_pico_hand=use_pico_hand,
+        left_hand_solver=left_hand_solver,
+        right_hand_solver=right_hand_solver,
     )
 
     if stop_event is None:
@@ -1521,6 +1597,9 @@ class PoseStreamer:
         wuji_hand_pub=None,
         neck_pub=None,
         neck_retarget_scale: float = 1.5,
+        use_pico_hand: bool = False,
+        left_hand_solver=None,
+        right_hand_solver=None,
     ):
         self.socket = socket
         self.reader = reader
@@ -1534,6 +1613,10 @@ class PoseStreamer:
         self.three_point = three_point
         self.manus_receiver = manus_receiver
         self.hand_retargeting = hand_retargeting
+        # Legacy Pico-controller hand path (trigger -> open/close) when enabled.
+        self.use_pico_hand = use_pico_hand
+        self.left_hand_solver = left_hand_solver
+        self.right_hand_solver = right_hand_solver
         self.wuji_hand_pub = wuji_hand_pub  # ZMQ PUB socket for wuji 26D tracking
         self.neck_pub = neck_pub            # ZMQ PUB socket for neck [yaw, pitch] JSON
         self.neck_retarget_scale = float(neck_retarget_scale)
@@ -1701,10 +1784,21 @@ class PoseStreamer:
         self.toggle_data_collection_last = toggle_data_collection_tmp
         self.toggle_data_abort_last = toggle_data_abort_tmp
 
-        left_hand_joints, right_hand_joints = compute_hand_joints_from_manus(
-            self.hand_retargeting,
-            self.manus_receiver,
-        )
+        if self.use_pico_hand:
+            # Pico controller triggers drive hand open/close via the IK solvers.
+            left_hand_joints, right_hand_joints = compute_hand_joints_from_inputs(
+                self.left_hand_solver,
+                self.right_hand_solver,
+                left_trigger,
+                left_grip,
+                right_trigger,
+                right_grip,
+            )
+        else:
+            left_hand_joints, right_hand_joints = compute_hand_joints_from_manus(
+                self.hand_retargeting,
+                self.manus_receiver,
+            )
 
         smpl_pose_np = (
             latest_data["smpl_pose"].detach().cpu().numpy()[:, :63].reshape(-1, 21, 3)[0]
@@ -1916,6 +2010,7 @@ def run_pico(
     enable_neck_pub: bool = True,
     neck_pub_port: int = 5570,
     neck_retarget_scale: float = 1.5,
+    use_pico_hand: bool = False,
 ):
     """Run Pico body tracking with real-time visualization and ZMQ streaming."""
     if xrt is None:
@@ -1969,6 +2064,7 @@ def run_pico(
             enable_neck_pub=enable_neck_pub,
             neck_pub_port=neck_pub_port,
             neck_retarget_scale=neck_retarget_scale,
+            use_pico_hand=use_pico_hand,
         )
     finally:
         socket.close()
@@ -2054,6 +2150,9 @@ class PlannerStreamer:
         zmq_feedback_port: int = 5557,
         manus_receiver=None,
         hand_retargeting=None,
+        use_pico_hand: bool = False,
+        left_hand_solver=None,
+        right_hand_solver=None,
     ):
         self.socket = socket
         self.reader = reader
@@ -2072,9 +2171,13 @@ class PlannerStreamer:
         self.last_send = time.time()
         self.last_xrt_timestamp = None
 
-        # Manus-driven hand retargeting (replaces trigger-based open/close)
+        # Manus-driven hand retargeting (default), or legacy Pico-controller
+        # trigger-based open/close when use_pico_hand is set.
         self.manus_receiver = manus_receiver
         self.hand_retargeting = hand_retargeting
+        self.use_pico_hand = use_pico_hand
+        self.left_hand_solver = left_hand_solver
+        self.right_hand_solver = right_hand_solver
 
     def reset_yaw(self):
         """Called when entering planner mode. Resets state for fresh start."""
@@ -2181,11 +2284,23 @@ class PlannerStreamer:
                     vr_3pt_position = (vr_3pt_pose[:, :3].flatten()).tolist()
                     vr_3pt_orientation = vr_3pt_pose[:, 3:].flatten().tolist()
 
-                # Hand joints come from the Manus glove + dex-retargeting pipeline
-                lh_joints, rh_joints = compute_hand_joints_from_manus(
-                    self.hand_retargeting,
-                    self.manus_receiver,
-                )
+                if self.use_pico_hand:
+                    # Pico controller triggers drive hand open/close via IK solvers.
+                    (_, lt, rt, lg, rg) = get_controller_inputs()
+                    lh_joints, rh_joints = compute_hand_joints_from_inputs(
+                        self.left_hand_solver,
+                        self.right_hand_solver,
+                        lt,
+                        lg,
+                        rt,
+                        rg,
+                    )
+                else:
+                    # Hand joints come from the Manus glove + dex-retargeting pipeline
+                    lh_joints, rh_joints = compute_hand_joints_from_manus(
+                        self.hand_retargeting,
+                        self.manus_receiver,
+                    )
                 left_hand_position = lh_joints.reshape(-1).astype(np.float32).tolist()
                 right_hand_position = rh_joints.reshape(-1).astype(np.float32).tolist()
 
@@ -2238,6 +2353,7 @@ def run_pico_manager(
     enable_neck_pub: bool = True,
     neck_pub_port: int = 5570,
     neck_retarget_scale: float = 1.5,
+    use_pico_hand: bool = False,
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
@@ -2292,10 +2408,23 @@ def run_pico_manager(
         log_prefix="PoseLoop",
     )
 
-    # Hand control: Manus glove -> retargeting -> hand joints
+    # Hand control: Manus glove -> retargeting -> hand joints (default), or the
+    # legacy Pico-controller trigger -> open/close path when use_pico_hand is set.
     manus_receiver = init_manus_receiver()
-    # Dex3 retargeting only needed for manus_dex3 mode
-    hand_retargeting = init_hand_retargeting() if hand_type == "manus_dex3" else None
+    # Dex3 retargeting only needed for manus_dex3 mode (and not when using the
+    # Pico-controller hand path).
+    hand_retargeting = (
+        init_hand_retargeting()
+        if (hand_type == "manus_dex3" and not use_pico_hand)
+        else None
+    )
+    left_hand_solver, right_hand_solver = (
+        init_hand_ik_solvers() if use_pico_hand else (None, None)
+    )
+    if use_pico_hand:
+        print("[Manager] Hand control: Pico controller triggers (open/close)")
+    else:
+        print("[Manager] Hand control: Manus glove retargeting")
 
     # Wuji mode: create a separate PUB socket to stream raw 26D hand tracking
     # to wuji_hand_server.py (which runs wuji-retargeting + wujihandpy independently)
@@ -2332,6 +2461,9 @@ def run_pico_manager(
         wuji_hand_pub=wuji_hand_pub,
         neck_pub=neck_pub,
         neck_retarget_scale=neck_retarget_scale,
+        use_pico_hand=use_pico_hand,
+        left_hand_solver=left_hand_solver,
+        right_hand_solver=right_hand_solver,
     )
     planner_streamer = PlannerStreamer(
         socket=socket,
@@ -2342,6 +2474,9 @@ def run_pico_manager(
         zmq_feedback_port=zmq_feedback_port,
         manus_receiver=manus_receiver,
         hand_retargeting=hand_retargeting,
+        use_pico_hand=use_pico_hand,
+        left_hand_solver=left_hand_solver,
+        right_hand_solver=right_hand_solver,
     )
 
     # State machine diagram:
@@ -2667,6 +2802,12 @@ if __name__ == "__main__":
         help="ZMQ PUB port for wuji 26D hand tracking (used when --hand_type wuji, default: 5559)",
     )
     parser.add_argument(
+        "--use_pico_hand",
+        action="store_true",
+        help="Control the hand open/close with the Pico controller triggers (legacy IK path) "
+        "instead of the default Manus glove retargeting",
+    )
+    parser.add_argument(
         "--skip_body_tracking",
         action="store_true",
         help="Skip waiting for body tracking data (run with Manus only)",
@@ -2738,6 +2879,7 @@ if __name__ == "__main__":
             enable_neck_pub=args.enable_neck_pub,
             neck_pub_port=args.neck_pub_port,
             neck_retarget_scale=args.neck_retarget_scale,
+            use_pico_hand=args.use_pico_hand,
         )
     else:
         # Run legacy single-thread pose streaming
@@ -2759,4 +2901,5 @@ if __name__ == "__main__":
             enable_neck_pub=args.enable_neck_pub,
             neck_pub_port=args.neck_pub_port,
             neck_retarget_scale=args.neck_retarget_scale,
+            use_pico_hand=args.use_pico_hand,
         )
