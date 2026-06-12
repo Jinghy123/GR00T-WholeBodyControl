@@ -47,9 +47,17 @@ class Optimizer:
     def set_joint_limit(self, joint_limits: np.ndarray, epsilon=1e-3):
         if joint_limits.shape != (self.opt_dof, 2):
             raise ValueError(f"Expect joint limits have shape: {(self.opt_dof, 2)}, but get {joint_limits.shape}")
-        self.opt.set_lower_bounds((joint_limits[:, 0] - epsilon).tolist())
-        self.opt.set_upper_bounds((joint_limits[:, 1] + epsilon).tolist())
-        # Store for downstream use (e.g. the thumb_1 post-retarget remap in retarget()).
+        lower = joint_limits[:, 0] - epsilon
+        upper = joint_limits[:, 1] + epsilon
+        # Widen thumb_1 IK bounds to ±π/2 so the optimizer has room to vary
+        # under Manus + DexPilot (URDF ~±52° causes saturation).
+        for _i, _name in enumerate(self.target_joint_names):
+            if _name.endswith("_thumb_1_joint"):
+                lower[_i] = -np.pi / 2.0
+                upper[_i] = np.pi / 2.0
+                break
+        self.opt.set_lower_bounds(lower.tolist())
+        self.opt.set_upper_bounds(upper.tolist())
         self.joint_limits = joint_limits.astype(np.float32)
 
     def get_link_indices(self, target_link_names):
@@ -90,28 +98,18 @@ class Optimizer:
             print(e)
             return np.array(last_qpos, dtype=np.float32)
 
-        # ---- Manus dex3 thumb_1 remap (conditional on DexPilot pinch state) ----
-        # Empirically observed with Manus glove + DexPilot: for non-pinch poses
-        # the optimizer solves thumb_1 to the wrong end of its range (≈limit for
-        # open-hand), which leaves the thumb folded in the palm. Pinch solutions
-        # are correct because inter-finger weight (200) dominates wrist→tip (6).
-        # Fix: when NOT pinching with the thumb, replace q[thumb_1] = pivot - q.
-        # Pivot is +π/2 for left (limit upper = +0.920), -π/2 for right (mirror).
-        #
-        # Pinch state comes from self.projected (DexPilotOptimizer only). For our
-        # 3-finger dex3 yml the inter-finger pairs are [thumb-index, thumb-middle,
-        # index-middle]; we ignore the last one since it doesn't involve thumb.
+        # Manus dex3 thumb_1 remap: when NOT pinching, flip thumb_1 around ±π/2.
+        # The IK saturates thumb_1 to the "wrong" end of its range in non-pinch
+        # poses (folds the thumb into the palm); pinch solutions are correct
+        # because inter-finger weight dominates.
         if hasattr(self, "projected") and len(self.projected) >= 2:
             thumb_pinching = bool(self.projected[0] or self.projected[1])
             if not thumb_pinching and hasattr(self, "joint_limits"):
                 for i, name in enumerate(self.target_joint_names):
                     if name.endswith("_thumb_1_joint"):
                         lo, hi = float(self.joint_limits[i, 0]), float(self.joint_limits[i, 1])
-                        # Pivot is on the larger-magnitude side of the joint range.
-                        # Pivot magnitude is empirical (π/2 = 90°).
-                        pivot_mag = np.pi / 2.0
-                        pivot = pivot_mag if abs(hi) >= abs(lo) else -pivot_mag
-                        qpos[i] = float(np.clip(pivot - qpos[i], lo, hi))
+                        pivot = np.pi / 2.0 if abs(hi) >= abs(lo) else -np.pi / 2.0
+                        qpos[i] = float(pivot - qpos[i])
                         break
 
         return qpos

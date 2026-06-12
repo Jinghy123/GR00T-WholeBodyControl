@@ -855,45 +855,18 @@ def compute_hand_joints_from_manus(
     unitree_left_hand = (M_to_unitree_hand @ left_homog)[0:3, :].T
     unitree_right_hand = (M_to_unitree_hand @ right_homog)[0:3, :].T
 
-    # Thumb LATERAL mirror: without this, the Manus thumb-tip lands on the
-    # wrong side of the palm (outside of index → inside of middle finger
-    # after retargeting). The flip mirrors the thumb along the in-palm-plane
-    # lateral axis so it sits on the correct side. Note: this is NOT meant
-    # to lift the thumb out of palm plane — that's a separate axis.
+    # Mirror the Manus thumb tip along the in-palm-plane lateral axis; without
+    # this it lands on the wrong side of the palm after retargeting.
     unitree_left_hand[24, 2]  *= -1
     unitree_right_hand[24, 2] *= -1
 
-    # Build the 6 DexPilot reference vectors expected by unitree_dex3.yml
-    # (target_link_human_indices_dexpilot = [[9,14,14,0,0,0], [4,4,9,4,9,14]]).
-    # Those indices are for the VR/MediaPipe-style 25-pt layout where
-    # wrist=0, thumb_tip=4, index_tip=9, middle_tip=14.
-    # The Manus 25-node layout is different: wrist=0, index_tip=5,
-    # middle_tip=10, thumb_tip=24. Remap accordingly so the 6 inter-keypoint
-    # vectors (3 inter-finger + 3 wrist-to-tip) are semantically the same.
+    # Remap the Manus 25-node layout (wrist=0, index_tip=5, middle_tip=10,
+    # thumb_tip=24) into the 6 DexPilot vectors expected by unitree_dex3.yml.
     manus_dex_origin = np.array([5, 10, 10, 0, 0, 0])
     manus_dex_task   = np.array([24, 24, 5, 24, 5, 10])
     ref_left  = unitree_left_hand[manus_dex_task]  - unitree_left_hand[manus_dex_origin]
     ref_right = unitree_right_hand[manus_dex_task] - unitree_right_hand[manus_dex_origin]
 
-    # DexPilot wrist→tip weights are fixed at 6 (vs inter-finger weight 1 normal,
-    # 200 when pinching). With Manus, the wrist→thumb_tip vector's palm-normal
-    # component is small (~2 cm in opposition pose), so the IK has no incentive
-    # to drive thumb_0 (opposition) to a high angle even though dex3 can do ±60°.
-    # Inter-finger (pinch) gestures still work because of the weight-200 boost.
-    # Amplify wrist→thumb_tip (vector index 3) to "stretch" the thumb target away
-    # from the wrist; the optimizer then has to crank up thumb opposition to reach
-    # it. Values mirror the spirit of vr_pico.py's per-tip scaling.
-    THUMB_WRIST_GAIN  = 1.15
-    INDEX_WRIST_GAIN  = 1.05
-    MIDDLE_WRIST_GAIN = 0.95
-    ref_left[3]  *= THUMB_WRIST_GAIN
-    ref_left[4]  *= INDEX_WRIST_GAIN
-    ref_left[5]  *= MIDDLE_WRIST_GAIN
-    ref_right[3] *= THUMB_WRIST_GAIN
-    ref_right[4] *= INDEX_WRIST_GAIN
-    ref_right[5] *= MIDDLE_WRIST_GAIN
-
-    # NOTE: vr_pico uses right_dex_retargeting_to_hardware for both hands; mirror that.
     reorder = hand_retargeting.right_dex_retargeting_to_hardware
     left_q = hand_retargeting.left_retargeting.retarget(ref_left)[reorder]
     right_q = hand_retargeting.right_retargeting.retarget(ref_right)[reorder]
