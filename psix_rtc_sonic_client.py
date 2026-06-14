@@ -21,13 +21,16 @@ from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
 )
 
 # ---------------- Configuration ----------------
-TASK_INSTRUCTION = "grasp the pink chip can and place it into the orange plate"
-# TASK_INSTRUCTION = "pick up the green grapes and place it into the green bowl"
+# TASK_INSTRUCTION = "grasp the pink chip can and place it into the orange plate"
+TASK_INSTRUCTION = "pick up the green grapes and place it into the green bowl"
 
 # FSQ configuration (must match g1_sonic_client / encoder)
 FSQ_MIN = -0.625
 FSQ_MAX = 0.625
 FSQ_STEP = 0.0625  # = 1/16
+
+# cap obs send rate; server control loop runs at 30Hz, sending faster just floods it
+OBS_SEND_INTERVAL = 1.0 / 30.0
 
 
 def fsq_quantize(continuous_value, fsq_min=FSQ_MIN, fsq_max=FSQ_MAX, fsq_step=FSQ_STEP):
@@ -347,6 +350,7 @@ class RTCWebSocketClient:
         prev_tick = time.perf_counter()
 
         while self._running and running.is_set():
+            start = time.time()
             try:
                 # Get robot state
                 state = self._state_sub.get_state()
@@ -426,6 +430,9 @@ class RTCWebSocketClient:
             except Exception as e:
                 print(f"[client] Send error: {e}")
                 break
+
+            sleep_time = max(0, OBS_SEND_INTERVAL - (time.time() - start))
+            time.sleep(sleep_time)
 
             now = time.perf_counter()
             interval = now - prev_tick
@@ -585,12 +592,12 @@ if __name__ == "__main__":
     parser.add_argument("--camera-address", type=str, default="tcp://192.168.123.164:5558",
                         help="Camera ZMQ address")
     parser.add_argument("--episode-dir", type=str,
-                        default="/home/xiawei/data/multi-task/put_chip_can_into_plate/episode_0",
+                        default="/home/xiawei/data/multi-task/pick_place_1/episode_0",
                         help="Episode folder containing color/ and color_subgoal/ for subgoal images")
     parser.add_argument("--prompts-json", type=str,
                         default="/home/xiawei/data/multi-task/prompts.json",
                         help="JSON mapping task-key -> {task_description, subtasks[]}")
-    parser.add_argument("--task-key", type=str, default="put_chip_can_into_plate",
+    parser.add_argument("--task-key", type=str, default="pick_place_1",
                         help="Key into prompts.json (e.g. pick_place_1); selects the "
                              "task_description and the per-stage subtask prompts.")
     parser.add_argument("--instruction", type=str, default=None,
