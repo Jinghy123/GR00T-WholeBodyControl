@@ -254,6 +254,7 @@ public:
             std::lock_guard<std::mutex> lock(current_motion_mutex);
             has_external_token_state_ = false;
             external_token_state_.SetData({});
+            has_hand_joints_ = false;  // reopen hands when streaming is force-disabled
             operator_state.play = false;
             reinitialize_heading = true;
             current_motion = motion_reader.GetMotionShared(motion_reader.current_motion_index_);
@@ -292,6 +293,7 @@ public:
                 // Encoder mode will be read from the motion's encode_mode
                 has_external_token_state_ = false;
                 external_token_state_.SetData({});
+                has_hand_joints_ = false;  // reopen hands on safety reset
                 operator_state.play = false;
                 reinitialize_heading = true;
                 auto temp_motion = std::make_shared<MotionSequence>(*current_motion);
@@ -342,6 +344,9 @@ public:
                     std::lock_guard<std::mutex> lock(current_motion_mutex);
                     has_external_token_state_ = false;
                     external_token_state_.SetData({});
+                    // Reset hand state so GetHandPose() returns the fully-open
+                    // default again instead of holding the last streamed pose.
+                    has_hand_joints_ = false;
                     operator_state.play = false;
                     reinitialize_heading = true;
                     current_motion = motion_reader.GetMotionShared(motion_reader.current_motion_index_); // current motion is the pre-loaded motion

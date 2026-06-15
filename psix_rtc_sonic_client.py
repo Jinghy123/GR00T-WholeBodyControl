@@ -39,6 +39,17 @@ def fsq_quantize(continuous_value, fsq_min=FSQ_MIN, fsq_max=FSQ_MAX, fsq_step=FS
     quantized = np.clip(quantized, fsq_min, fsq_max)
     return quantized
 
+# Encode the current robot pose into a 64-D sonic body token (same encoder the non-RTC
+# client uses to "freeze" the body token), to seed the server's first-chunk RTC prev-action.
+from encoder_client import EncoderClient
+ENCODER_MODEL = "gear_sonic_deploy/policy/release/model_encoder.onnx"
+_MUJOCO_TO_ISAACLAB_DOF = np.array(
+    [0, 6, 12, 1, 7, 13, 2, 8, 14, 3, 9, 15, 22, 4, 10, 16, 23, 5, 11, 17, 24, 18, 25, 19, 26, 20, 27, 21, 28],
+    dtype=np.int32,
+)
+def _mujoco29_to_isaaclab29(qpos):
+    return np.asarray(qpos, dtype=np.float32).reshape(29)[_MUJOCO_TO_ISAACLAB_DOF].copy()
+
 # ---------------- Serialization utilities ----------------
 from base64 import b64encode, b64decode
 from numpy.lib.format import dtype_to_descr, descr_to_dtype
@@ -291,6 +302,13 @@ class RTCWebSocketClient:
         self._subgoal_manager = subgoal_manager
         self._task = task_instruction
         self._dbg_last_idx = -1  # debug: track stage changes for image/idx dumps
+        # Encoder for the first-frame current-pose token (seeds the server first-chunk RTC).
+        try:
+            self._encoder = EncoderClient(ENCODER_MODEL, mode=0)
+        except Exception as e:
+            print(f"[init-prev] encoder load failed ({e}); first chunk falls back to unconditioned")
+            self._encoder = None
+        self._sent_init_prev = False
 
     def execute_action(self, action):
         """
@@ -399,12 +417,30 @@ class RTCWebSocketClient:
                 }
                 state_obs = {"states": states}
 
-                # instruction must be a dict {"task", "subtask"}; the server assembles
-                # "Task: <task>. Subtask: <subtask>" (subtask dropped when empty).
-                instruction = {
-                    "task": self._task,
-                    "subtask": self._subgoal_manager.get_subtask(),
-                }
+                # First frame only: encode current pose -> 64-D sonic token, assemble a raw
+                # 78-D pseudo prev-action [LH7 | RH7 | token64] for the server's first-chunk RTC.
+                if not self._sent_init_prev and self._encoder is not None:
+                    qpos = _mujoco29_to_isaaclab29(state["body_q_measured"])           # (29,)
+                    base_quat = np.asarray(state.get("base_quat_measured", [1, 0, 0, 0]),
+                                           dtype=np.float32).reshape(4)
+                    jp = np.tile(qpos, (10, 1)).astype(np.float32)                     # (10,29)
+                    jv = np.zeros((10, 29), dtype=np.float32)
+                    bq = np.tile(base_quat, (10, 1)).astype(np.float32)                # (10,4)
+                    enc_token = np.asarray(self._encoder.encode(jp, jv, bq),
+                                           dtype=np.float32).reshape(64)               # (64,)
+                    init_prev_action = np.concatenate(
+                        [left_hand_states, right_hand_states, enc_token]).astype(np.float32)  # (78,)
+                    state_obs["init_prev_action"] = init_prev_action
+                    self._sent_init_prev = True
+                    print(f"[init-prev] first-frame pseudo prev-action sent; "
+                          f"token range=[{enc_token.min():.3f},{enc_token.max():.3f}]")
+
+                # Assemble the instruction string here (server feeds it to the VLM verbatim).
+                # Must match the training format: "Task: <task>. Subtask: <subtask>"
+                # (task lowercased, subtask dropped when empty).
+                task = str(self._task).strip().lower()
+                subtask = str(self._subgoal_manager.get_subtask()).strip()
+                instruction = f"Task: {task}. Subtask: {subtask}" if subtask else f"Task: {task}"
 
                 payload = {
                     "image": img_obs,

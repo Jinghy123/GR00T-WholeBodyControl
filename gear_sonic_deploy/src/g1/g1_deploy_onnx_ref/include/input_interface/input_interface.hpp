@@ -337,15 +337,15 @@ public:
      * @brief Get 7-DOF Dex3 hand joint positions.
      * @param is_left  true → left hand, false → right hand.
      * @return {true, joints} if hand joint data is available; {false, defaults} otherwise.
-     *         Default left  = {0, 0,  1.75, -1.57, -1.75, -1.57, -1.75}
-     *         Default right = {0, 0, -1.75,  1.57,  1.75,  1.57,  1.75}
+     *         Default (both hands) = all zeros (fully open) so the hands stay
+     *         fully open when no hand-joint stream is present.
      */
     virtual std::pair<bool, std::array<double, 7>> GetHandPose(bool is_left) const {
         if(!has_hand_joints_) {
             if(is_left) {
-                return {false, {0, 0, 1.75, -1.57, -1.75, -1.57, -1.75 }};
+                return {false, {0, 0, 0, 0, 0, 0, 0 }};  // fully open
             } else {
-                return {false, {0, 0, -1.75,  1.57,  1.75,  1.57,  1.75 }};
+                return {false, {0, 0, 0, 0, 0, 0, 0 }};  // fully open
             }
         }
         if(is_left) {
@@ -354,14 +354,14 @@ public:
                 return {true, *buffered_data.data};
             }
             else {
-                return {false, {0, 0, 1.75, -1.57, -1.75, -1.57, -1.75 }};
+                return {false, {0, 0, 0, 0, 0, 0, 0 }};  // fully open
             }
         } else {
             auto buffered_data = right_hand_joint_.GetDataWithTime();
             if (buffered_data.data) {
                 return {true, *buffered_data.data};
             } else {
-                return {false, {0, 0, -1.75,  1.57,  1.75,  1.57,  1.75 }};
+                return {false, {0, 0, 0, 0, 0, 0, 0 }};  // fully open
             }
         }
     }
