@@ -4,7 +4,6 @@ import time
 import threading
 import json
 import signal
-from collections import deque
 
 import cv2
 import numpy as np
@@ -13,9 +12,6 @@ import msgpack
 import requests
 import json_numpy
 
-# Add project root to path for imports
-# _GROOT_ROOT = os.path.expanduser("~/hsc/GR00T-WholeBodyControl")
-# sys.path.insert(0, _GROOT_ROOT)
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
     pack_pose_message,
     build_command_message,
@@ -67,10 +63,11 @@ def fsq_quantize(continuous_value, fsq_min=FSQ_MIN, fsq_max=FSQ_MAX, fsq_step=FS
 # ---------------- SubgoalManager ----------------
 class SubgoalManager:
     """
-    Holds the current subgoal image and advances through a fixed sequence on Enter.
+    Holds the current subgoal image and advances through a fixed sequence via advance()
+    (driven by the `:adv` / `:goal` stdin commands or an HLP `switch`).
 
     Sequence: every image in color_subgoal/ in order, then color[-1] as the final one.
-    Further Enter presses after the last one are no-ops.
+    advance() past the last stage is a no-op (index caps at len-1).
     """
 
     _IMG_EXTS = (".jpg", ".jpeg", ".png")
@@ -94,10 +91,10 @@ class SubgoalManager:
         self._idx = 0
         self._lock = threading.Lock()
 
-        # Per-stage subtask prompts, parallel to self.paths. Advanced together with the
-        # subgoal image on each Enter (the server expects the client to switch BOTH the
-        # goal image and the subtask over time). Missing entries -> "" so the server
-        # falls back to task-only conditioning for that stage.
+        # Per-stage subtask prompts, parallel to self.paths — DEBUG/LOG ONLY (printed below
+        # and in advance()/get_stage()). They are NOT sent to the server: the VLA's subtask
+        # comes from the client's inline state (manual stdin / HLP) via _make_instruction().
+        # Missing entries -> "".
         subtasks = list(subtasks or [])
         self._subtasks = [
             (subtasks[i] if i < len(subtasks) else "") for i in range(len(self.paths))
@@ -109,7 +106,7 @@ class SubgoalManager:
         print(f"[Subgoal] Loaded {len(self._images)} subgoal images from {episode_dir}:")
         for i, p in enumerate(self.paths):
             print(f"  [{i}] {p}  | subtask: {self._subtasks[i]!r}")
-        print(f"[Subgoal] Current index: 0  (press Enter to advance)")
+        print(f"[Subgoal] Current index: 0  (advance via :adv / :goal <n> or an HLP switch)")
 
     @classmethod
     def _list_images(cls, d):
@@ -133,12 +130,8 @@ class SubgoalManager:
         with self._lock:
             return self._images[self._idx]
 
-    def get_subtask(self):
-        with self._lock:
-            return self._subtasks[self._idx]
-
     def get_stage(self):
-        """(idx, subgoal_path, subtask) for the current stage — for debugging."""
+        """(idx, subgoal_path, subtask) for the current stage — for debug logging."""
         with self._lock:
             return self._idx, self.paths[self._idx], self._subtasks[self._idx]
 
@@ -278,7 +271,8 @@ class PsixSonicClient:
 
     def __init__(self, server_url, state_subscriber, camera, token_publisher,
                  subgoal_manager, task_instruction, http_timeout=30.0,
-                 hlp_url=None, hlp_timeout=30.0, hlp_camera=None, hlp_period=0.7):
+                 hlp_url=None, hlp_timeout=30.0, hlp_camera=None, hlp_period=0.7,
+                 hlp_auto_threshold=1.5):
         self._server_url = server_url
         self._state_sub = state_subscriber
         self._camera = camera
@@ -310,6 +304,13 @@ class PsixSonicClient:
         self._hlp_session = requests.Session()  # independent of the VLA self._session
         self._hlp_first = True                  # is_initial until first successful HLP reply
         self._hlp_thread = None
+        # Predicted-time auto-transition: when HLP says 'continue' with a predicted
+        # seconds_to_subgoal < this threshold, switch to the (already-predicted) next subtask at
+        # the predicted time instead of waiting for a future 'switch' reply — hides the ~1s HLP
+        # latency for imminent transitions. 0 disables it.
+        self._auto_threshold = hlp_auto_threshold
+        self._pending_transition = None         # (next_subtask, fire_at, from_subtask), under _subtask_lock
+        self._transition_thread = None
 
         # Encoder for frozen token
         self._encoder = EncoderClient(ENCODER_MODEL, mode=0)
@@ -341,8 +342,6 @@ class PsixSonicClient:
         assert state is not None, "Robot state not available"
 
         body_q = np.array(state["body_q_measured"], dtype=np.float32)        # (29,) = [leg/base(15) | arm(14)]
-        # left_hand_states = np.array(state["left_hand_q"], dtype=np.float32)   # (7,)
-        # right_hand_states = np.array(state["right_hand_q"], dtype=np.float32)  # (7,)
         left_hand_states = np.array(state["left_hand_q_measured"], dtype=np.float32)   # (7,)
         right_hand_states = np.array(state["right_hand_q_measured"], dtype=np.float32)  # (7,)
 
@@ -493,7 +492,6 @@ class PsixSonicClient:
             return
 
         idx = 0
-        using_last_action = False
         frozen_action = None
         last_action = None
         print(f"[PublishLoop] First chunk: shape={chunk.shape}. Starting execution.")
@@ -506,7 +504,6 @@ class PsixSonicClient:
                 action = chunk[idx]
                 last_action = action.copy()
                 idx += 1
-                using_last_action = False
             else:
                 # ── WAITING for next chunk ─────────────────────────────────
 
@@ -545,10 +542,8 @@ class PsixSonicClient:
                     action = chunk[idx]
                     last_action = action.copy()
                     idx += 1
-                    using_last_action = False
                 else:
                     action = frozen_action
-                    using_last_action = True
 
             self._token_publisher.publish_token(action)
 
@@ -610,6 +605,63 @@ class PsixSonicClient:
                 self._set_subtask_locked("__done__", "hlp")
             return False
 
+    def _hlp_switch_to(self, next_subtask):
+        """Switch to next_subtask (HLP source; respects manual override) and advance the fixed
+        goal image in lockstep iff it actually switched. Shared by the HLP 'switch' decision and
+        the predicted-time auto-transition. Returns True iff it switched."""
+        applied = self._apply_hlp("switch", next_subtask)
+        if applied:
+            idx, _, _ = self._subgoal_manager.get_stage()
+            if idx >= len(self._subgoal_manager.paths) - 1:
+                print("[HLP] switch but goal image already at last stage; image/subtask decoupled")
+            self._subgoal_manager.advance()
+        return applied
+
+    def _maybe_schedule_transition(self, next_subtask, secs, was_initial):
+        """On an HLP 'continue': schedule an auto-transition to next_subtask at now+secs iff it
+        is imminent (0<=secs<threshold), non-initial, not manual, and a real change. Records the
+        subtask we transition FROM so a STALE schedule can't overwrite a newer switch (the timer
+        only fires while the current subtask is still that one). Returns True iff scheduled."""
+        with self._subtask_lock:
+            if (not was_initial) and self._auto_threshold > 0 and next_subtask \
+                    and isinstance(secs, (int, float)) and 0 <= float(secs) < self._auto_threshold \
+                    and not self._manual_override and next_subtask != self._subtask:
+                self._pending_transition = (next_subtask, time.time() + float(secs), self._subtask)
+                return True
+            self._pending_transition = None
+            return False
+
+    def _clear_pending_transition(self):
+        with self._subtask_lock:
+            self._pending_transition = None
+
+    def _transition_timer(self):
+        """Fire a due pending auto-transition (~0.1 s resolution) so an imminent switch happens at
+        the HLP-predicted time instead of waiting for the next ~1 s poll. Fires ONLY if the current
+        subtask is still the one it was scheduled FROM — otherwise a newer HLP 'switch' superseded
+        it (stale) and we keep the latest. The staleness check + subtask update are atomic under
+        the lock; the goal-image advance follows. Also skipped under manual override."""
+        print("[HLP] transition timer started")
+        while self._running.is_set():
+            fire = None
+            with self._subtask_lock:
+                pend = self._pending_transition
+                if pend is not None and time.time() >= pend[1]:
+                    next_sub, _, from_sub = pend
+                    if (not self._manual_override) and self._subtask == from_sub \
+                            and next_sub and next_sub != self._subtask:
+                        self._set_subtask_locked(next_sub, "hlp")
+                        fire = next_sub
+                    self._pending_transition = None   # consume (whether fired or stale)
+            if fire is not None:
+                idx, _, _ = self._subgoal_manager.get_stage()
+                if idx >= len(self._subgoal_manager.paths) - 1:
+                    print("[HLP] auto-transition but goal image already at last stage; decoupled")
+                self._subgoal_manager.advance()
+                print(f"[HLP] auto-transition at predicted time -> {fire!r}")
+            time.sleep(0.1)
+        print("[HLP] transition timer stopped")
+
     # ---------- HLP poller (separate process; never blocks the 30 Hz loop) ----------
     def _hlp_worker(self):
         """Poll the HLP server (default 0.7 s; --hlp-period 0 = as fast as possible) and
@@ -648,19 +700,21 @@ class PsixSonicClient:
             was_initial = self._hlp_first
             self._hlp_first = False  # only after a VALID reply
             next_subtask = out.get("next_subtask")
-            applied_switch = self._apply_hlp(decision, next_subtask)  # True iff HLP switched
-            # Lockstep: advance the fixed goal image on a real, NON-INITIAL HLP switch. The
-            # initial "switch" only ESTABLISHES the first subtask (goal image is already at
-            # stage 0); manual override / empty next_subtask / same subtask -> applied_switch
-            # False -> no advance. Gating on the atomic return (not a before/after compare)
-            # avoids a TOCTOU race vs stdin.
-            if (not was_initial) and applied_switch:
-                idx, _, _ = self._subgoal_manager.get_stage()
-                if idx >= len(self._subgoal_manager.paths) - 1:
-                    print("[HLP] switch but goal image already at last stage; "
-                          "image/subtask now decoupled")
-                self._subgoal_manager.advance()
-            print(f"[HLP] decision={decision!r} subtask={self._get_subtask()!r}")
+            secs = out.get("seconds_to_subgoal")
+            if decision == "switch":
+                # Initial 'switch' only ESTABLISHES the first subtask (goal already at stage 0);
+                # a later switch advances the goal image in lockstep (_hlp_switch_to).
+                if was_initial:
+                    self._apply_hlp("switch", next_subtask)
+                else:
+                    self._hlp_switch_to(next_subtask)
+                self._clear_pending_transition()  # a real switch supersedes any pending schedule
+            elif decision == "done":
+                self._apply_hlp("done", next_subtask)  # passthrough -> __done__
+                self._clear_pending_transition()
+            else:  # 'continue': maybe schedule an imminent predicted-time auto-transition.
+                self._maybe_schedule_transition(next_subtask, secs, was_initial)
+            print(f"[HLP] decision={decision!r} subtask={self._get_subtask()!r} secs={secs}")
             time.sleep(self._hlp_period)
         print("[HLP] worker stopped")
 
@@ -751,6 +805,10 @@ class PsixSonicClient:
         if self._hlp_url:
             self._hlp_thread = threading.Thread(target=self._hlp_worker, daemon=True)
             self._hlp_thread.start()
+            # Predicted-time auto-transition timer (fires imminent transitions on schedule).
+            if self._auto_threshold > 0:
+                self._transition_thread = threading.Thread(target=self._transition_timer, daemon=True)
+                self._transition_thread.start()
 
         print("[PsixSonicClient] Started successfully!")
         return True
@@ -794,7 +852,7 @@ class PsixSonicClient:
 # ---------------- Main ----------------
 def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_topic,
          camera_address, episode_dir, task_instruction, subtasks,
-         hlp_url=None, hlp_timeout=30.0, hlp_period=0.7):
+         hlp_url=None, hlp_timeout=30.0, hlp_period=0.7, hlp_auto_threshold=1.5):
     print("[MAIN] Initializing components...")
 
     # 1. Initialize token publisher (ZMQ PUB, Protocol v4)
@@ -845,6 +903,7 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
         hlp_timeout=hlp_timeout,
         hlp_camera=hlp_camera,
         hlp_period=hlp_period,
+        hlp_auto_threshold=hlp_auto_threshold,
     )
 
     if not client.start():
@@ -919,6 +978,11 @@ if __name__ == "__main__":
                         help="HLP HTTP request timeout (s)")
     parser.add_argument("--hlp-period", type=float, default=0.7,
                         help="HLP poll period (s); 0 = as fast as possible")
+    parser.add_argument("--hlp-auto-transition-threshold", type=float, default=1.5,
+                        help="When HLP says continue with seconds_to_subgoal < this (s), "
+                             "auto-transition to the predicted next subtask at the predicted "
+                             "time instead of waiting for an HLP 'switch' (hides HLP latency). "
+                             "0 disables.")
     parser.add_argument("--no-hlp", action="store_true",
                         help="Disable the HLP poller — manual stdin steering only")
 
@@ -958,4 +1022,5 @@ if __name__ == "__main__":
         hlp_url=hlp_url,
         hlp_timeout=args.hlp_timeout,
         hlp_period=args.hlp_period,
+        hlp_auto_threshold=args.hlp_auto_transition_threshold,
     )
