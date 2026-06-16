@@ -438,6 +438,7 @@ class RTCWebSocketClient:
                 # Assemble the instruction string here (server feeds it to the VLM verbatim).
                 # Must match the training format: "Task: <task>. Subtask: <subtask>"
                 # (task lowercased, subtask dropped when empty).
+
                 task = str(self._task).strip().lower()
                 subtask = str(self._subgoal_manager.get_subtask()).strip()
                 instruction = f"Task: {task}. Subtask: {subtask}" if subtask else f"Task: {task}"

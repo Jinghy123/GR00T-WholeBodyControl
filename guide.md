@@ -146,6 +146,6 @@ ssh -L 5000:localhost:5000 nebula101
 
 ```bash
 python apply_initial_pose.py
-
+(conda activate sonic)
 python g1_sonic_client.py --action-only --include-neck
 ```

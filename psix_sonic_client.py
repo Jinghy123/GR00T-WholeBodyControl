@@ -29,8 +29,8 @@ from encoder_client import EncoderClient
 json_numpy.patch()
 
 # ---------------- Configuration ----------------
-TASK_INSTRUCTION = "grasp the pink chip can and place it into the orange plate"
-# TASK_INSTRUCTION = "pick up the grapes and place in the bowl"
+# TASK_INSTRUCTION = "grasp the pink chip can and place it into the orange plate"
+TASK_INSTRUCTION = "pick up the grapes and place in the bowl"
 
 # FSQ configuration (must match g1_sonic_client / encoder)
 FSQ_MIN = -0.625
@@ -335,6 +335,10 @@ class PsixSonicClient:
 
         subgoal_frame = self._subgoal_manager.get()
 
+        task = str(self._task).strip().lower()
+        subtask = str(self._subgoal_manager.get_subtask()).strip()
+        instruction = f"Task: {task}. Subtask: {subtask}" if subtask else f"Task: {task}"
+
         # --- DEBUG: dump ego + goal to /tmp whenever the subgoal stage changes ---
         stage_idx, stage_path, stage_subtask = self._subgoal_manager.get_stage()
         if stage_idx != self._dbg_last_idx:
@@ -352,10 +356,11 @@ class PsixSonicClient:
             "state": {"states": states},  # single (43,) frame
             "gt_action": None,
             "dataset_name": None,
-            "instruction": {
-                "task": self._task,
-                "subtask": self._subgoal_manager.get_subtask(),
-            },
+            # "instruction": {
+            #     "task": self._task,
+            #     "subtask": self._subgoal_manager.get_subtask(),
+            # },
+            "instruction": instruction,
             "history": None,
             "condition": None,
             "timestamp": None,
@@ -680,12 +685,12 @@ if __name__ == "__main__":
     parser.add_argument("--camera-address", type=str, default="tcp://192.168.123.164:5558",
                         help="Camera ZMQ address")
     parser.add_argument("--episode-dir", type=str,
-                        default="/home/xiawei/data/multi-task/put_chip_can_into_plate/episode_0",
+                        default="/home/xiawei/data/multi-task/pick_place_1/episode_0",
                         help="Episode folder containing color/ and color_subgoal/ for subgoal images")
     parser.add_argument("--prompts-json", type=str,
                         default="/home/xiawei/data/multi-task/prompts.json",
                         help="JSON mapping task-key -> {task_description, subtasks[]}")
-    parser.add_argument("--task-key", type=str, default="put_chip_can_into_plate",
+    parser.add_argument("--task-key", type=str, default="pick_place_1",
                         help="Key into prompts.json; selects the task_description and the "
                              "per-stage subtask prompts.")
     parser.add_argument("--instruction", type=str, default=None,
