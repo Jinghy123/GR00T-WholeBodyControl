@@ -174,6 +174,21 @@ def zed_capture_thread(cfg: Any) -> None:
     right_mat = sl.Mat()
     runtime = sl.RuntimeParameters()
 
+    # Independent viewer PUB stream. Decoupled from the REP recording socket
+    # (5558) so a slow viewer never backpressures the recorder. PUB drops
+    # frames for slow subscribers, so the recording rate stays at full FPS.
+    viewer_pub = None
+    if getattr(cfg, "viewer_pub", ""):
+        try:
+            viewer_pub = zmq.Context.instance().socket(zmq.PUB)
+            viewer_pub.setsockopt(zmq.SNDHWM, 2)
+            viewer_pub.setsockopt(zmq.LINGER, 0)
+            viewer_pub.bind(cfg.viewer_pub)
+            print(f"[ZED] Viewer PUB bound: {cfg.viewer_pub}")
+        except Exception as e:
+            print(f"\033[91m[ZED] Viewer PUB bind failed: {e}\033[0m")
+            viewer_pub = None
+
     print(f"[ZED] Started: resolution={cfg.resolution_name} fps={cfg.fps}")
 
     while True:
@@ -208,6 +223,16 @@ def zed_capture_thread(cfg: Any) -> None:
                 latest_ego_stereo_frame = stereo_bgr.copy()
                 frame_seq += 1
                 frame_cond.notify_all()
+
+            # Broadcast to viewers on the separate PUB. NOBLOCK + low SNDHWM
+            # means a stalled viewer just drops frames instead of stalling
+            # this capture thread or the REP recording path.
+            if viewer_pub is not None:
+                try:
+                    viewer_pub.send_multipart([enc_rgb, enc_stereo],
+                                              flags=zmq.NOBLOCK)
+                except zmq.Again:
+                    pass
 
         except Exception as e:
             print(f"[ZED] Capture error: {e}")
@@ -912,6 +937,15 @@ def _parse_args() -> argparse.Namespace:
         default=ZMQ_BIND_DEFAULT,
         help="ZMQ REP bind address (default tcp://192.168.123.164:5558)",
     )
+    p.add_argument(
+        "--viewer-pub",
+        default=os.environ.get("VIEWER_PUB", "tcp://0.0.0.0:5559"),
+        help=(
+            "ZMQ PUB bind address for the live viewer stream (separate from "
+            "the REP recording socket so the viewer never slows recording). "
+            "Set to empty string to disable. Default 'tcp://0.0.0.0:5559'."
+        ),
+    )
 
     # Pico
     p.set_defaults(enable_pico=_env_bool("ENABLE_PICO", False))
@@ -946,6 +980,7 @@ def _build_config(ns: argparse.Namespace) -> Any:
     c.jpeg_rgb_quality = ns.jpeg_rgb_quality
     c.jpeg_stereo_quality = ns.jpeg_stereo_quality
     c.zmq_bind = ns.zmq_bind
+    c.viewer_pub = ns.viewer_pub
     c.enable_pico = ns.enable_pico
     c.pico_ip = ns.pico_ip
     c.pico_port = ns.pico_port

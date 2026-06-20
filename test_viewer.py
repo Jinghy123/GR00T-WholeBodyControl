@@ -1,16 +1,14 @@
 """
 Live ZED-only viewer for realsense_server.py.
 
-Displays the ZED ego window (and optionally the ZED stereo L|R) by polling
-the server's 4-part ZMQ REP reply. Press 'q' or ESC to quit. Use --duration
-N to auto-exit after N seconds.
-
-D405 wrist windows are HARD-DISABLED (search for `DISABLED: D405 wrists`
-to re-enable). The server pads the wrist slots with b"" so this viewer
-only shows the ZED.
+Subscribes to the server's dedicated viewer PUB stream (2-part multipart:
+[ego_jpeg, stereo_jpeg]) on port 5559. This is SEPARATE from the REP
+recording socket (5558), so running this viewer never slows down the
+recorder — PUB drops frames for a slow subscriber instead of backpressuring.
+Press 'q' or ESC to quit. Use --duration N to auto-exit after N seconds.
 
 Usage:
-  python test_viewer.py                                      # connect to 127.0.0.1:5558
+  python test_viewer.py                                      # connect to 127.0.0.1:5559
   python test_viewer.py --server 192.168.123.164             # robot IP
   python test_viewer.py --show-stereo                        # add stereo window
   python test_viewer.py --duration 15                        # auto-close after 15s
@@ -34,9 +32,10 @@ def _decode(jpeg_bytes):
 
 
 def _make_sock(ctx, addr):
-    s = ctx.socket(zmq.REQ)
+    s = ctx.socket(zmq.SUB)
+    s.setsockopt(zmq.SUBSCRIBE, b"")
     s.setsockopt(zmq.RCVTIMEO, 3000)
-    s.setsockopt(zmq.SNDTIMEO, 3000)
+    s.setsockopt(zmq.RCVHWM, 2)
     s.setsockopt(zmq.LINGER, 0)
     s.connect(addr)
     return s
@@ -63,35 +62,28 @@ def run(args):
     try:
         while True:
             try:
-                sock.send(b"get_frame")
                 parts = sock.recv_multipart()
             except zmq.Again:
-                print("[viewer] server timeout, reconnecting...")
+                print("[viewer] no frames from server, reconnecting...")
                 sock.close()
                 sock = _make_sock(ctx, addr)
                 continue
 
-            while len(parts) < 4:
+            while len(parts) < 2:
                 parts.append(b"")
-            ego, stereo, lw, rw = (_decode(p) for p in parts[:4])
+            ego, stereo = (_decode(p) for p in parts[:2])
 
             if ego is not None:
                 cv2.imshow("ZED Ego", ego)
             if args.show_stereo and stereo is not None:
                 cv2.imshow("ZED Stereo L|R", stereo)
-            # DISABLED: D405 wrist windows — wrist slots from the server are
-            # always b"". Re-enable alongside the wrist code in realsense_server.py.
-            # if lw is not None:
-            #     cv2.imshow("Left Wrist (D405)", lw)
-            # if rw is not None:
-            #     cv2.imshow("Right Wrist (D405)", rw)
 
             frames += 1
             now = time.time()
             if now - last_report > 2.0:
                 fps = frames / (now - t0)
-                got = [n for n, x in zip(["ego", "stereo", "lw", "rw"],
-                                          [ego, stereo, lw, rw]) if x is not None]
+                got = [n for n, x in zip(["ego", "stereo"],
+                                          [ego, stereo]) if x is not None]
                 print(f"[viewer] {frames} frames, {fps:.1f} fps, streams={got}")
                 last_report = now
 
@@ -110,7 +102,7 @@ def run(args):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--server", default="127.0.0.1")
-    p.add_argument("--port", type=int, default=5558)
+    p.add_argument("--port", type=int, default=5559)
     p.add_argument("--show-stereo", action="store_true",
                    help="also open a window for the ZED stereo L|R view")
     p.add_argument("--duration", type=float, default=0,

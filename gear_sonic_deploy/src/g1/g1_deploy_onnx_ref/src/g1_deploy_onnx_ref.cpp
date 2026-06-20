@@ -3532,7 +3532,10 @@ class G1Deploy {
             std::cout << "Reset to frame 0." << std::endl;
           }
         } else {
-          if (current_frame_ >= current_motion_->timesteps - saved_frame_for_observation_window_) {
+          // if (current_frame_ >= current_motion_->timesteps - saved_frame_for_observation_window_) {
+          constexpr int kStreamWindowCap = 10;
+          const int eff_window = std::min(saved_frame_for_observation_window_, kStreamWindowCap);
+          if (current_frame_ >= current_motion_->timesteps - eff_window) {
             current_frame_ = current_frame_ - 1;
             std::cout << "Motion " << current_motion_->name << " completed and waiting following motion" << std::endl;                    
           }

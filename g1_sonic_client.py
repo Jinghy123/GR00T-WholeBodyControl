@@ -20,7 +20,7 @@ import numpy as np
 import zmq
 import msgpack
 
-_GROOT_ROOT = os.path.expanduser("~/hsc/GR00T-WholeBodyControl")
+_GROOT_ROOT = os.path.expanduser("/mnt/data/weiduo/heng/GR00T-WholeBodyControl")
 sys.path.insert(0, _GROOT_ROOT)
 
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
@@ -80,6 +80,10 @@ DEFAULT_NECK_STATE_ZMQ = "tcp://192.168.123.164:5560"
 DEFAULT_POLICY_HOST = "localhost"
 DEFAULT_POLICY_PORT = 5000
 
+# Expected image resolution for policy server (height, width)
+# cv2.resize expects (width, height), so we store it as (672, 384)
+POLICY_IMAGE_RESOLUTION = (672, 384)  # (width, height) for cv2.resize
+
 # Control frequencies
 FREQ_POLICY = 30  # Hz - frequency to query policy server
 
@@ -108,8 +112,9 @@ TOKEN_DIM = 64
 # Image buffer
 IMAGE_BUFFER_SIZE = 100
 
-TASK_PROMPT = "grasp the white paper cup and pour water into the kettle"
+# TASK_PROMPT = "grasp the white paper cup and pour water into the kettle"
 # TASK_PROMPT = "grasp the red box and place it into the orange box"
+TASK_PROMPT = "pick up the gray hippo toy and place it into the orange bowl"
 
 def fsq_quantize(continuous_value, fsq_min=FSQ_MIN, fsq_max=FSQ_MAX, fsq_step=FSQ_STEP):
     clipped = np.clip(continuous_value, fsq_min, fsq_max)
@@ -632,10 +637,19 @@ class TokenPolicyClient:
         Capture current observation and query policy server.
         Returns np.ndarray of shape (N, action_dim), or None on failure.
         """
-        
+
         with self.image_buffer_lock:
             selected = [self.image_buffer[i].copy() for i in frame_indices]  # (T, H, W, 3)
         selected = np.stack(selected, axis=0) # (T, H, W, 3) or (1, H, W, 3)
+
+        # Resize images to match policy server's expected resolution (672x384)
+        # Only needed for ZedNeckCamera (include_neck mode) which outputs 672x376
+        if self._include_neck:
+            if selected.ndim == 4:  # (T, H, W, 3)
+                selected = np.stack([cv2.resize(frame, POLICY_IMAGE_RESOLUTION) for frame in selected], axis=0)
+            elif selected.ndim == 3:  # (H, W, 3)
+                selected = cv2.resize(selected, POLICY_IMAGE_RESOLUTION)
+
         if len(frame_indices) == 1:
             selected = selected[0]  # (H, W, 3)
 
@@ -809,6 +823,12 @@ class TokenPolicyClient:
                 # whose neck slice is copied from the last fresh action, so we
                 # naturally hold the last neck value (mirrors hand_joints).
                 neck_slice = action[HAND_DIM:HAND_DIM + NECK_DIM]
+                # Debug: print neck values every second (every 30 ticks)
+                if not hasattr(self, '_neck_debug_counter'):
+                    self._neck_debug_counter = 0
+                self._neck_debug_counter += 1
+                if self._neck_debug_counter % 30 == 0:
+                    print(f"[NeckPublisher] yaw={neck_slice[0]:.4f}, pitch={neck_slice[1]:.4f}")
                 self._neck_publisher.publish(neck_slice[0], neck_slice[1])
 
             # Maintain 30 Hz with relative delay

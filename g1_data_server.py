@@ -94,7 +94,7 @@ WBC_TOPIC = "g1_debug"
 WUJI_STATE_HOST = "localhost"  # Host running wuji_hand_server.py
 WUJI_STATE_PORT = 5560         # ZMQ PUB port for wuji measured state / action
 
-DATA_FOLDER = os.path.expanduser("~/data")
+DATA_FOLDER = os.path.expanduser("/mnt/data/weiduo/heng/data")
 TASK_NAME   = "demonstration"
 FPS         = 30
 
@@ -693,7 +693,9 @@ class DataCollector:
                     if state is not None or has_hand_data:
                         colors = {}
                         if ego is not None:        colors["rgb"]         = ego
-                        if ego_stereo is not None: colors["stereo"]      = ego_stereo
+                        # DISABLED: stereo color not recorded — only the mono
+                        # ego RGB is kept. The server still returns the stereo
+                        # frame, we just drop it here.
                         # DISABLED: D405 wrist frames not recorded — wrists
                         # are hard-off in realsense_server.py for now. Server
                         # still pads the multipart reply so `lw` / `rw` are

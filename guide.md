@@ -25,9 +25,9 @@ cd ~/GR00T-WholeBodyControl     # 机器人上按实际路径调整
 python realsense_server.py \
     --zed-only \
     --zmq-bind tcp://0.0.0.0:5558 \
-    --enable-pico --pico-ip 192.168.0.102 \
+    --enable-pico --pico-ip 192.168.0.242 \
     --enable-neck-motor \
-    --pose-zmq tcp://192.168.0.105:5570
+    --pose-zmq tcp://192.168.123.222:5570
 ```
 
 > `--pose-zmq` 指向**桌面端**脖子发布者的 IP（此处 `192.168.0.105`）。
@@ -54,8 +54,9 @@ source scripts/setup_env.sh
 export GR00T_ROOT="$PWD"
 export PYTHONPATH="$GR00T_ROOT/external_dependencies/gmr_shim:$GR00T_ROOT/external_dependencies/XRoboToolkit-PC-Service-Pybind_X86_and_ARM64:$PYTHONPATH"
 export LD_LIBRARY_PATH="$GR00T_ROOT/external_dependencies/XRoboToolkit-PC-Service-Pybind_X86_and_ARM64:$LD_LIBRARY_PATH"
+export PYTHONPATH=$PWD/GMR:$PYTHONPATH
 source .venv_teleop/bin/activate
-python gear_sonic/scripts/pico_manus_thread_server.py
+python gear_sonic/scripts/pico_manus_thread_server.py --use_pico_hand
 ```
 
 > 用 SlimeVR 身体源时，把这一步换成
@@ -74,7 +75,7 @@ python g1_data_server.py \
 可选的实时 ZED 画面查看：
 
 ```bash
-python test_viewer.py --server 192.168.123.164 --port 5558 --show-stereo
+python test_viewer.py --server 192.168.123.164 --port 5559 --show-stereo
 ```
 
 Manus 手套 SDK（在 `:8000` 推流）：
@@ -130,7 +131,7 @@ source scripts/setup_env.sh
 ```
 
 图像客户端：
-
+22
 ```bash
 cd ~/hongyi/Unitree_Robotics/Humanoid-Teleop/teleop/image_server
 python image_client.py
@@ -146,6 +147,24 @@ ssh -L 5000:localhost:5000 nebula101
 
 ```bash
 python apply_initial_pose.py
-(conda activate sonic)
+
 python g1_sonic_client.py --action-only --include-neck
-```
+
+
+
+
+slimevr -1 +1
+pico +1 -1
+
+
+pc ip: 192.168.123.222
+g1 ip: 192.168.123.164
+mac ip: 192.168.123.158
+windows ip: 192.168.123.177
+
+
+mac:
+ssh weiduoyuan@192.168.123.222
+./start_sonic.sh
+
+
