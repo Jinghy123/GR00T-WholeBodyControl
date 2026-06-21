@@ -32,6 +32,25 @@ FSQ_STEP = 0.0625  # = 1/16
 # cap obs send rate; server control loop runs at 30Hz, sending faster just floods it
 OBS_SEND_INTERVAL = 1.0 / 30.0
 
+# Action/state layout (must match g1_sonic_client conventions):
+#   default:        states(43) = hand(14) + arm(14) + leg(15)
+#                    action(78) = hand_joints(14) + token(64)
+#   --include-neck:  states(45) = states(43) + neck(2) [appended at the end]
+#                    action(80) = hand_joints(14) + token(64) + neck(2) [neck is the last 2 dims]
+HAND_DIM = 14
+NECK_DIM = 2
+TOKEN_DIM = 64
+ACTION_DIM_DEFAULT = 78
+ACTION_DIM_NECK = 80
+
+# Neck publisher configuration (to G1 NeckMotor, matches pose_publisher.py wire format)
+DEFAULT_NECK_PUB_HOST = "*"
+DEFAULT_NECK_PUB_PORT = 5570
+
+# Neck state subscriber (ZMQ SUB <- realsense_server.py on the robot, port 5560)
+# JSON `[yaw_rad, pitch_rad]` of the Dynamixel present-position read each tick.
+DEFAULT_NECK_STATE_ZMQ = "tcp://192.168.123.164:5560"
+
 
 def fsq_quantize(continuous_value, fsq_min=FSQ_MIN, fsq_max=FSQ_MAX, fsq_step=FSQ_STEP):
     clipped = np.clip(continuous_value, fsq_min, fsq_max)
@@ -189,6 +208,28 @@ class RSCamera:
         return rgb_image
 
 
+# ---------------- ZedNeckCamera ----------------
+class ZedNeckCamera:
+    """Neck-mounted ZED camera (--include-neck). Server reply is 4-part
+    multipart [ego_rgb, ego_stereo, left_wrist, right_wrist]; only slot 0 used."""
+
+    def __init__(self, address="tcp://192.168.123.164:5558"):
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REQ)
+        self.socket.connect(address)
+
+    def get_frame(self):
+        self.socket.send(b"get_frame")
+        parts = self.socket.recv_multipart()
+        while len(parts) < 4:
+            parts.append(b"")
+        ego_rgb_jpeg = parts[0]
+        if not ego_rgb_jpeg:
+            return None
+        arr = np.frombuffer(ego_rgb_jpeg, dtype=np.uint8)
+        return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+
 # ---------------- RobotStateSubscriber ----------------
 class RobotStateSubscriber:
     """Subscribe to robot state published by g1_deploy_onnx_ref on ZMQ PUB port."""
@@ -280,6 +321,56 @@ class TokenPublisher:
         self._socket.close()
         self._context.term()
 
+
+# ---------------- NeckStateReader / NeckPublisher ----------------
+class NeckStateReader:
+    """SUB to realsense_server.py's neck present-position stream (JSON [yaw, pitch])."""
+
+    def __init__(self, addr):
+        self._ctx = zmq.Context.instance()
+        self._sock = self._ctx.socket(zmq.SUB)
+        self._sock.setsockopt(zmq.CONFLATE, 1)
+        self._sock.setsockopt(zmq.SUBSCRIBE, b"")
+        self._sock.setsockopt(zmq.LINGER, 0)
+        self._sock.connect(addr)
+        self._latest = None
+
+    def get_latest(self):
+        try:
+            raw = self._sock.recv(flags=zmq.NOBLOCK)
+        except zmq.Again:
+            return self._latest
+        try:
+            msg = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return self._latest
+        if isinstance(msg, (list, tuple)) and len(msg) >= 2:
+            self._latest = [float(msg[0]), float(msg[1])]
+        return self._latest
+
+    def stop(self):
+        self._sock.close(linger=0)
+
+
+class NeckPublisher:
+    """PUB of [yaw, pitch] JSON for the G1 NeckMotor (matches pose_publisher.py wire format)."""
+
+    def __init__(self, host=DEFAULT_NECK_PUB_HOST, port=DEFAULT_NECK_PUB_PORT):
+        self._ctx = zmq.Context()
+        self._sock = self._ctx.socket(zmq.PUB)
+        self._sock.setsockopt(zmq.SNDHWM, 1)
+        self._sock.setsockopt(zmq.LINGER, 0)
+        self._sock.bind(f"tcp://{host}:{port}")
+
+    def publish(self, yaw, pitch):
+        msg = json.dumps([float(yaw), float(pitch)]).encode("utf-8")
+        self._sock.send(msg)
+
+    def stop(self):
+        self._sock.close(linger=0)
+        self._ctx.term()
+
+
 # ---------------- Global state ----------------
 running = threading.Event()
 running.set()
@@ -288,7 +379,7 @@ running.set()
 # ---------------- RTCWebSocketClient ----------------
 class RTCWebSocketClient:
     def __init__(self, server_url, state_subscriber, camera, token_publisher, subgoal_manager,
-                 task_instruction):
+                 task_instruction, include_neck=False, neck_publisher=None, neck_state_reader=None):
         self.server_url = server_url
         self._running = True
         self._connected = threading.Event()
@@ -302,6 +393,9 @@ class RTCWebSocketClient:
         self._subgoal_manager = subgoal_manager
         self._task = task_instruction
         self._dbg_last_idx = -1  # debug: track stage changes for image/idx dumps
+        self._include_neck = include_neck
+        self._neck_publisher = neck_publisher
+        self._neck_state_reader = neck_state_reader
         # Encoder for the first-frame current-pose token (seeds the server first-chunk RTC).
         try:
             self._encoder = EncoderClient(ENCODER_MODEL, mode=0)
@@ -314,20 +408,23 @@ class RTCWebSocketClient:
         """
         Map the server action -> robot command and publish via Protocol v4.
 
-        Server action layout (repack.action_key order) is
-            [action.hand_joints(14) | action.body_token(64)]
-        i.e. hand_joints FIRST, then the 64-D sonic token. publish_token expects
-        [token(64) | left_hand(7) | right_hand(7)], so we re-pack accordingly.
+        Server action layout is [hand_joints(14) | body_token(64)] (78-D default),
+        or [hand_joints(14) | body_token(64) | neck(2)] (80-D --include-neck).
+        publish_token expects [token(64) | left_hand(7) | right_hand(7)].
         """
         if action.ndim > 1:
             action = action[0]
 
-        hand_joints = action[:14]      # [left_hand(7), right_hand(7)]
-        token_ori = action[14:78]      # 64-D sonic body token
+        hand_joints = action[:HAND_DIM]
+        token_ori = action[HAND_DIM:HAND_DIM + TOKEN_DIM]
         token_qtz = fsq_quantize(token_ori)
 
         action_out = np.concatenate([token_qtz, hand_joints])  # [token(64), LH(7), RH(7)]
         self._token_publisher.publish_token(action_out)
+
+        if self._include_neck and self._neck_publisher is not None:
+            neck = action[HAND_DIM + TOKEN_DIM:HAND_DIM + TOKEN_DIM + NECK_DIM]
+            self._neck_publisher.publish(neck[0], neck[1])
 
     def _on_open(self, ws):
         print("[client] Connected!")
@@ -388,6 +485,15 @@ class RTCWebSocketClient:
                     (left_hand_states, right_hand_states, arm_states, leg_states), axis=0
                 )  # (43,)
 
+                if self._include_neck:
+                    neck_latest = self._neck_state_reader.get_latest()
+                    neck_state = (
+                        np.asarray(neck_latest, dtype=np.float32)
+                        if neck_latest is not None
+                        else np.zeros(NECK_DIM, dtype=np.float32)
+                    )
+                    states = np.concatenate((states, neck_state), axis=0)  # (45,)
+
                 # Get camera frame
                 frame = self._camera.get_frame()
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -418,7 +524,8 @@ class RTCWebSocketClient:
                 state_obs = {"states": states}
 
                 # First frame only: encode current pose -> 64-D sonic token, assemble a raw
-                # 78-D pseudo prev-action [LH7 | RH7 | token64] for the server's first-chunk RTC.
+                # pseudo prev-action [LH7 | RH7 | token64] (| neck2 if --include-neck) for the
+                # server's first-chunk RTC.
                 if not self._sent_init_prev and self._encoder is not None:
                     qpos = _mujoco29_to_isaaclab29(state["body_q_measured"])           # (29,)
                     base_quat = np.asarray(state.get("base_quat_measured", [1, 0, 0, 0]),
@@ -430,6 +537,9 @@ class RTCWebSocketClient:
                                            dtype=np.float32).reshape(64)               # (64,)
                     init_prev_action = np.concatenate(
                         [left_hand_states, right_hand_states, enc_token]).astype(np.float32)  # (78,)
+                    if self._include_neck:
+                        init_prev_action = np.concatenate(
+                            [init_prev_action, states[-NECK_DIM:]]).astype(np.float32)  # (80,)
                     state_obs["init_prev_action"] = init_prev_action
                     self._sent_init_prev = True
                     print(f"[init-prev] first-frame pseudo prev-action sent; "
@@ -506,7 +616,9 @@ class RTCWebSocketClient:
 
 # ---------------- Main ----------------
 def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_topic,
-         camera_address, episode_dir, task_instruction, subtasks):
+         camera_address, episode_dir, task_instruction, subtasks,
+         include_neck=False, neck_pub_host=DEFAULT_NECK_PUB_HOST, neck_pub_port=DEFAULT_NECK_PUB_PORT,
+         neck_state_zmq=DEFAULT_NECK_STATE_ZMQ):
     print("[MAIN] Initializing components...")
 
     # 1. Initialize token publisher (ZMQ PUB, Protocol v4)
@@ -517,9 +629,18 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
     state_sub = RobotStateSubscriber(host=zmq_host, port=zmq_sub_port, topic=zmq_sub_topic)
     print(f"[MAIN] State subscriber connected to {zmq_host}:{zmq_sub_port}, topic='{zmq_sub_topic}'")
 
-    # 3. Initialize camera
-    camera = RSCamera(address=camera_address)
-    print(f"[MAIN] Camera connected to {camera_address}")
+    # 3. Initialize camera (neck-mounted ZED when --include-neck, else RealSense)
+    camera = ZedNeckCamera(address=camera_address) if include_neck else RSCamera(address=camera_address)
+    print(f"[MAIN] Camera connected to {camera_address} (include_neck={include_neck})")
+
+    # 3c. Initialize neck publisher/state-reader when --include-neck
+    neck_publisher = None
+    neck_state_reader = None
+    if include_neck:
+        neck_publisher = NeckPublisher(host=neck_pub_host, port=neck_pub_port)
+        neck_state_reader = NeckStateReader(neck_state_zmq)
+        print(f"[MAIN] Neck publisher bound on {neck_pub_host}:{neck_pub_port}, "
+              f"state reader connected to {neck_state_zmq}")
 
     # 3b. Initialize subgoal manager (subgoal images + per-stage subtask prompts)
     subgoal_manager = SubgoalManager(episode_dir=episode_dir, subtasks=subtasks)
@@ -552,6 +673,9 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
         token_publisher=token_publisher,
         subgoal_manager=subgoal_manager,
         task_instruction=task_instruction,
+        include_neck=include_neck,
+        neck_publisher=neck_publisher,
+        neck_state_reader=neck_state_reader,
     )
 
     # 7b. Start stdin listener: each Enter advances the subgoal index
@@ -605,6 +729,10 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
 
     state_sub.stop()
     token_publisher.stop()
+    if neck_publisher is not None:
+        neck_publisher.stop()
+    if neck_state_reader is not None:
+        neck_state_reader.stop()
     print("[MAIN] Shutdown complete.")
 
 
@@ -639,6 +767,17 @@ if __name__ == "__main__":
                              "task_description and the per-stage subtask prompts.")
     parser.add_argument("--instruction", type=str, default=None,
                         help="Override task instruction (else taken from prompts.json[task-key])")
+    parser.add_argument("--include-neck", action="store_true",
+                        help="Neck variant: states 45-dim (+neck2 appended), action 80-dim "
+                             "(hand14 + token64 + neck2 appended), init_prev_action 80-dim "
+                             "(+ first-frame neck2 appended). Also swaps RealSense for the "
+                             "neck-mounted ZED camera. Default (off) keeps the legacy 43/78-dim path.")
+    parser.add_argument("--neck-pub-host", type=str, default=DEFAULT_NECK_PUB_HOST,
+                        help=f"Neck PUB bind host (default: {DEFAULT_NECK_PUB_HOST})")
+    parser.add_argument("--neck-pub-port", type=int, default=DEFAULT_NECK_PUB_PORT,
+                        help=f"Neck PUB port (default: {DEFAULT_NECK_PUB_PORT})")
+    parser.add_argument("--neck-state-zmq", type=str, default=DEFAULT_NECK_STATE_ZMQ,
+                        help=f"Neck-state SUB address (default: {DEFAULT_NECK_STATE_ZMQ})")
 
     args = parser.parse_args()
 
@@ -672,4 +811,8 @@ if __name__ == "__main__":
         episode_dir=args.episode_dir,
         task_instruction=task_instruction,
         subtasks=subtasks,
+        include_neck=args.include_neck,
+        neck_pub_host=args.neck_pub_host,
+        neck_pub_port=args.neck_pub_port,
+        neck_state_zmq=args.neck_state_zmq,
     )
