@@ -95,6 +95,17 @@ def apply_initial_pose(pose, zmq_host, zmq_port, zmq_topic, neck_pub_host, neck_
     neck_pub.bind(f"tcp://{neck_pub_host}:{neck_pub_port}")
     print(f"[NeckPub] PUB bound to tcp://{neck_pub_host}:{neck_pub_port}")
 
+    # Warm up the neck PUB early: realsense_server's NeckMotor SUB is a
+    # persistent connect side with CONFLATE; it needs time to (re)connect and
+    # propagate its subscription to this freshly-bound PUB. Send the real neck
+    # value during the wait so the first delivered frame is already correct.
+    neck_warmup = json.dumps(
+        [float(pose['neck'][0]), float(pose['neck'][1])]
+    ).encode("utf-8")
+    for _ in range(20):
+        neck_pub.send(neck_warmup)
+        time.sleep(0.01)
+
     time.sleep(0.2)  # Wait for connections to establish
 
     # Send start command first
@@ -143,8 +154,11 @@ def apply_initial_pose(pose, zmq_host, zmq_port, zmq_topic, neck_pub_host, neck_
 
     print("\n[Done] Initial pose sent. The robot should now move to the starting position.")
 
-    # Send a few more times to ensure delivery
-    for _ in range(5):
+    # Keep streaming for ~1.5s so both the WBC planner SUB (5556) and the
+    # NeckMotor SUB (5570) reliably receive at least one frame even with the
+    # PUB/SUB slow-joiner delay. CONFLATE on the neck SUB means it just keeps
+    # the latest value, so re-sending is safe.
+    for _ in range(150):
         token_pub.send(msg)
         neck_pub.send(neck_msg)
         time.sleep(0.01)
