@@ -56,6 +56,25 @@ FSQ_STEP = 0.0625  # = 1/16
 # cap obs send rate; server control loop runs at 30Hz, sending faster just floods it
 OBS_SEND_INTERVAL = 1.0 / 30.0
 
+# Action/state layout (must match g1_sonic_client conventions):
+#   default:        states(43) = hand(14) + arm(14) + leg(15)
+#                    action(78) = hand_joints(14) + token(64)
+#   --include-neck:  states(45) = states(43) + neck(2) [appended at the end]
+#                    action(80) = hand_joints(14) + token(64) + neck(2) [neck is the last 2 dims]
+HAND_DIM = 14
+NECK_DIM = 2
+TOKEN_DIM = 64
+ACTION_DIM_DEFAULT = 78
+ACTION_DIM_NECK = 80
+
+# Neck publisher configuration (to G1 NeckMotor, matches pose_publisher.py wire format)
+DEFAULT_NECK_PUB_HOST = "*"
+DEFAULT_NECK_PUB_PORT = 5570
+
+# Neck state subscriber (ZMQ SUB <- realsense_server.py on the robot, port 5560)
+# JSON `[yaw_rad, pitch_rad]` of the Dynamixel present-position read each tick.
+DEFAULT_NECK_STATE_ZMQ = "tcp://192.168.123.164:5560"
+
 ENCODER_MODEL = "gear_sonic_deploy/policy/release/model_encoder.onnx"
 _MUJOCO_TO_ISAACLAB_DOF = np.array(
     [0, 6, 12, 1, 7, 13, 2, 8, 14, 3, 9, 15, 22, 4, 10, 16, 23, 5, 11, 17, 24, 18, 25, 19, 26, 20, 27, 21, 28],
@@ -228,8 +247,32 @@ class HlpController:
         self._running = False
         self._thread = None
         self._manual_override = None  # --no-hlp local takeover text
+        self._last_decision_log = None
 
     # ---- helpers ----
+    @staticmethod
+    def _short_text(value, limit=240):
+        text = "" if value is None else str(value).strip()
+        if len(text) <= limit:
+            return text
+        return text[:limit] + "...<truncated>"
+
+    def _print_decision_change(self, out):
+        decision = out.get("decision")
+        if decision not in ("switch", "done"):
+            return
+        stage = out.get("stage")
+        subtask = out.get("next_subtask") or out.get("instruction")
+        summary = (decision, stage, subtask)
+        if summary == self._last_decision_log:
+            return
+        self._last_decision_log = summary
+        if decision == "switch":
+            print(f"[HLP] switch subtask[{stage}]: {self._short_text(subtask)}")
+        else:
+            detail = f": {self._short_text(subtask)}" if subtask else ""
+            print(f"[HLP] done stage={stage}{detail} (VLA gated)")
+
     def _ego_rgb(self):
         frame = self._camera.get_frame()
         if frame is None:
@@ -295,8 +338,7 @@ class HlpController:
                 self._instruction = instr
             if stage is not None:
                 self._sg.goto(stage)            # goal image = absolute server stage (can't desync)
-        if decision == "switch":
-            print(f"[HLP] switch -> {instr!r}  goal_stage={self._sg.get_stage()[0]}")
+        self._print_decision_change(out)
 
     def _loop(self):
         print(f"[HLP] poller started (url={self._url}, period={self._period}s)")
@@ -324,6 +366,7 @@ class HlpController:
             return
         with self._lock:
             self._gen += 1
+            self._last_decision_log = None
         try:
             out = self._post("/prev", {})
         except Exception as e:
@@ -347,6 +390,7 @@ class HlpController:
             self._gen += 1                     # invalidate any in-flight poll before /reset
             self._instruction = None
             self._is_initial = True
+            self._last_decision_log = None
         try:
             out = self._post("/reset", {})
         except Exception as e:
@@ -364,6 +408,7 @@ class HlpController:
             return
         with self._lock:
             self._gen += 1
+            self._last_decision_log = None
         try:
             out = self._post("/override", {"subtask": text})
         except Exception as e:
@@ -382,6 +427,7 @@ class HlpController:
             return
         with self._lock:
             self._gen += 1
+            self._last_decision_log = None
         try:
             out = self._post("/resume", {})
         except Exception as e:
@@ -421,6 +467,28 @@ class RSCamera:
             self.context.term()
         except Exception:
             pass
+
+
+# ---------------- ZedNeckCamera ----------------
+class ZedNeckCamera:
+    """Neck-mounted ZED camera (--include-neck). Server reply is 4-part
+    multipart [ego_rgb, ego_stereo, left_wrist, right_wrist]; only slot 0 used."""
+
+    def __init__(self, address="tcp://192.168.123.164:5558"):
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REQ)
+        self.socket.connect(address)
+
+    def get_frame(self):
+        self.socket.send(b"get_frame")
+        parts = self.socket.recv_multipart()
+        while len(parts) < 4:
+            parts.append(b"")
+        ego_rgb_jpeg = parts[0]
+        if not ego_rgb_jpeg:
+            return None
+        arr = np.frombuffer(ego_rgb_jpeg, dtype=np.uint8)
+        return cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
 
 # ---------------- RobotStateSubscriber ----------------
@@ -502,6 +570,55 @@ class TokenPublisher:
         self._context.term()
 
 
+# ---------------- NeckStateReader / NeckPublisher ----------------
+class NeckStateReader:
+    """SUB to realsense_server.py's neck present-position stream (JSON [yaw, pitch])."""
+
+    def __init__(self, addr):
+        self._ctx = zmq.Context.instance()
+        self._sock = self._ctx.socket(zmq.SUB)
+        self._sock.setsockopt(zmq.CONFLATE, 1)
+        self._sock.setsockopt(zmq.SUBSCRIBE, b"")
+        self._sock.setsockopt(zmq.LINGER, 0)
+        self._sock.connect(addr)
+        self._latest = None
+
+    def get_latest(self):
+        try:
+            raw = self._sock.recv(flags=zmq.NOBLOCK)
+        except zmq.Again:
+            return self._latest
+        try:
+            msg = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return self._latest
+        if isinstance(msg, (list, tuple)) and len(msg) >= 2:
+            self._latest = [float(msg[0]), float(msg[1])]
+        return self._latest
+
+    def stop(self):
+        self._sock.close(linger=0)
+
+
+class NeckPublisher:
+    """PUB of [yaw, pitch] JSON for the G1 NeckMotor (matches pose_publisher.py wire format)."""
+
+    def __init__(self, host=DEFAULT_NECK_PUB_HOST, port=DEFAULT_NECK_PUB_PORT):
+        self._ctx = zmq.Context()
+        self._sock = self._ctx.socket(zmq.PUB)
+        self._sock.setsockopt(zmq.SNDHWM, 1)
+        self._sock.setsockopt(zmq.LINGER, 0)
+        self._sock.bind(f"tcp://{host}:{port}")
+
+    def publish(self, yaw, pitch):
+        msg = json.dumps([float(yaw), float(pitch)]).encode("utf-8")
+        self._sock.send(msg)
+
+    def stop(self):
+        self._sock.close(linger=0)
+        self._ctx.term()
+
+
 # ---------------- Global state ----------------
 running = threading.Event()
 running.set()
@@ -509,7 +626,8 @@ running.set()
 
 # ---------------- RTCWebSocketClient ----------------
 class RTCWebSocketClient:
-    def __init__(self, server_url, state_subscriber, camera, token_publisher, subgoal_manager, hlp):
+    def __init__(self, server_url, state_subscriber, camera, token_publisher, subgoal_manager, hlp,
+                 include_neck=False, neck_publisher=None, neck_state_reader=None):
         self.server_url = server_url
         self._running = True
         self._connected = threading.Event()
@@ -525,6 +643,9 @@ class RTCWebSocketClient:
         self._dbg_last_idx = -1
         self._wbc_started = False   # delay WBC start until the first HLP instruction (robot safety)
         self._last_gate_log = 0.0   # throttle the "still gated" log
+        self._include_neck = include_neck
+        self._neck_publisher = neck_publisher
+        self._neck_state_reader = neck_state_reader
         try:
             from encoder_client import EncoderClient
             self._encoder = EncoderClient(ENCODER_MODEL, mode=0)
@@ -536,11 +657,14 @@ class RTCWebSocketClient:
     def execute_action(self, action):
         if action.ndim > 1:
             action = action[0]
-        hand_joints = action[:14]
-        token_ori = action[14:78]
+        hand_joints = action[:HAND_DIM]
+        token_ori = action[HAND_DIM:HAND_DIM + TOKEN_DIM]
         token_qtz = fsq_quantize(token_ori)
         action_out = np.concatenate([token_qtz, hand_joints])  # [token(64), LH(7), RH(7)]
         self._token_publisher.publish_token(action_out)
+        if self._include_neck and self._neck_publisher is not None:
+            neck = action[HAND_DIM + TOKEN_DIM:HAND_DIM + TOKEN_DIM + NECK_DIM]
+            self._neck_publisher.publish(neck[0], neck[1])
 
     def _on_open(self, ws):
         print("[client] Connected!")
@@ -605,6 +729,15 @@ class RTCWebSocketClient:
                 states = np.concatenate(
                     (left_hand_states, right_hand_states, arm_states, leg_states), axis=0)  # (43,)
 
+                if self._include_neck:
+                    neck_latest = self._neck_state_reader.get_latest()
+                    neck_state = (
+                        np.asarray(neck_latest, dtype=np.float32)
+                        if neck_latest is not None
+                        else np.zeros(NECK_DIM, dtype=np.float32)
+                    )
+                    states = np.concatenate((states, neck_state), axis=0)  # (45,)
+
                 frame = self._camera.get_frame()
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.uint8)
                 # subgoal_frame was captured atomically with `instruction` above.
@@ -630,6 +763,9 @@ class RTCWebSocketClient:
                     enc_token = np.asarray(self._encoder.encode(jp, jv, bq), dtype=np.float32).reshape(64)
                     init_prev_action = np.concatenate(
                         [left_hand_states, right_hand_states, enc_token]).astype(np.float32)  # (78,)
+                    if self._include_neck:
+                        init_prev_action = np.concatenate(
+                            [init_prev_action, states[-NECK_DIM:]]).astype(np.float32)  # (80,)
                     state_obs["init_prev_action"] = init_prev_action
                     self._sent_init_prev = True
                     print(f"[init-prev] first-frame pseudo prev-action sent")
@@ -687,7 +823,9 @@ class RTCWebSocketClient:
 # ---------------- Main ----------------
 def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_topic,
          camera_address, episode_dir, task_instruction, subtasks,
-         hlp_url=None, hlp_period=0.7, hlp_timeout=30.0, no_hlp=False):
+         hlp_url=None, hlp_period=0.7, hlp_timeout=30.0, no_hlp=False,
+         include_neck=False, neck_pub_host=DEFAULT_NECK_PUB_HOST, neck_pub_port=DEFAULT_NECK_PUB_PORT,
+         neck_state_zmq=DEFAULT_NECK_STATE_ZMQ):
     print("[MAIN] Initializing components...")
 
     token_publisher = TokenPublisher(host="*", port=zmq_pub_port, topic=zmq_topic)
@@ -696,14 +834,30 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
     state_sub = RobotStateSubscriber(host=zmq_host, port=zmq_sub_port, topic=zmq_sub_topic)
     print(f"[MAIN] State subscriber connected to {zmq_host}:{zmq_sub_port}, topic='{zmq_sub_topic}'")
 
-    camera = RSCamera(address=camera_address)
-    print(f"[MAIN] Camera connected to {camera_address}")
+    # Camera: neck-mounted ZED when --include-neck, else RealSense.
+    camera = ZedNeckCamera(address=camera_address) if include_neck else RSCamera(address=camera_address)
+    print(f"[MAIN] Camera connected to {camera_address} (include_neck={include_neck})")
+
+    # Neck publisher/state-reader when --include-neck.
+    neck_publisher = None
+    neck_state_reader = None
+    if include_neck:
+        neck_publisher = NeckPublisher(host=neck_pub_host, port=neck_pub_port)
+        neck_state_reader = NeckStateReader(neck_state_zmq)
+        print(f"[MAIN] Neck publisher bound on {neck_pub_host}:{neck_pub_port}, "
+              f"state reader connected to {neck_state_zmq}")
 
     subgoal_manager = SubgoalManager(episode_dir=episode_dir, subtasks=subtasks)
     print(f"[MAIN] Task instruction: {task_instruction!r}")
 
     # HLP controller — its OWN camera so the ~1s poll never shares the control-loop REQ socket.
-    hlp_camera = RSCamera(address=camera_address) if not no_hlp else None
+    # The poll camera must match the control camera type (ZedNeckCamera when --include-neck).
+    if no_hlp:
+        hlp_camera = None
+    elif include_neck:
+        hlp_camera = ZedNeckCamera(address=camera_address)
+    else:
+        hlp_camera = RSCamera(address=camera_address)
     hlp = HlpController(hlp_url, hlp_camera, subgoal_manager, task_instruction,
                         period=hlp_period, timeout=hlp_timeout, no_hlp=no_hlp)
 
@@ -725,6 +879,8 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
     client = RTCWebSocketClient(
         server_url=server_url, state_subscriber=state_sub, camera=camera,
         token_publisher=token_publisher, subgoal_manager=subgoal_manager, hlp=hlp,
+        include_neck=include_neck, neck_publisher=neck_publisher,
+        neck_state_reader=neck_state_reader,
     )
 
     def stdin_listener():
@@ -786,6 +942,10 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
         print(f"[MAIN] Error sending stop command: {e}")
     state_sub.stop()
     token_publisher.stop()
+    if neck_publisher is not None:
+        neck_publisher.stop()
+    if neck_state_reader is not None:
+        neck_state_reader.stop()
     print("[MAIN] Shutdown complete.")
 
 
@@ -815,6 +975,17 @@ if __name__ == "__main__":
     parser.add_argument("--hlp-timeout", type=float, default=30.0)
     parser.add_argument("--no-hlp", action="store_true",
                         help="Debug: no HLP; use the local SubgoalManager subtask + :adv stepping")
+    parser.add_argument("--include-neck", action="store_true",
+                        help="Neck variant: states 45-dim (+neck2 appended), action 80-dim "
+                             "(hand14 + token64 + neck2 appended), init_prev_action 80-dim "
+                             "(+ first-frame neck2 appended). Also swaps RealSense for the "
+                             "neck-mounted ZED camera. Default (off) keeps the legacy 43/78-dim path.")
+    parser.add_argument("--neck-pub-host", type=str, default=DEFAULT_NECK_PUB_HOST,
+                        help=f"Neck PUB bind host (default: {DEFAULT_NECK_PUB_HOST})")
+    parser.add_argument("--neck-pub-port", type=int, default=DEFAULT_NECK_PUB_PORT,
+                        help=f"Neck PUB port (default: {DEFAULT_NECK_PUB_PORT})")
+    parser.add_argument("--neck-state-zmq", type=str, default=DEFAULT_NECK_STATE_ZMQ,
+                        help=f"Neck-state SUB address (default: {DEFAULT_NECK_STATE_ZMQ})")
 
     args = parser.parse_args()
 
@@ -832,4 +1003,6 @@ if __name__ == "__main__":
         camera_address=args.camera_address, episode_dir=episode_dir,
         task_instruction=task_instruction, subtasks=subtasks,
         hlp_url=hlp_url, hlp_period=args.hlp_period, hlp_timeout=args.hlp_timeout, no_hlp=args.no_hlp,
+        include_neck=args.include_neck, neck_pub_host=args.neck_pub_host,
+        neck_pub_port=args.neck_pub_port, neck_state_zmq=args.neck_state_zmq,
     )

@@ -42,8 +42,26 @@ FREQ_POLICY = 30  # Hz
 # Action layout: token(64) + hand_joints(14) = 78
 ACTION_DIM = 78
 
+# Internal action layout (after reorder in _get_policy_chunk):
+#   default:        token(64) + hand_joints(14)            = 78
+#   --include-neck: token(64) + hand_joints(14) + neck(2)  = 80
+# Server layout (repack.action_key order) is [hand(14) | token(64)] (| neck(2) appended).
+HAND_DIM = 14
+NECK_DIM = 2
+TOKEN_DIM = 64
+ACTION_DIM_DEFAULT = 78
+ACTION_DIM_NECK = 80
+
 # Encoder model path (for frozen token between chunks)
 ENCODER_MODEL = "gear_sonic_deploy/policy/release/model_encoder.onnx"
+
+# Neck publisher configuration (to G1 NeckMotor, matches pose_publisher.py wire format)
+DEFAULT_NECK_PUB_HOST = "*"
+DEFAULT_NECK_PUB_PORT = 5570
+
+# Neck state subscriber (ZMQ SUB <- realsense_server.py on the robot, port 5560)
+# JSON `[yaw_rad, pitch_rad]` of the Dynamixel present-position read each tick.
+DEFAULT_NECK_STATE_ZMQ = "tcp://192.168.123.164:5560"
 
 # Joint order conversion: WBC publishes in Mujoco order, encoder expects IsaacLab order
 _MUJOCO_TO_ISAACLAB_DOF = np.array(
@@ -187,6 +205,34 @@ class RSCamera:
             self.context.term()
 
 
+# ---------------- ZedNeckCamera ----------------
+class ZedNeckCamera:
+    """Neck-mounted ZED camera (--include-neck). Server reply is 4-part
+    multipart [ego_rgb, ego_stereo, left_wrist, right_wrist]; only slot 0 used."""
+
+    def __init__(self, address="tcp://192.168.123.164:5558"):
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REQ)
+        self.socket.connect(address)
+
+    def get_frame(self):
+        self.socket.send(b"get_frame")
+        parts = self.socket.recv_multipart()
+        while len(parts) < 4:
+            parts.append(b"")
+        ego_rgb_jpeg = parts[0]
+        if not ego_rgb_jpeg:
+            return None
+        arr = np.frombuffer(ego_rgb_jpeg, dtype=np.uint8)
+        return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+    def close(self):
+        if self.socket:
+            self.socket.close()
+        if self.context:
+            self.context.term()
+
+
 # ---------------- RobotStateSubscriber ----------------
 class RobotStateSubscriber:
     """Subscribe to robot state published by g1_deploy_onnx_ref on ZMQ PUB port."""
@@ -279,6 +325,55 @@ class TokenPublisher:
         self._context.term()
 
 
+# ---------------- NeckStateReader / NeckPublisher ----------------
+class NeckStateReader:
+    """SUB to realsense_server.py's neck present-position stream (JSON [yaw, pitch])."""
+
+    def __init__(self, addr):
+        self._ctx = zmq.Context.instance()
+        self._sock = self._ctx.socket(zmq.SUB)
+        self._sock.setsockopt(zmq.CONFLATE, 1)
+        self._sock.setsockopt(zmq.SUBSCRIBE, b"")
+        self._sock.setsockopt(zmq.LINGER, 0)
+        self._sock.connect(addr)
+        self._latest = None
+
+    def get_latest(self):
+        try:
+            raw = self._sock.recv(flags=zmq.NOBLOCK)
+        except zmq.Again:
+            return self._latest
+        try:
+            msg = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return self._latest
+        if isinstance(msg, (list, tuple)) and len(msg) >= 2:
+            self._latest = [float(msg[0]), float(msg[1])]
+        return self._latest
+
+    def stop(self):
+        self._sock.close(linger=0)
+
+
+class NeckPublisher:
+    """PUB of [yaw, pitch] JSON for the G1 NeckMotor (matches pose_publisher.py wire format)."""
+
+    def __init__(self, host=DEFAULT_NECK_PUB_HOST, port=DEFAULT_NECK_PUB_PORT):
+        self._ctx = zmq.Context()
+        self._sock = self._ctx.socket(zmq.PUB)
+        self._sock.setsockopt(zmq.SNDHWM, 1)
+        self._sock.setsockopt(zmq.LINGER, 0)
+        self._sock.bind(f"tcp://{host}:{port}")
+
+    def publish(self, yaw, pitch):
+        msg = json.dumps([float(yaw), float(pitch)]).encode("utf-8")
+        self._sock.send(msg)
+
+    def stop(self):
+        self._sock.close(linger=0)
+        self._ctx.term()
+
+
 # ---------------- Main Client ----------------
 class PsixSonicClient:
     """
@@ -291,7 +386,8 @@ class PsixSonicClient:
     """
 
     def __init__(self, server_url, state_subscriber, camera, token_publisher,
-                 hlp_controller, subgoal_manager, task_instruction, http_timeout=30.0):
+                 hlp_controller, subgoal_manager, task_instruction, http_timeout=30.0,
+                 include_neck=False, neck_publisher=None, neck_state_reader=None):
         self._server_url = server_url
         self._state_sub = state_subscriber
         self._camera = camera
@@ -301,6 +397,9 @@ class PsixSonicClient:
         self._task = task_instruction
         self._http_timeout = http_timeout
         self._dbg_last_idx = -1  # debug: track stage changes for image/idx dumps
+        self._include_neck = include_neck
+        self._neck_publisher = neck_publisher
+        self._neck_state_reader = neck_state_reader
 
         # Encoder for frozen token
         self._encoder = EncoderClient(ENCODER_MODEL, mode=0)
@@ -345,6 +444,15 @@ class PsixSonicClient:
             (left_hand_states, right_hand_states, arm_states, leg_states), axis=0
         )  # (43,)
 
+        if self._include_neck:
+            neck_latest = self._neck_state_reader.get_latest()
+            neck_state = (
+                np.asarray(neck_latest, dtype=np.float32)
+                if neck_latest is not None
+                else np.zeros(NECK_DIM, dtype=np.float32)
+            )
+            states = np.concatenate((states, neck_state), axis=0)  # (45,)
+
         frame = self._camera.get_frame()
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         frame = frame.astype(np.uint8)
@@ -376,15 +484,16 @@ class PsixSonicClient:
     def _get_policy_chunk(self):
         """
         POST current observation to the HTTP policy server and return a chunk of
-        actions, shape (N, 78), repacked to publish layout [token(64) | hand(14)]
+        actions, repacked to internal publish layout [token(64) | hand(14)]
+        (78-D default) or [token(64) | hand(14) | neck(2)] (80-D --include-neck),
         with FSQ quantization applied to the token. Returns None on failure.
 
         The PsiX server returns each action in repack.action_key order
-            [action.hand_joints(14) | action.body_token(64)]
-        i.e. hand_joints FIRST, then the 64-D sonic token. We reorder to
-        [token(64) | hand(14)] so the downstream publish loop + encoder-freeze
-        logic match psi_sonic_client exactly, and publish_token receives
-        [token(64) | left_hand(7) | right_hand(7)].
+            [hand_joints(14) | body_token(64)] (| neck(2) appended when --include-neck)
+        i.e. hand_joints FIRST, then the 64-D sonic token, then neck last. We
+        reorder to [token(64) | hand(14)] (| neck(2)) so the downstream publish
+        loop + encoder-freeze logic match psi_sonic_client, and publish_token
+        receives [token(64) | left_hand(7) | right_hand(7)].
         """
         payload = self._build_observation_payload()
         if payload is None:
@@ -408,16 +517,21 @@ class PsixSonicClient:
             print(f"[Inference] Response parse error: {e}")
             return None
 
-        if chunk.shape[-1] != ACTION_DIM:
-            print(f"[Inference] Unexpected action dim: {chunk.shape}, expected (*, {ACTION_DIM})")
+        expected_dim = ACTION_DIM_NECK if self._include_neck else ACTION_DIM_DEFAULT
+        if chunk.shape[-1] != expected_dim:
+            print(f"[Inference] Unexpected action dim: {chunk.shape}, expected (*, {expected_dim})")
             return None
 
-        # Server layout is [hand_joints(14) | body_token(64)] -> reorder to
-        # [token(64) | hand(14)] and FSQ-quantize the token part.
-        hand_joints = chunk[:, :14]    # [left_hand(7), right_hand(7)]
-        token_ori = chunk[:, 14:78]    # 64-D sonic body token
+        # Server layout is [hand_joints(14) | body_token(64)] (| neck(2)) -> reorder to
+        # [token(64) | hand(14)] (| neck(2)) and FSQ-quantize the token part.
+        hand_joints = chunk[:, :HAND_DIM]
+        token_ori = chunk[:, HAND_DIM:HAND_DIM + TOKEN_DIM]
         token_qtz = fsq_quantize(token_ori)
-        chunk_out = np.concatenate([token_qtz, hand_joints], axis=-1).astype(np.float32)
+        parts = [token_qtz, hand_joints]
+        if self._include_neck:
+            neck = chunk[:, HAND_DIM + TOKEN_DIM:HAND_DIM + TOKEN_DIM + NECK_DIM]
+            parts.append(neck)
+        chunk_out = np.concatenate(parts, axis=-1).astype(np.float32)
 
         print(f"[Inference] Chunk received: shape={chunk_out.shape}, "
               f"token range=[{token_ori.min():.4f},{token_ori.max():.4f}] → "
@@ -497,10 +611,28 @@ class PsixSonicClient:
         idx = 0
         frozen_action = None
         last_action = None
+        gate_announced = False
         print(f"[PublishLoop] First chunk: shape={chunk.shape}. Starting execution.")
 
         while self._running.is_set():
             t_start = time.perf_counter()
+
+            current_instruction = self._hlp.current_instruction()
+            if current_instruction is None:
+                # HLP done/restart gates the VLA. Do not finish a stale chunk from the old prompt.
+                if not gate_announced:
+                    print("[PublishLoop] HLP gated; dropping pending policy actions and holding last action.")
+                    gate_announced = True
+                if idx <= len(chunk):
+                    idx = len(chunk) + 1
+                if frozen_action is None and last_action is not None:
+                    frozen_action = last_action.copy()
+                self._sequence_done_event.set()
+                if frozen_action is None:
+                    time.sleep(dt)
+                    continue
+            else:
+                gate_announced = False
 
             if idx < len(chunk):
                 # ── EXECUTING ──────────────────────────────────────────────
@@ -522,9 +654,13 @@ class PsixSonicClient:
                         body_quat = np.tile(base_quat, (10, 1)).astype(np.float32)  # (10, 4)
 
                         enc_token = self._encoder.encode(joint_pos, joint_vel, body_quat)  # (64,)
-                        # internal layout: token(64) + hand_joints(14)
-                        # keep hand joints from last action, replace body token
-                        frozen_action = np.concatenate([enc_token, last_action[64:78]])
+                        # internal layout: token(64) + hand_joints(14) (+ neck(2) if --include-neck)
+                        # keep hand joints (and neck) from last action, replace body token
+                        if self._include_neck:
+                            frozen_action = np.concatenate(
+                                [enc_token, last_action[64:78], last_action[78:80]])
+                        else:
+                            frozen_action = np.concatenate([enc_token, last_action[64:78]])
                         print(f"[PublishLoop] Chunk done ({len(chunk)} tokens), "
                               f"encoder freeze token computed.")
                     else:
@@ -548,7 +684,14 @@ class PsixSonicClient:
                 else:
                     action = frozen_action
 
-            self._token_publisher.publish_token(action)
+            if action is None:
+                time.sleep(dt)
+                continue
+
+            self._token_publisher.publish_token(action[:HAND_DIM + TOKEN_DIM])
+            if self._include_neck and self._neck_publisher is not None:
+                neck = action[HAND_DIM + TOKEN_DIM:HAND_DIM + TOKEN_DIM + NECK_DIM]
+                self._neck_publisher.publish(neck[0], neck[1])
 
             # Maintain 30 Hz
             elapsed = time.perf_counter() - t_start
@@ -644,6 +787,10 @@ class PsixSonicClient:
             pass
         self._state_sub.stop()
         self._token_publisher.stop()
+        if self._neck_publisher is not None:
+            self._neck_publisher.stop()
+        if self._neck_state_reader is not None:
+            self._neck_state_reader.stop()
 
         print("[PsixSonicClient] Stopped.")
 
@@ -651,6 +798,8 @@ class PsixSonicClient:
 # ---------------- Main ----------------
 def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_topic,
          camera_address, episode_dir, task_instruction, subtasks,
+         include_neck=False, neck_pub_host=DEFAULT_NECK_PUB_HOST, neck_pub_port=DEFAULT_NECK_PUB_PORT,
+         neck_state_zmq=DEFAULT_NECK_STATE_ZMQ,
          hlp_url=None, hlp_timeout=30.0, hlp_period=0.7):
     print("[MAIN] Initializing components...")
 
@@ -662,9 +811,18 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
     state_sub = RobotStateSubscriber(host=zmq_host, port=zmq_sub_port, topic=zmq_sub_topic)
     print(f"[MAIN] State subscriber connected to {zmq_host}:{zmq_sub_port}, topic='{zmq_sub_topic}'")
 
-    # 3. Initialize camera
-    camera = RSCamera(address=camera_address)
-    print(f"[MAIN] Camera connected to {camera_address}")
+    # 3. Initialize camera (neck-mounted ZED when --include-neck, else RealSense)
+    camera = ZedNeckCamera(address=camera_address) if include_neck else RSCamera(address=camera_address)
+    print(f"[MAIN] Camera connected to {camera_address} (include_neck={include_neck})")
+
+    # 3c. Initialize neck publisher/state-reader when --include-neck
+    neck_publisher = None
+    neck_state_reader = None
+    if include_neck:
+        neck_publisher = NeckPublisher(host=neck_pub_host, port=neck_pub_port)
+        neck_state_reader = NeckStateReader(neck_state_zmq)
+        print(f"[MAIN] Neck publisher bound on {neck_pub_host}:{neck_pub_port}, "
+              f"state reader connected to {neck_state_zmq}")
 
     # 3b. Initialize subgoal manager (subgoal images + per-stage subtask prompts)
     subgoal_manager = SubgoalManager(episode_dir=episode_dir, subtasks=subtasks)
@@ -688,7 +846,11 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
 
     # 5b. Second camera for the HLP poller (own REQ socket on the same camera server), so it
     # never shares the control-loop camera socket. The shared HlpController polls with it.
-    hlp_camera = RSCamera(address=camera_address) if hlp_url else None
+    # Match the control-loop camera type so the HLP sees the same ego stream (--include-neck).
+    if hlp_url:
+        hlp_camera = ZedNeckCamera(address=camera_address) if include_neck else RSCamera(address=camera_address)
+    else:
+        hlp_camera = None
 
     # 5c. Server-owns-memory HLP controller (same class the RTC client + mocks use). It owns the
     # subtask/memory + goal stage; the client just reads instruction_and_goal().
@@ -706,6 +868,9 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
         hlp_controller=hlp,
         subgoal_manager=subgoal_manager,
         task_instruction=task_instruction,
+        include_neck=include_neck,
+        neck_publisher=neck_publisher,
+        neck_state_reader=neck_state_reader,
     )
 
     if not client.start():
@@ -775,6 +940,16 @@ if __name__ == "__main__":
                              "per-stage subtask prompts.")
     parser.add_argument("--instruction", type=str, default=None,
                         help="Override task instruction (else taken from prompts.json[task-key])")
+    parser.add_argument("--include-neck", action="store_true",
+                        help="Neck variant: states 45-dim (+neck2 appended), action chunk 80-dim "
+                             "(hand14 + token64 + neck2 appended). Also swaps RealSense for the "
+                             "neck-mounted ZED camera. Default (off) keeps the legacy 43/78-dim path.")
+    parser.add_argument("--neck-pub-host", type=str, default=DEFAULT_NECK_PUB_HOST,
+                        help=f"Neck PUB bind host (default: {DEFAULT_NECK_PUB_HOST})")
+    parser.add_argument("--neck-pub-port", type=int, default=DEFAULT_NECK_PUB_PORT,
+                        help=f"Neck PUB port (default: {DEFAULT_NECK_PUB_PORT})")
+    parser.add_argument("--neck-state-zmq", type=str, default=DEFAULT_NECK_STATE_ZMQ,
+                        help=f"Neck-state SUB address (default: {DEFAULT_NECK_STATE_ZMQ})")
     parser.add_argument("--hlp-host", type=str, default="localhost",
                         help="HLP server host")
     parser.add_argument("--hlp-port", type=int, default=8015,
@@ -820,6 +995,10 @@ if __name__ == "__main__":
         episode_dir=args.episode_dir,
         task_instruction=task_instruction,
         subtasks=subtasks,
+        include_neck=args.include_neck,
+        neck_pub_host=args.neck_pub_host,
+        neck_pub_port=args.neck_pub_port,
+        neck_state_zmq=args.neck_state_zmq,
         hlp_url=hlp_url,
         hlp_timeout=args.hlp_timeout,
         hlp_period=args.hlp_period,
