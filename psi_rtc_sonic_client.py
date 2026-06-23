@@ -302,8 +302,8 @@ class RTCWebSocketClient:
         if action.ndim > 1:
             action = action[0]
 
-        hand_joints = action[:HAND_DIM]
-        token_ori = action[HAND_DIM:HAND_DIM + TOKEN_DIM]
+        hand_joints = action[TOKEN_DIM:TOKEN_DIM+HAND_DIM]
+        token_ori = action[:TOKEN_DIM]
         token_qtz = fsq_quantize(token_ori)
 
         action_out = np.concatenate([token_qtz, hand_joints])
@@ -386,7 +386,7 @@ class RTCWebSocketClient:
                 frame = frame.astype(np.uint8)
 
                 # Build observation payload
-                img_obs = {"video.egocentric": frame}
+                img_obs = {"observation.images.egocentric": frame}
                 state_obs = {"states": states}
 
                 payload = {

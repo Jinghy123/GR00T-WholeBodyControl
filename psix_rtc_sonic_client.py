@@ -757,10 +757,10 @@ if __name__ == "__main__":
     parser.add_argument("--camera-address", type=str, default="tcp://192.168.123.164:5558",
                         help="Camera ZMQ address")
     parser.add_argument("--episode-dir", type=str,
-                        default="/home/xiawei/data/multi-task/pick_place_1/episode_0",
+                        default="/home/songlin/hfm/data/real_sonic_g1/pick_place_1/episode_0",
                         help="Episode folder containing color/ and color_subgoal/ for subgoal images")
     parser.add_argument("--prompts-json", type=str,
-                        default="/home/xiawei/data/multi-task/prompts.json",
+                        default="/home/songlin/hfm/data/real_sonic_g1/prompts.json",
                         help="JSON mapping task-key -> {task_description, subtasks[]}")
     parser.add_argument("--task-key", type=str, default="pick_place_1",
                         help="Key into prompts.json (e.g. pick_place_1); selects the "

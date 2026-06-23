@@ -13,7 +13,7 @@ import time
 import numpy as np
 import zmq
 
-_GROOT_ROOT = os.path.expanduser("/mnt/data/weiduo/heng/GR00T-WholeBodyControl")
+_GROOT_ROOT = os.path.expanduser("/home/songlin/Projects/hongyi-wbc")
 sys.path.insert(0, _GROOT_ROOT)
 
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
@@ -173,7 +173,7 @@ def apply_initial_pose(pose, zmq_host, zmq_port, zmq_topic, neck_pub_host, neck_
 def main():
     parser = argparse.ArgumentParser(description="Apply initial pose from data.json")
     parser.add_argument("--data", type=str,
-                       default="/mnt/data/weiduo/heng/GR00T-WholeBodyControl/data.json",
+                       default="/home/songlin/Projects/hongyi-wbc/data.json",
                        help="Path to data.json file")
     parser.add_argument("--zmq-host", type=str, default=DEFAULT_ZMQ_HOST,
                        help="ZMQ publisher bind host (default: *)")
