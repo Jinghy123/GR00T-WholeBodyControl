@@ -18,6 +18,9 @@ from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
 )
 from encoder_client import EncoderClient
 
+# Server-owns-memory HLP control, shared with the RTC client + the mock clients (single impl).
+from psix_rtc_sonic_client_wHLP import HlpController
+
 # json_numpy.patch() monkey-patches stdlib json so np.ndarray round-trips over HTTP.
 # The PsiX non-RTC server (psix_serve_sonic.py) (de)serializes with helpers.py's
 # base64 "__numpy__" scheme, which is byte-identical to json_numpy — so requests'
@@ -92,8 +95,8 @@ class SubgoalManager:
         self._lock = threading.Lock()
 
         # Per-stage subtask prompts, parallel to self.paths — DEBUG/LOG ONLY (printed below
-        # and in advance()/get_stage()). They are NOT sent to the server: the VLA's subtask
-        # comes from the client's inline state (manual stdin / HLP) via _make_instruction().
+        # and in advance()/get_stage()). They are NOT sent to the server: the subtask + goal
+        # stage are driven by the HLP server (server-owns-memory) via HlpController.
         # Missing entries -> "".
         subtasks = list(subtasks or [])
         self._subtasks = [
@@ -135,6 +138,11 @@ class SubgoalManager:
         with self._lock:
             return self._idx, self.paths[self._idx], self._subtasks[self._idx]
 
+    def get_subtask(self):
+        """Current stage's subtask string — used by HlpController._local_instruction (--no-hlp)."""
+        with self._lock:
+            return self._subtasks[self._idx]
+
     def advance(self):
         with self._lock:
             if self._idx < len(self._images) - 1:
@@ -143,6 +151,19 @@ class SubgoalManager:
                       f"| subtask: {self._subtasks[self._idx]!r}")
             else:
                 print(f"[Subgoal] Already at last subgoal (index {self._idx})")
+
+    def goto(self, idx):
+        """Jump to an absolute stage (clamped) — the HLP server drives this via its `stage`."""
+        with self._lock:
+            self._idx = max(0, min(int(idx), len(self._images) - 1))
+
+    def retreat(self):
+        with self._lock:
+            self._idx = max(0, self._idx - 1)
+
+    def reset(self):
+        with self._lock:
+            self._idx = 0
 
 
 # ---------------- RSCamera ----------------
@@ -270,47 +291,16 @@ class PsixSonicClient:
     """
 
     def __init__(self, server_url, state_subscriber, camera, token_publisher,
-                 subgoal_manager, task_instruction, http_timeout=30.0,
-                 hlp_url=None, hlp_timeout=30.0, hlp_camera=None, hlp_period=0.7,
-                 hlp_auto_threshold=1.5):
+                 hlp_controller, subgoal_manager, task_instruction, http_timeout=30.0):
         self._server_url = server_url
         self._state_sub = state_subscriber
         self._camera = camera
         self._token_publisher = token_publisher
-        self._subgoal_manager = subgoal_manager
+        self._hlp = hlp_controller          # server-owns-memory HLP (shared HlpController)
+        self._subgoal_manager = subgoal_manager  # kept for debug get_stage(); HlpController drives goto()
         self._task = task_instruction
         self._http_timeout = http_timeout
         self._dbg_last_idx = -1  # debug: track stage changes for image/idx dumps
-
-        # ---- Inline subtask state (self-contained; no external subtask driver) ----
-        # The VLA's subtask comes from manual stdin / HLP instead of the fixed per-stage list.
-        # Start with NO subtask + EMPTY memory: the FIRST HLP call (is_initial=True, empty
-        # memory) PREDICTS the first subtask, which then enters memory; until that first reply
-        # (or any manual input) the VLA gets task-only conditioning. We do NOT seed the canned
-        # stage-0 subtask, because that would (a) feed the HLP a non-empty memory at the
-        # initial frame (OOD vs training, where the initial prediction sees Memory:none) and
-        # (b) make the initial "switch to <first>" a no-op (next==current).
-        self._subtask_lock = threading.Lock()
-        self._subtask = ""
-        self._subtask_source = "init"
-        self._manual_override = False
-        self._subtask_memory = []  # list of (text, started_at), oldest-first
-
-        # ---- HLP polling (separate HTTP process; None => disabled, e.g. --no-hlp) ----
-        self._hlp_url = hlp_url
-        self._hlp_timeout = hlp_timeout
-        self._hlp_camera = hlp_camera
-        self._hlp_period = hlp_period
-        self._hlp_session = requests.Session()  # independent of the VLA self._session
-        self._hlp_first = True                  # is_initial until first successful HLP reply
-        self._hlp_thread = None
-        # Predicted-time auto-transition: when HLP says 'continue' with a predicted
-        # seconds_to_subgoal < this threshold, switch to the (already-predicted) next subtask at
-        # the predicted time instead of waiting for a future 'switch' reply — hides the ~1s HLP
-        # latency for imminent transitions. 0 disables it.
-        self._auto_threshold = hlp_auto_threshold
-        self._pending_transition = None         # (next_subtask, fire_at, from_subtask), under _subtask_lock
-        self._transition_thread = None
 
         # Encoder for frozen token
         self._encoder = EncoderClient(ENCODER_MODEL, mode=0)
@@ -331,13 +321,16 @@ class PsixSonicClient:
     def _build_observation_payload(self):
         """Capture current state + ego/goal frames, build PsiX payload dict.
 
-        Image keys MUST match the server's repack:
-          ego image  -> repack.image_keys[0]  == "video.egocentric"
-          goal image -> repack.subgoal_key[0] == "subgoal.egocentric"
-        State is a SINGLE frame (the server reshapes (D,) -> (1, 1, D)).
-        Instruction is a dict {"task", "subtask"}; the server assembles
-        "Task: <task>. Subtask: <subtask>" (subtask dropped when empty).
+        Server-owns-memory: the instruction is the HLP server's VERBATIM string and the goal
+        image follows the server's absolute `stage` — both come from the HlpController. Returns
+        None while gated (HLP hasn't established a subtask yet, or the episode is done).
+        Image keys match the server's repack: video.egocentric / subgoal.egocentric.
+        State is a SINGLE (43,) frame (the server reshapes (D,) -> (1, 1, D)).
         """
+        instr, subgoal_frame = self._hlp.instruction_and_goal()
+        if instr is None:
+            return None  # gated — don't send to the VLA until the HLP gives an instruction
+
         state = self._state_sub.get_state()
         assert state is not None, "Robot state not available"
 
@@ -356,16 +349,14 @@ class PsixSonicClient:
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         frame = frame.astype(np.uint8)
 
-        subgoal_frame = self._subgoal_manager.get()
-
         # --- DEBUG: dump ego + goal to /tmp whenever the subgoal stage changes ---
-        stage_idx, stage_path, stage_subtask = self._subgoal_manager.get_stage()
+        stage_idx, stage_path, _ = self._subgoal_manager.get_stage()
         if stage_idx != self._dbg_last_idx:
             self._dbg_last_idx = stage_idx
             cv2.imwrite("/tmp/sent_ego.jpg", cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
             cv2.imwrite("/tmp/sent_goal.jpg", cv2.cvtColor(subgoal_frame, cv2.COLOR_RGB2BGR))
             print(f"[DEBUG] stage idx={stage_idx} | goal={os.path.basename(stage_path)} "
-                  f"| subtask={stage_subtask!r} | dumped /tmp/sent_ego.jpg /tmp/sent_goal.jpg")
+                  f"| instruction={instr!r} | dumped /tmp/sent_ego.jpg /tmp/sent_goal.jpg")
 
         payload = {
             "image": {
@@ -375,9 +366,7 @@ class PsixSonicClient:
             "state": {"states": states},  # single (43,) frame
             "gt_action": None,
             "dataset_name": None,
-            # subtask now from the inline state (manual stdin now; HLP later); the goal
-            # image above is still the fixed SubgoalManager sequence.
-            "instruction": self._make_instruction(),
+            "instruction": instr,  # verbatim HLP string (server-owns-memory)
             "history": None,
             "condition": None,
             "timestamp": None,
@@ -398,6 +387,8 @@ class PsixSonicClient:
         [token(64) | left_hand(7) | right_hand(7)].
         """
         payload = self._build_observation_payload()
+        if payload is None:
+            return None  # gated by HLP — no instruction yet
 
         try:
             resp = self._session.post(self._server_url, json=payload,
@@ -446,20 +437,25 @@ class PsixSonicClient:
 
         while self._running.is_set():
             self._sequence_done_event.wait()
+            if not self._running.is_set():
+                break
             try:
                 t0 = time.time()
                 chunk = self._get_policy_chunk()
                 dt = time.time() - t0
-                if chunk is None:
-                    raise RuntimeError("Failed to get chunk")
-                print(f"[Inference] Policy returned chunk shape={chunk.shape} in {dt:.2f}s")
-                with self._chunk_lock:
-                    self._pending_chunk = chunk
-                self._sequence_done_event.clear()
-            except RuntimeError as e:
-                print(f"[Inference] {e}")
-                self._running.clear()
-                return
+            except Exception as e:
+                print(f"[Inference] error (will retry): {e}")
+                chunk = None
+            if chunk is None:
+                # Gated (HLP gave no instruction — 'done' / clean restart) or a transient failure:
+                # DON'T tear down the client. Leave the done-event set so we retry; the publish loop
+                # holds the frozen token meanwhile. (The RTC client pauses the same way.)
+                time.sleep(0.1)
+                continue
+            print(f"[Inference] Policy returned chunk shape={chunk.shape} in {dt:.2f}s")
+            with self._chunk_lock:
+                self._pending_chunk = chunk
+            self._sequence_done_event.clear()
 
     def _publish_loop(self):
         """
@@ -472,6 +468,13 @@ class PsixSonicClient:
         Internal action layout is [token(64) | hand(14)] (set by _get_policy_chunk).
         """
         dt = 1.0 / FREQ_POLICY
+
+        # Server-owns-memory: gate until the HLP establishes the first subtask (subtask 0), like
+        # the RTC client — don't start WBC or request a chunk until there's an instruction.
+        while self._running.is_set() and self._hlp.current_instruction() is None:
+            time.sleep(0.05)
+        if not self._running.is_set():
+            return
 
         # Send start command and request first chunk
         self._token_publisher.send_command(start=True, stop=False, planner=True)
@@ -553,202 +556,16 @@ class PsixSonicClient:
             if sleep_time > 0:
                 time.sleep(sleep_time)
 
-    # ---------- Subtask state (inline; self-contained) ----------
-    def _get_subtask(self):
-        with self._subtask_lock:
-            return self._subtask
 
-    def _make_instruction(self):
-        """{"task","subtask"} for the payload; server assembles 'Task: X. Subtask: Y'."""
-        with self._subtask_lock:
-            return {"task": self._task, "subtask": self._subtask}
-
-    def _render_memory(self):
-        """Most-recent-first [{text, seconds_ago}] for the HLP prompt's Memory block."""
-        with self._subtask_lock:
-            now = time.time()  # inside the lock so no entry has started_at > now (neg seconds)
-            return [{"text": t, "seconds_ago": now - ts}
-                    for t, ts in reversed(self._subtask_memory)]
-
-    def _set_subtask_locked(self, text, source):
-        # caller holds _subtask_lock. Push memory on a real change to a real subtask
-        # (skip "" task-only and the "__done__" terminal sentinel).
-        changed = text != self._subtask
-        self._subtask = text
-        self._subtask_source = source
-        if changed and text and text != "__done__":
-            self._subtask_memory.append((text, time.time()))
-
-    def _set_manual_subtask(self, text):
-        with self._subtask_lock:
-            self._manual_override = True
-            self._set_subtask_locked(text, "manual")
-
-    def _release_to_hlp(self):
-        with self._subtask_lock:
-            self._manual_override = False
-
-    def _apply_hlp(self, decision, next_subtask):
-        """Apply an HLP decision unless a manual override is sticky.
-        switch->next_subtask, done->__done__, continue/unknown->keep.
-        Returns True iff this call actually switched the subtask to a NEW value — the caller
-        gates the goal-image advance on this atomic result (not a before/after compare), which
-        avoids a TOCTOU race where stdin changes the subtask between the two reads."""
-        with self._subtask_lock:
-            if self._manual_override:
-                return False  # manual wins
-            if decision == "switch" and next_subtask:
-                changed = next_subtask != self._subtask
-                self._set_subtask_locked(next_subtask, "hlp")
-                return changed
-            elif decision == "done":
-                self._set_subtask_locked("__done__", "hlp")
-            return False
-
-    def _hlp_switch_to(self, next_subtask):
-        """Switch to next_subtask (HLP source; respects manual override) and advance the fixed
-        goal image in lockstep iff it actually switched. Shared by the HLP 'switch' decision and
-        the predicted-time auto-transition. Returns True iff it switched."""
-        applied = self._apply_hlp("switch", next_subtask)
-        if applied:
-            idx, _, _ = self._subgoal_manager.get_stage()
-            if idx >= len(self._subgoal_manager.paths) - 1:
-                print("[HLP] switch but goal image already at last stage; image/subtask decoupled")
-            self._subgoal_manager.advance()
-        return applied
-
-    def _maybe_schedule_transition(self, next_subtask, secs, was_initial):
-        """On an HLP 'continue': schedule an auto-transition to next_subtask at now+secs iff it
-        is imminent (0<=secs<threshold), non-initial, not manual, and a real change. Records the
-        subtask we transition FROM so a STALE schedule can't overwrite a newer switch (the timer
-        only fires while the current subtask is still that one). Returns True iff scheduled."""
-        with self._subtask_lock:
-            if (not was_initial) and self._auto_threshold > 0 and next_subtask \
-                    and isinstance(secs, (int, float)) and 0 <= float(secs) < self._auto_threshold \
-                    and not self._manual_override and next_subtask != self._subtask:
-                self._pending_transition = (next_subtask, time.time() + float(secs), self._subtask)
-                return True
-            self._pending_transition = None
-            return False
-
-    def _clear_pending_transition(self):
-        with self._subtask_lock:
-            self._pending_transition = None
-
-    def _transition_timer(self):
-        """Fire a due pending auto-transition (~0.1 s resolution) so an imminent switch happens at
-        the HLP-predicted time instead of waiting for the next ~1 s poll. Fires ONLY if the current
-        subtask is still the one it was scheduled FROM — otherwise a newer HLP 'switch' superseded
-        it (stale) and we keep the latest. The staleness check + subtask update are atomic under
-        the lock; the goal-image advance follows. Also skipped under manual override."""
-        print("[HLP] transition timer started")
-        while self._running.is_set():
-            fire = None
-            with self._subtask_lock:
-                pend = self._pending_transition
-                if pend is not None and time.time() >= pend[1]:
-                    next_sub, _, from_sub = pend
-                    if (not self._manual_override) and self._subtask == from_sub \
-                            and next_sub and next_sub != self._subtask:
-                        self._set_subtask_locked(next_sub, "hlp")
-                        fire = next_sub
-                    self._pending_transition = None   # consume (whether fired or stale)
-            if fire is not None:
-                idx, _, _ = self._subgoal_manager.get_stage()
-                if idx >= len(self._subgoal_manager.paths) - 1:
-                    print("[HLP] auto-transition but goal image already at last stage; decoupled")
-                self._subgoal_manager.advance()
-                print(f"[HLP] auto-transition at predicted time -> {fire!r}")
-            time.sleep(0.1)
-        print("[HLP] transition timer stopped")
-
-    # ---------- HLP poller (separate process; never blocks the 30 Hz loop) ----------
-    def _hlp_worker(self):
-        """Poll the HLP server (default 0.7 s; --hlp-period 0 = as fast as possible) and
-        apply its decision. Own thread + HTTP session + camera, so the slow 2B model (in
-        the HLP server process) never stalls the publish loop. Failures are logged and
-        ignored (control keeps running)."""
-        print(f"[HLP] worker started (url={self._hlp_url}, period={self._hlp_period}s)")
-        while self._running.is_set():
-            try:
-                frame = self._hlp_camera.get_frame()
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.uint8)
-                with self._subtask_lock:
-                    task = self._task          # snapshot under lock (stdin :task writes it)
-                mem = self._render_memory()     # takes the lock internally
-                resp = self._hlp_session.post(self._hlp_url, timeout=self._hlp_timeout, json={
-                    "ego_image": frame,
-                    "task": task,
-                    "memory_items": mem,
-                    "is_initial": self._hlp_first,
-                })
-                resp.raise_for_status()
-                out = resp.json()
-            except Exception as e:
-                print(f"[HLP] request failed (ignored): {e}")
-                time.sleep(self._hlp_period)
-                continue
-            # The HLP server returns HTTP 200 even on failure ({"error": ...}, like the VLA
-            # server). Treat any reply without a valid decision (error / unparseable / truncated
-            # JSON -> decision None) as a no-op: keep the current subtask AND keep is_initial
-            # True so the next call still flags the episode start.
-            decision = out.get("decision")
-            if "error" in out or decision not in ("continue", "switch", "done"):
-                print(f"[HLP] no valid decision (ignored): {out.get('error') or out.get('raw_text') or out}")
-                time.sleep(self._hlp_period)
-                continue
-            was_initial = self._hlp_first
-            self._hlp_first = False  # only after a VALID reply
-            next_subtask = out.get("next_subtask")
-            secs = out.get("seconds_to_subgoal")
-            if decision == "switch":
-                # Initial 'switch' only ESTABLISHES the first subtask (goal already at stage 0);
-                # a later switch advances the goal image in lockstep (_hlp_switch_to).
-                if was_initial:
-                    self._apply_hlp("switch", next_subtask)
-                else:
-                    self._hlp_switch_to(next_subtask)
-                self._clear_pending_transition()  # a real switch supersedes any pending schedule
-            elif decision == "done":
-                self._apply_hlp("done", next_subtask)  # passthrough -> __done__
-                self._clear_pending_transition()
-            else:  # 'continue': maybe schedule an imminent predicted-time auto-transition.
-                self._maybe_schedule_transition(next_subtask, secs, was_initial)
-            print(f"[HLP] decision={decision!r} subtask={self._get_subtask()!r} secs={secs}")
-            time.sleep(self._hlp_period)
-        print("[HLP] worker stopped")
-
-    # ---------- stdin manual control ----------
-    def _print_subtask_state(self):
-        with self._subtask_lock:
-            st, src, mo = self._subtask, self._subtask_source, self._manual_override
-        idx, _, _ = self._subgoal_manager.get_stage()
-        print(f"[stdin] subtask={st!r} source={src} manual={mo} | goal_stage={idx}")
-
-    def _goto_goal(self, rest):
-        try:
-            n = int(rest)
-        except (TypeError, ValueError):
-            print("[stdin] usage: :goal <index>")
-            return
-        while True:
-            idx, _, _ = self._subgoal_manager.get_stage()
-            if idx >= n or idx >= len(self._subgoal_manager.paths) - 1:
-                break
-            self._subgoal_manager.advance()
-
+    # ---------- stdin manual control (server-owns-memory; delegates to HlpController) ----------
     def _stdin_loop(self):
-        """Manual subtask control + goal-image stepping over stdin (blocks on readline):
-          <text>     set current subtask (manual, sticky — HLP won't override)
-          :adv       advance the fixed goal image one stage (old Enter behavior)
-          :goal <n>  advance the goal image up to stage n
-          :hlp       release manual override (hand subtask back to HLP)
-          :task <t>  change the task string
-          :clear     subtask = "" (task-only)    |   :done   subtask = "__done__"
-          :show      print state                 |   <blank> reprint state
+        """Subtask control over stdin — all routed to the HLP server (server owns memory):
+          :prev      previous subtask        :restart   clean restart (reset episode)
+          :resume    release takeover        :show      print state      :quit
+          :adv       advance goal image (--no-hlp manual mode)
+          <text>     human takeover (sticky)
         """
-        print("[stdin] type a subtask to steer; :adv goal+1, :hlp release, :show, :task <t>")
-        self._print_subtask_state()
+        print("[stdin] :prev | :restart | :resume | <text> takeover | :show | :quit")
         while self._running.is_set():
             try:
                 line = sys.stdin.readline()
@@ -756,36 +573,28 @@ class PsixSonicClient:
                 break
             if not line:  # EOF
                 break
-            cmd = line.rstrip("\n")
+            cmd = line.strip()
             if cmd == "":
-                self._print_subtask_state()
+                continue
+            if cmd == ":quit":
+                self._running.clear()
+                break
+            elif cmd == ":prev":
+                self._hlp.prev()
+            elif cmd == ":restart":
+                self._hlp.restart()
+            elif cmd == ":resume":
+                self._hlp.resume()
+            elif cmd == ":show":
+                instr, _ = self._hlp.instruction_and_goal()
+                idx, _, _ = self._subgoal_manager.get_stage()
+                print(f"[stdin] instruction={instr!r} | goal_stage={idx}")
+            elif cmd == ":adv":
+                self._hlp.adv_local()  # manual goal-image advance (for --no-hlp; HLP re-syncs via stage)
             elif cmd.startswith(":"):
-                head, _, rest = cmd.partition(" ")
-                rest = rest.strip()
-                if head == ":adv":
-                    self._subgoal_manager.advance()
-                elif head == ":goal":
-                    self._goto_goal(rest)
-                elif head == ":hlp":
-                    self._release_to_hlp()
-                    print("[stdin] released manual override -> HLP controls subtask")
-                elif head == ":task":
-                    with self._subtask_lock:
-                        self._task = rest
-                    print(f"[stdin] task = {rest!r}")
-                elif head == ":clear":
-                    self._set_manual_subtask("")
-                    print("[stdin] subtask cleared (task-only)")
-                elif head == ":done":
-                    self._set_manual_subtask("__done__")
-                    print("[stdin] subtask = __done__")
-                elif head == ":show":
-                    self._print_subtask_state()
-                else:
-                    print(f"[stdin] unknown command {head!r}")
+                print(f"[stdin] unknown command {cmd!r}")
             else:
-                self._set_manual_subtask(cmd)
-                print(f"[stdin] subtask = {cmd!r} (manual, sticky)")
+                self._hlp.takeover(cmd)
         print("[stdin] loop stopped")
 
     # ---------- Lifecycle ----------
@@ -797,18 +606,11 @@ class PsixSonicClient:
         self._inference_thread = threading.Thread(target=self._inference_worker, daemon=True)
         self._inference_thread.start()
 
-        # Start publish loop
+        # Start publish loop (gates on the HLP instruction internally)
         self._publish_thread = threading.Thread(target=self._publish_loop, daemon=True)
         self._publish_thread.start()
 
-        # Start HLP poller (only if an HLP url was given; --no-hlp => disabled).
-        if self._hlp_url:
-            self._hlp_thread = threading.Thread(target=self._hlp_worker, daemon=True)
-            self._hlp_thread.start()
-            # Predicted-time auto-transition timer (fires imminent transitions on schedule).
-            if self._auto_threshold > 0:
-                self._transition_thread = threading.Thread(target=self._transition_timer, daemon=True)
-                self._transition_thread.start()
+        # The HLP poll loop lives in the shared HlpController (started by main()).
 
         print("[PsixSonicClient] Started successfully!")
         return True
@@ -816,6 +618,12 @@ class PsixSonicClient:
     def stop(self):
         print("[PsixSonicClient] Stopping...")
         self._running.clear()
+
+        # Stop the shared HLP poll loop
+        try:
+            self._hlp.stop()
+        except Exception:
+            pass
 
         # Send stop command to WBC
         try:
@@ -834,15 +642,6 @@ class PsixSonicClient:
             self._camera.close()
         except Exception:
             pass
-        try:
-            self._hlp_session.close()
-        except Exception:
-            pass
-        if self._hlp_camera is not None:
-            try:
-                self._hlp_camera.close()
-            except Exception:
-                pass
         self._state_sub.stop()
         self._token_publisher.stop()
 
@@ -852,7 +651,7 @@ class PsixSonicClient:
 # ---------------- Main ----------------
 def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_topic,
          camera_address, episode_dir, task_instruction, subtasks,
-         hlp_url=None, hlp_timeout=30.0, hlp_period=0.7, hlp_auto_threshold=1.5):
+         hlp_url=None, hlp_timeout=30.0, hlp_period=0.7):
     print("[MAIN] Initializing components...")
 
     # 1. Initialize token publisher (ZMQ PUB, Protocol v4)
@@ -887,9 +686,16 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
     else:
         print("[MAIN] WARNING: No robot state received after 15s, proceeding anyway...")
 
-    # 5b. Second camera for the HLP poller (own REQ socket on the same camera server), so
-    # it never shares the control-loop camera socket. Only created when HLP is enabled.
+    # 5b. Second camera for the HLP poller (own REQ socket on the same camera server), so it
+    # never shares the control-loop camera socket. The shared HlpController polls with it.
     hlp_camera = RSCamera(address=camera_address) if hlp_url else None
+
+    # 5c. Server-owns-memory HLP controller (same class the RTC client + mocks use). It owns the
+    # subtask/memory + goal stage; the client just reads instruction_and_goal().
+    hlp = HlpController(hlp_url or "", hlp_camera or camera, subgoal_manager, task_instruction,
+                        period=hlp_period, timeout=hlp_timeout, no_hlp=(hlp_url is None))
+    hlp.restart()   # begin a fresh episode (clean server memory)
+    hlp.start()
 
     # 6. Create and start client
     client = PsixSonicClient(
@@ -897,13 +703,9 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
         state_subscriber=state_sub,
         camera=camera,
         token_publisher=token_publisher,
+        hlp_controller=hlp,
         subgoal_manager=subgoal_manager,
         task_instruction=task_instruction,
-        hlp_url=hlp_url,
-        hlp_timeout=hlp_timeout,
-        hlp_camera=hlp_camera,
-        hlp_period=hlp_period,
-        hlp_auto_threshold=hlp_auto_threshold,
     )
 
     if not client.start():
@@ -911,10 +713,8 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
         client.stop()
         return
 
-    # 6b. Start stdin command loop: the client owns the subtask text now (type to set it,
-    # manual+sticky). `:adv` / `:goal <n>` step the FIXED goal-image sequence (old Enter
-    # behavior); `:hlp` releases manual override; `:task`/`:show`/`:clear`/`:done`. Lets a
-    # --no-hlp manual run drive BOTH the subtask text and the goal image.
+    # 6b. Start stdin command loop (server-owns-memory): :prev / :restart / :resume / <text>
+    # takeover / :show / :quit — all routed to the HLP server via the HlpController.
     t_stdin = threading.Thread(target=client._stdin_loop, daemon=True)
     t_stdin.start()
 
@@ -934,6 +734,11 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
         print("[MAIN] Caught Ctrl+C, exiting...")
 
     client.stop()
+    if hlp_camera is not None:
+        try:
+            hlp_camera.close()
+        except Exception:
+            pass
     print("[MAIN] Shutdown complete.")
 
 
@@ -978,11 +783,6 @@ if __name__ == "__main__":
                         help="HLP HTTP request timeout (s)")
     parser.add_argument("--hlp-period", type=float, default=0.7,
                         help="HLP poll period (s); 0 = as fast as possible")
-    parser.add_argument("--hlp-auto-transition-threshold", type=float, default=1.5,
-                        help="When HLP says continue with seconds_to_subgoal < this (s), "
-                             "auto-transition to the predicted next subtask at the predicted "
-                             "time instead of waiting for an HLP 'switch' (hides HLP latency). "
-                             "0 disables.")
     parser.add_argument("--no-hlp", action="store_true",
                         help="Disable the HLP poller — manual stdin steering only")
 
@@ -1007,7 +807,8 @@ if __name__ == "__main__":
         task_instruction = TASK_INSTRUCTION
 
     server_url = f"http://{args.host}:{args.port}/act"
-    hlp_url = None if args.no_hlp else f"http://{args.hlp_host}:{args.hlp_port}/hlp"
+    # HlpController appends paths (/hlp, /prev, ...) so pass the BASE url (no /hlp suffix).
+    hlp_url = None if args.no_hlp else f"http://{args.hlp_host}:{args.hlp_port}"
     main(
         server_url=server_url,
         zmq_host=args.zmq_host,
@@ -1022,5 +823,4 @@ if __name__ == "__main__":
         hlp_url=hlp_url,
         hlp_timeout=args.hlp_timeout,
         hlp_period=args.hlp_period,
-        hlp_auto_threshold=args.hlp_auto_transition_threshold,
     )
