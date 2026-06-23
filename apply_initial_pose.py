@@ -13,7 +13,8 @@ import time
 import numpy as np
 import zmq
 
-_GROOT_ROOT = os.path.expanduser("/home/songlin/Projects/hongyi-wbc")
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+_GROOT_ROOT = PROJECT_ROOT
 sys.path.insert(0, _GROOT_ROOT)
 
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
@@ -172,9 +173,12 @@ def apply_initial_pose(pose, zmq_host, zmq_port, zmq_topic, neck_pub_host, neck_
 
 def main():
     parser = argparse.ArgumentParser(description="Apply initial pose from data.json")
-    parser.add_argument("--data", type=str,
-                       default="/home/songlin/Projects/hongyi-wbc/data.json",
-                       help="Path to data.json file")
+    parser.add_argument("--data", type=str, default="data.json",
+                       help="Path to data json file (relative to the project root "
+                            "unless absolute; default: data.json)")
+    parser.add_argument("--distance", choices=["near", "middle", "far"], default=None,
+                       help="Shortcut to select data_near.json / data_middle.json / "
+                            "data_far.json (overrides --data)")
     parser.add_argument("--zmq-host", type=str, default=DEFAULT_ZMQ_HOST,
                        help="ZMQ publisher bind host (default: *)")
     parser.add_argument("--zmq-port", type=int, default=DEFAULT_ZMQ_PORT,
@@ -188,9 +192,16 @@ def main():
 
     args = parser.parse_args()
 
+    # --distance is a shortcut to the data_<distance>.json files.
+    if args.distance:
+        args.data = f"data_{args.distance}.json"
+
+    # Resolve --data relative to the project root unless an absolute path was given.
+    data_path = args.data if os.path.isabs(args.data) else os.path.join(PROJECT_ROOT, args.data)
+
     # Load initial pose
-    print(f"[Load] Reading initial pose from {args.data}")
-    pose = load_initial_pose(args.data)
+    print(f"[Load] Reading initial pose from {data_path}")
+    pose = load_initial_pose(data_path)
 
     print(f"[Pose] qpos[0:5]: {pose['qpos'][:5]}")
     print(f"[Pose] quat (wxyz): {pose['quat']}")
