@@ -10,9 +10,7 @@ ZMQ REP bind: tcp://192.168.123.164:5558
 Each request receives a 4-part multipart reply (all JPEG bytes, b"" if unavailable):
 
   Part 0 — Ego left RGB JPEG       (ZED left)
-  Part 1 — b""                     (stereo NOT sent over REP — recorder /
-                                    policy clients only use slot 0; stereo is
-                                    available on the viewer PUB instead)
+  Part 1 — Ego stereo JPEG         (ZED left|right, for VR / archival)
   Part 2 — b""                     (was left wrist D405 — disabled)
   Part 3 — b""                     (was right wrist D405 — disabled)
 
@@ -77,13 +75,6 @@ latest_ego_stereo_frame: Optional[np.ndarray] = None
 # latest_right_wrist_bytes: Optional[bytes] = None
 frame_seq = 0
 frame_cond = threading.Condition()
-
-# Raw frames handed off from the grab thread to the encode thread, so the grab
-# loop stays free of GIL-held work and keeps the camera's 30 Hz cadence.
-latest_raw_left: Optional[np.ndarray] = None
-latest_raw_right: Optional[np.ndarray] = None
-raw_seq = 0
-raw_cond = threading.Condition()
 
 # Defaults (overridden by CLI / env)
 ZMQ_BIND_DEFAULT = os.environ.get("ZMQ_BIND", "tcp://192.168.123.164:5558")
@@ -163,10 +154,9 @@ def _env_bool(name: str, default: bool) -> bool:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def zed_grab_thread(cfg: Any) -> None:
-    """Grab + retrieve only. Copies raw frames out and hands them to the encode
-    thread. Kept free of JPEG/convert work so grab() never misses its cadence."""
-    global latest_raw_left, latest_raw_right, raw_seq
+def zed_capture_thread(cfg: Any) -> None:
+    global latest_ego_rgb_bytes, latest_ego_stereo_bytes
+    global latest_ego_stereo_frame, frame_seq
 
     zed = sl.Camera()
     init = sl.InitParameters()
@@ -177,13 +167,17 @@ def zed_grab_thread(cfg: Any) -> None:
 
     err = zed.open(init)
     if err != sl.ERROR_CODE.SUCCESS:
-        print(f"[ZED] Open failed: {repr(err)}. Grab thread exits.")
+        print(f"[ZED] Open failed: {repr(err)}. Ego capture thread exits.")
         return
 
     left_mat = sl.Mat()
     right_mat = sl.Mat()
     runtime = sl.RuntimeParameters()
-    print(f"[ZED] Grab started: resolution={cfg.resolution_name} fps={cfg.fps}")
+
+    print(f"[ZED] Started: resolution={cfg.resolution_name} fps={cfg.fps}")
+
+    fps_t0 = time.time()
+    fps_count = 0
 
     while True:
         try:
@@ -193,56 +187,15 @@ def zed_grab_thread(cfg: Any) -> None:
             zed.retrieve_image(left_mat, sl.VIEW.LEFT, sl.MEM.CPU)
             zed.retrieve_image(right_mat, sl.VIEW.RIGHT, sl.MEM.CPU)
 
-            # Copy out: the next grab() overwrites the Mat buffers.
-            left = np.array(left_mat.get_data(), dtype=np.uint8)
-            right = np.array(right_mat.get_data(), dtype=np.uint8)
-            if left.ndim != 3 or right.ndim != 3:
+            left_rgba = np.ascontiguousarray(
+                np.asarray(left_mat.get_data(), dtype=np.uint8)
+            )
+            right_rgba = np.ascontiguousarray(
+                np.asarray(right_mat.get_data(), dtype=np.uint8)
+            )
+            if left_rgba.ndim != 3 or right_rgba.ndim != 3:
                 continue
-            if left.shape[2] != 4 or right.shape[2] != 4:
-                continue
-
-            with raw_cond:
-                latest_raw_left = left
-                latest_raw_right = right
-                raw_seq += 1
-                raw_cond.notify_all()
-
-        except Exception as e:
-            print(f"[ZED] Grab error: {e}")
-            time.sleep(0.01)
-
-
-def zed_encode_thread(cfg: Any) -> None:
-    """Consumes raw frames, does BGRA→BGR + hstack + JPEG, publishes to the REP
-    state and the viewer PUB. All the GIL-heavy work lives here, off the grab
-    loop's critical path."""
-    global latest_ego_rgb_bytes, latest_ego_stereo_bytes
-    global latest_ego_stereo_frame, frame_seq
-
-    # Independent viewer PUB stream (drops frames for slow subscribers).
-    viewer_pub = None
-    if getattr(cfg, "viewer_pub", ""):
-        try:
-            viewer_pub = zmq.Context.instance().socket(zmq.PUB)
-            viewer_pub.setsockopt(zmq.SNDHWM, 2)
-            viewer_pub.setsockopt(zmq.LINGER, 0)
-            viewer_pub.bind(cfg.viewer_pub)
-            print(f"[ZED] Viewer PUB bound: {cfg.viewer_pub}")
-        except Exception as e:
-            print(f"\033[91m[ZED] Viewer PUB bind failed: {e}\033[0m")
-            viewer_pub = None
-
-    last_seq = 0
-    while True:
-        try:
-            with raw_cond:
-                while raw_seq == last_seq:
-                    raw_cond.wait(timeout=0.1)
-                left_rgba = latest_raw_left
-                right_rgba = latest_raw_right
-                last_seq = raw_seq
-
-            if left_rgba is None or right_rgba is None:
+            if left_rgba.shape[2] != 4 or right_rgba.shape[2] != 4:
                 continue
 
             left_bgr = _bgra_to_bgr(left_rgba)
@@ -255,20 +208,55 @@ def zed_encode_thread(cfg: Any) -> None:
             with frame_cond:
                 latest_ego_rgb_bytes = enc_rgb
                 latest_ego_stereo_bytes = enc_stereo
-                latest_ego_stereo_frame = stereo_bgr
+                latest_ego_stereo_frame = stereo_bgr.copy()
                 frame_seq += 1
                 frame_cond.notify_all()
 
-            if viewer_pub is not None:
-                try:
-                    viewer_pub.send_multipart([enc_rgb, enc_stereo],
-                                              flags=zmq.NOBLOCK)
-                except zmq.Again:
-                    pass
+            fps_count += 1
+            now = time.time()
+            if now - fps_t0 >= 5.0:
+                print(f"[ZED] capture {fps_count / (now - fps_t0):.1f} fps")
+                fps_t0 = now
+                fps_count = 0
 
         except Exception as e:
-            print(f"[ZED] Encode error: {e}")
+            print(f"[ZED] Capture error: {e}")
             time.sleep(0.01)
+
+
+def viewer_pub_thread(cfg: Any) -> None:
+    """Sends frames to the live viewer on a separate thread so the PUB work
+    never rides the capture loop's critical path (off it, an attached viewer
+    can't slow frame production / recording)."""
+    if not getattr(cfg, "viewer_pub", ""):
+        return
+    try:
+        sock = zmq.Context.instance().socket(zmq.PUB)
+        sock.setsockopt(zmq.SNDHWM, 2)
+        sock.setsockopt(zmq.LINGER, 0)
+        sock.bind(cfg.viewer_pub)
+        print(f"[ZED] Viewer PUB bound: {cfg.viewer_pub}")
+    except Exception as e:
+        print(f"\033[91m[ZED] Viewer PUB bind failed: {e}\033[0m")
+        return
+
+    last_seq = 0
+    while True:
+        with frame_cond:
+            while frame_seq == last_seq:
+                frame_cond.wait(timeout=0.1)
+            enc_rgb = latest_ego_rgb_bytes
+            enc_stereo = latest_ego_stereo_bytes
+            last_seq = frame_seq
+        if enc_rgb is None:
+            continue
+        try:
+            sock.send_multipart(
+                [enc_rgb, enc_stereo if enc_stereo is not None else b""],
+                flags=zmq.NOBLOCK,
+            )
+        except zmq.Again:
+            pass
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1032,10 +1020,10 @@ def start_server(cfg: Any) -> None:
     print("[Server] Mode: ZED only (wrist cameras hard-disabled in code).")
 
     threading.Thread(
-        target=zed_grab_thread, args=(cfg,), daemon=True
+        target=zed_capture_thread, args=(cfg,), daemon=True
     ).start()
     threading.Thread(
-        target=zed_encode_thread, args=(cfg,), daemon=True
+        target=viewer_pub_thread, args=(cfg,), daemon=True
     ).start()
 
     # ── DISABLED: D405 wrists ────────────────────────────────────────────────
@@ -1114,14 +1102,22 @@ def start_server(cfg: Any) -> None:
                 while frame_seq == last_sent_seq:
                     frame_cond.wait(timeout=0.1)
                 ego_rgb = latest_ego_rgb_bytes
+                ego_stereo = latest_ego_stereo_bytes
+                # DISABLED: D405 wrists — pad slots with empty bytes so the
+                # 4-part multipart contract stays intact for the client.
+                lw = b""
+                rw = b""
                 last_sent_seq = frame_seq
 
-            # Slot 1 (stereo) and slots 2/3 (D405 wrists) stay empty: REP
-            # consumers only use slot 0. Stereo is on the viewer PUB.
             if ego_rgb is None:
                 sock.send_multipart([b"", b"", b"", b""])
             else:
-                sock.send_multipart([ego_rgb, b"", b"", b""])
+                sock.send_multipart([
+                    ego_rgb,
+                    ego_stereo if ego_stereo is not None else b"",
+                    lw if lw is not None else b"",
+                    rw if rw is not None else b"",
+                ])
     finally:
         sock.close()
         context.term()

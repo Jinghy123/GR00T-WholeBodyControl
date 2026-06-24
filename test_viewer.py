@@ -75,7 +75,8 @@ def run(args):
 
             while len(parts) < 2:
                 parts.append(b"")
-            ego, stereo = (_decode(p) for p in parts[:2])
+            ego = _decode(parts[0])
+            stereo = _decode(parts[1]) if args.show_stereo else None
 
             if ego is not None:
                 cv2.imshow("ZED Ego", ego)
