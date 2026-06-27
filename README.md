@@ -1,6 +1,16 @@
 # GR00T-WholeBodyControl
 
-## Documentation
+> Based on the original repository: [NVlabs/GR00T-WholeBodyControl](https://github.com/NVlabs/GR00T-WholeBodyControl)
+
+## Ours_documentation
+
+- [Guide](ours_docs/guide.md)
+- [Neck Teleop Guide](ours_docs/NECK_TELEOP_GUIDE.md)
+- [Replay Guide](ours_docs/REPLAY_GUIDE.md)
+- [SlimeVR Manus Guide](ours_docs/SLIMEVR_MANUS_GUIDE.md)
+- [SlimeVR Neck Test](ours_docs/SLIMEVR_NECK_TEST.md)
+
+## Original_documentation
 
 📚 **[Full Documentation](https://nvlabs.github.io/GR00T-WholeBodyControl/)**
 
