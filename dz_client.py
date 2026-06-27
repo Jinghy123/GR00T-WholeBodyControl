@@ -1,36 +1,60 @@
+"""Non-RTC WebSocket client for the DreamZero (DZ) G1-neck policy server.
+
+Talks to  baselines/dreamzero/socket_test_g1_neck.py  (the NON-rtc server), which
+serves over an openpi `WebsocketPolicyServer` (msgpack_numpy protocol, default
+port 5000). Each request returns one action chunk; the client plays the chunk
+open-loop at 30 Hz and, between chunks, freezes the body token via the encoder
+(identical playback to psix_sonic_client.py — only the transport + obs layout differ).
+
+Protocol (openpi WebsocketPolicyServer):
+  * On connect the server sends one msgpack metadata frame (handled by
+    WebsocketClientPolicy.__init__).
+  * Each request: client sends a msgpack-packed FLAT obs dict, server replies with
+    a msgpack-packed action array.
+  * The obs dict MUST carry an "endpoint" field ("infer" to run, "reset" to reset).
+
+Obs dict (FLAT, top-level keys — same as g1_sonic_client.py --include-neck):
+  {
+      "observation/head":        frame,   # uint8, RGB, (H, W, 3) or (T, H, W, 3)
+      "observation/hand_joints": hand,    # float32, (14,)
+      "observation/qpos":        qpos,    # float32, (29,) layout leg/base15 + arm14
+      "observation/neck":        neck,    # float32, (2,)
+      "prompt":                  instruction,  # str
+      "session_id":              session_id,   # str
+  }
+
+Server reply: action chunk, shape (T, 80), layout [hand_joints(14) | neck(2) | token(64)].
+We FSQ-quantize the token and publish in internal layout hand(14) + neck(2) + token(64),
+matching g1_sonic_client.py --include-neck.
+"""
+
 import os
 import sys
 import time
 import threading
 import json
 import signal
+import uuid
 from collections import deque
 
 import cv2
 import numpy as np
 import zmq
 import msgpack
-import requests
-import json_numpy
+
+from openpi_client.websocket_client_policy import WebsocketClientPolicy
 
 # Add project root to path for imports
-# _GROOT_ROOT = os.path.expanduser("~/hsc/GR00T-WholeBodyControl")
-# sys.path.insert(0, _GROOT_ROOT)
+_GROOT_ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _GROOT_ROOT)
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
     pack_pose_message,
     build_command_message,
 )
 from encoder_client import EncoderClient
 
-# json_numpy.patch() monkey-patches stdlib json so np.ndarray round-trips over HTTP.
-# The PsiX non-RTC server (psix_serve_sonic.py) (de)serializes with helpers.py's
-# base64 "__numpy__" scheme, which is byte-identical to json_numpy — so requests'
-# json=payload / resp.json() interoperate with it directly.
-json_numpy.patch()
-
 # ---------------- Configuration ----------------
-# TASK_INSTRUCTION = "grasp the pink chip can and place it into the orange plate"
-TASK_INSTRUCTION = "pick up the grapes and place in the bowl"
+TASK_INSTRUCTION = "pick up the green grapes and place it into the green bowl"
 
 # FSQ configuration (must match g1_sonic_client / encoder)
 FSQ_MIN = -0.625
@@ -40,15 +64,22 @@ FSQ_STEP = 0.0625  # = 1/16
 # Control frequency
 FREQ_POLICY = 30  # Hz
 
-# Internal action layout (after reorder in _get_policy_chunk):
-#   default:        token(64) + hand_joints(14)            = 78
-#   --include-neck: token(64) + hand_joints(14) + neck(2)  = 80
-# Server layout (repack.action_key order) is [hand(14) | token(64)] (| neck(2) appended).
+# Internal action layout (after reorder in _get_policy_chunk), matching
+# g1_sonic_client.py --include-neck:
+#   hand_joints(14) + neck(2) + token(64) = 80
+# Server reply layout is [hand(14) | neck(2) | token(64)] (always 80-D).
 HAND_DIM = 14
 NECK_DIM = 2
 TOKEN_DIM = 64
-ACTION_DIM_DEFAULT = 78
-ACTION_DIM_NECK = 80
+ACTION_DIM = 80
+
+# Video: send 9 frames at stride-4 (training video delta [0,4,...,32], span 32)
+# selected from a continuous 30 Hz ego ring buffer. The server uses them directly.
+VIDEO_OFFSETS = (-32, -28, -24, -20, -16, -12, -8, -4, 0)
+VIDEO_BUFFER_SIZE = 64
+# Pre-resize frames to the policy resolution before sending (server is 384x672);
+# cv2.resize takes (W, H). Keeps the 9-frame payload small.
+POLICY_IMAGE_WH = (672, 384)
 
 # Encoder model path (for frozen token between chunks)
 ENCODER_MODEL = "gear_sonic_deploy/policy/release/model_encoder.onnx"
@@ -58,7 +89,6 @@ DEFAULT_NECK_PUB_HOST = "*"
 DEFAULT_NECK_PUB_PORT = 5570
 
 # Neck state subscriber (ZMQ SUB <- realsense_server.py on the robot, port 5560)
-# JSON `[yaw_rad, pitch_rad]` of the Dynamixel present-position read each tick.
 DEFAULT_NECK_STATE_ZMQ = "tcp://192.168.123.164:5560"
 
 # Joint order conversion: WBC publishes in Mujoco order, encoder expects IsaacLab order
@@ -79,92 +109,40 @@ def fsq_quantize(continuous_value, fsq_min=FSQ_MIN, fsq_max=FSQ_MAX, fsq_step=FS
     return quantized
 
 
-# ---------------- SubgoalManager ----------------
-class SubgoalManager:
+# ---------------- InstructionManager ----------------
+class InstructionManager:
+    """Holds the per-stage subtask prompts and advances through them on Enter.
+
+    DreamZero has no goal image, so this only tracks the text subtask; the assembled
+    instruction switches as the operator presses Enter.
     """
-    Holds the current subgoal image and advances through a fixed sequence on Enter.
 
-    Sequence: every image in color_subgoal/ in order, then color[-1] as the final one.
-    Further Enter presses after the last one are no-ops.
-    """
-
-    _IMG_EXTS = (".jpg", ".jpeg", ".png")
-
-    def __init__(self, episode_dir, subtasks=None):
-        self.episode_dir = episode_dir
-        subgoal_dir = os.path.join(episode_dir, "color_subgoal")
-        color_dir = os.path.join(episode_dir, "color")
-
-        subgoal_files = self._list_images(subgoal_dir)
-        color_files = self._list_images(color_dir)
-
-        self.paths = list(subgoal_files)
-        if color_files:
-            self.paths.append(color_files[-1])
-
-        if not self.paths:
-            raise ValueError(f"[Subgoal] No images found under {episode_dir}")
-
-        self._images = [self._load(p) for p in self.paths]
+    def __init__(self, subtasks=None):
+        subtasks = [str(s) for s in (subtasks or [])]
+        self._subtasks = subtasks if subtasks else [""]
         self._idx = 0
         self._lock = threading.Lock()
 
-        # Per-stage subtask prompts, parallel to self.paths. Advanced together with the
-        # subgoal image on each Enter (the server expects the client to switch BOTH the
-        # goal image and the subtask over time). Missing entries -> "" so the server
-        # falls back to task-only conditioning for that stage.
-        subtasks = list(subtasks or [])
-        self._subtasks = [
-            (subtasks[i] if i < len(subtasks) else "") for i in range(len(self.paths))
-        ]
-        if subtasks and len(subtasks) != len(self.paths):
-            print(f"[Subgoal] WARNING: {len(subtasks)} subtasks but {len(self.paths)} "
-                  f"subgoal stages; padded/truncated to match.")
-
-        print(f"[Subgoal] Loaded {len(self._images)} subgoal images from {episode_dir}:")
-        for i, p in enumerate(self.paths):
-            print(f"  [{i}] {p}  | subtask: {self._subtasks[i]!r}")
-        print(f"[Subgoal] Current index: 0  (press Enter to advance)")
-
-    @classmethod
-    def _list_images(cls, d):
-        if not os.path.isdir(d):
-            return []
-        return sorted(
-            os.path.join(d, f)
-            for f in os.listdir(d)
-            if f.lower().endswith(cls._IMG_EXTS)
-        )
-
-    @staticmethod
-    def _load(path):
-        img = cv2.imread(path)
-        if img is None:
-            raise IOError(f"[Subgoal] Failed to load image: {path}")
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        return img.astype(np.uint8)
-
-    def get(self):
-        with self._lock:
-            return self._images[self._idx]
+        print(f"[Instruction] Loaded {len(self._subtasks)} subtask stage(s):")
+        for i, s in enumerate(self._subtasks):
+            print(f"  [{i}] subtask: {s!r}")
+        print("[Instruction] Current index: 0  (press Enter to advance)")
 
     def get_subtask(self):
         with self._lock:
             return self._subtasks[self._idx]
 
     def get_stage(self):
-        """(idx, subgoal_path, subtask) for the current stage — for debugging."""
         with self._lock:
-            return self._idx, self.paths[self._idx], self._subtasks[self._idx]
+            return self._idx, self._subtasks[self._idx]
 
     def advance(self):
         with self._lock:
-            if self._idx < len(self._images) - 1:
+            if self._idx < len(self._subtasks) - 1:
                 self._idx += 1
-                print(f"[Subgoal] -> index {self._idx}: {self.paths[self._idx]}  "
-                      f"| subtask: {self._subtasks[self._idx]!r}")
+                print(f"[Instruction] -> index {self._idx}: subtask {self._subtasks[self._idx]!r}")
             else:
-                print(f"[Subgoal] Already at last subgoal (index {self._idx})")
+                print(f"[Instruction] Already at last subtask (index {self._idx})")
 
 
 # ---------------- RSCamera ----------------
@@ -176,8 +154,8 @@ class RSCamera:
 
     def get_frame(self):
         self.socket.send(b"get_frame")
-        rgb_bytes, _, _ = self.socket.recv_multipart()
-        rgb_array = np.frombuffer(rgb_bytes, np.uint8)
+        parts = self.socket.recv_multipart()  # 3-part RealSense or 4-part ZED; slot 0 is ego RGB
+        rgb_array = np.frombuffer(parts[0], np.uint8)
         rgb_image = cv2.imdecode(rgb_array, cv2.IMREAD_COLOR)
         return rgb_image
 
@@ -244,7 +222,6 @@ class RobotStateSubscriber:
             except zmq.ZMQError:
                 break
 
-            # Strip topic prefix
             topic_bytes = self._topic.encode("utf-8")
             if msg.startswith(topic_bytes):
                 payload = msg[len(topic_bytes):]
@@ -259,7 +236,6 @@ class RobotStateSubscriber:
                 print(f"[StateSubscriber] Unpack error: {e}")
 
     def get_state(self):
-        """Return the latest robot state dict, or None if not yet received."""
         with self._lock:
             return self._latest_state
 
@@ -287,17 +263,19 @@ class TokenPublisher:
         print(f"[TokenPublisher] Command: start={start} stop={stop} planner={planner}")
 
     def publish_token(self, action):
-        """
-        Publish action token message (Protocol v4).
+        """Publish action token message (Protocol v4).
 
         Args:
-            action: np.ndarray of shape (78,) — token(64) + left_hand(7) + right_hand(7)
+            action: np.ndarray of shape (80,) — hand(14) + neck(2) + token(64),
+                matching g1_sonic_client.py --include-neck. The neck slot is
+                forwarded separately by NeckPublisher; only token + hands go here.
         """
         action = action.astype(np.float32).reshape(1, -1)
+        token_start = HAND_DIM + NECK_DIM  # 16
         pose_data = {
-            "token_state": action[:, :64],          # (1, 64)
-            "left_hand_joints": action[:, 64:71],   # (1, 7)
-            "right_hand_joints": action[:, 71:78],  # (1, 7)
+            "token_state": action[:, token_start:token_start + TOKEN_DIM],  # (1, 64)
+            "left_hand_joints": action[:, :7],    # (1, 7)
+            "right_hand_joints": action[:, 7:14],  # (1, 7)
         }
         msg = pack_pose_message(pose_data, topic=self._topic, version=4)
         self._socket.send(msg)
@@ -358,177 +336,171 @@ class NeckPublisher:
 
 
 # ---------------- Main Client ----------------
-class PsixSonicClient:
+class DZSonicClient:
     """
-    Chunk-based PsiX (subtask + goal-image) client for the NON-RTC HTTP server
-    (psix_serve_sonic.py, POST /act). Each inference returns a chunk of actions;
+    Chunk-based non-RTC DreamZero client. Each inference returns a chunk of actions;
     the publish loop iterates it at 30 Hz, and the encoder freezes the body token
-    between chunks. Identical transport/playback to psi_sonic_client.py — only the
-    observation payload (two images + dict instruction + single-frame state) and the
-    server's action layout differ.
+    between chunks. Identical playback to psix_sonic_client.py — only the transport
+    (openpi msgpack WebSocket) and the flat obs layout differ.
     """
 
-    def __init__(self, server_url, state_subscriber, camera, token_publisher,
-                 subgoal_manager, task_instruction, http_timeout=30.0,
+    def __init__(self, policy_client, state_subscriber, camera, token_publisher,
+                 instruction_manager, task_instruction,
                  include_neck=False, neck_publisher=None, neck_state_reader=None):
-        self._server_url = server_url
+        self._policy = policy_client
         self._state_sub = state_subscriber
         self._camera = camera
         self._token_publisher = token_publisher
-        self._subgoal_manager = subgoal_manager
+        self._instruction_manager = instruction_manager
         self._task = task_instruction
-        self._http_timeout = http_timeout
-        self._dbg_last_idx = -1  # debug: track stage changes for image/idx dumps
+        self._dbg_last_idx = -1
         self._include_neck = include_neck
         self._neck_publisher = neck_publisher
         self._neck_state_reader = neck_state_reader
 
+        # One session id per run; server resets its video frame buffer when it changes.
+        self._session_id = uuid.uuid4().hex
+        print(f"[DZSonicClient] session_id={self._session_id}")
+
         # Encoder for frozen token
         self._encoder = EncoderClient(ENCODER_MODEL, mode=0)
 
-        # Threading / synchronization (mirrors psi_sonic_client / g1_sonic_client)
         self._running = threading.Event()
         self._sequence_done_event = threading.Event()
-        self._pending_chunk = None  # latest chunk from inference worker
+        self._pending_chunk = None
         self._chunk_lock = threading.Lock()
-
-        # HTTP session (reuses TCP connection)
-        self._session = requests.Session()
 
         self._inference_thread = None
         self._publish_thread = None
 
-    # ---------- Policy request ----------
-    def _build_observation_payload(self):
-        """Capture current state + ego/goal frames, build PsiX payload dict.
+        # Continuous 30 Hz ego-frame ring buffer; inference pulls 9 stride-4 frames
+        # out of it. Filled by the publish loop (one capture per control tick).
+        self._frame_buffer = deque(maxlen=VIDEO_BUFFER_SIZE)
+        self._frame_lock = threading.Lock()
 
-        Image keys MUST match the server's repack:
-          ego image  -> repack.image_keys[0]  == "video.egocentric"
-          goal image -> repack.subgoal_key[0] == "subgoal.egocentric"
-        State is a SINGLE frame (the server reshapes (D,) -> (1, 1, D)).
-        Instruction is a dict {"task", "subtask"}; the server assembles
-        "Task: <task>. Subtask: <subtask>" (subtask dropped when empty).
+    # ---------- Policy request ----------
+    def _capture_frame(self):
+        """Grab one ego frame, convert to RGB + resize, append to the ring buffer."""
+        frame = self._camera.get_frame()
+        if frame is None:
+            return
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame = cv2.resize(frame, POLICY_IMAGE_WH).astype(np.uint8)
+        with self._frame_lock:
+            self._frame_buffer.append(frame)
+
+    def _video_window(self):
+        """Select the 9 stride-4 frames [-32,-28,...,0] from the ring buffer
+        (left-padded with the oldest). Returns (9, H, W, 3) or None if empty."""
+        with self._frame_lock:
+            frames = list(self._frame_buffer)
+        if not frames:
+            return None
+        latest = len(frames) - 1
+        idxs = [max(0, latest + off) for off in VIDEO_OFFSETS]
+        return np.stack([frames[i] for i in idxs], axis=0)
+
+    def _build_observation_payload(self):
+        """Capture current state + ego frame, build the flat DreamZero obs dict.
+
+        FLAT top-level keys, same as g1_sonic_client.py --include-neck:
+        observation/head, observation/hand_joints (14), observation/qpos (29, raw
+        body_q = leg/base15 + arm14), observation/neck (2), prompt, session_id.
+        The server reorders qpos+hand+neck into the model state internally.
         """
         state = self._state_sub.get_state()
         assert state is not None, "Robot state not available"
 
-        body_q = np.array(state["body_q_measured"], dtype=np.float32)        # (29,) = [leg/base(15) | arm(14)]
-        # left_hand_states = np.array(state["left_hand_q"], dtype=np.float32)   # (7,)
-        # right_hand_states = np.array(state["right_hand_q"], dtype=np.float32)  # (7,)
+        body_q = np.array(state["body_q_measured"], dtype=np.float32)        # (29,) = leg/base15 + arm14
         left_hand_states = np.array(state["left_hand_q_measured"], dtype=np.float32)   # (7,)
         right_hand_states = np.array(state["right_hand_q_measured"], dtype=np.float32)  # (7,)
+        hand_joints = np.concatenate((left_hand_states, right_hand_states), axis=0)    # (14,)
 
-        # Model expects state.joint_positions = [hand(L7,R7) | arm(14) | leg(15)].
-        leg_states = body_q[:15]    # base/leg
-        arm_states = body_q[15:29]  # arm
-        states = np.concatenate(
-            (left_hand_states, right_hand_states, arm_states, leg_states), axis=0
-        )  # (43,)
+        neck_latest = (
+            self._neck_state_reader.get_latest()
+            if self._neck_state_reader is not None
+            else None
+        )
+        neck_state = (
+            np.asarray(neck_latest, dtype=np.float32).reshape(NECK_DIM)
+            if neck_latest is not None
+            else np.zeros(NECK_DIM, dtype=np.float32)
+        )
 
-        if self._include_neck:
-            neck_latest = self._neck_state_reader.get_latest()
-            neck_state = (
-                np.asarray(neck_latest, dtype=np.float32)
-                if neck_latest is not None
-                else np.zeros(NECK_DIM, dtype=np.float32)
+        # 9 stride-4 ego frames from the 30 Hz ring buffer (filled by the publish
+        # loop). The server uses them directly as the video block.
+        head = self._video_window()
+        if head is None:
+            raise RuntimeError(
+                "No camera frames in buffer yet; the publish loop should prime it"
             )
-            states = np.concatenate((states, neck_state), axis=0)  # (45,)
 
-        frame = self._camera.get_frame()
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame = frame.astype(np.uint8)
+        # Instruction: verbatim subtask if set, else the task string as-is.
+        base = str(self._task).strip()
+        subtask = str(self._instruction_manager.get_subtask()).strip()
+        instruction = f"Task: {base.lower()}. Subtask: {subtask}" if subtask else base
 
-        subgoal_frame = self._subgoal_manager.get()
-
-        task = str(self._task).strip().lower()
-        subtask = str(self._subgoal_manager.get_subtask()).strip()
-        instruction = f"Task: {task}. Subtask: {subtask}" if subtask else f"Task: {task}"
-
-        # --- DEBUG: dump ego + goal to /tmp whenever the subgoal stage changes ---
-        stage_idx, stage_path, stage_subtask = self._subgoal_manager.get_stage()
+        # --- DEBUG: dump latest ego frame whenever the instruction stage changes ---
+        stage_idx, stage_subtask = self._instruction_manager.get_stage()
         if stage_idx != self._dbg_last_idx:
             self._dbg_last_idx = stage_idx
-            cv2.imwrite("/tmp/sent_ego.jpg", cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-            cv2.imwrite("/tmp/sent_goal.jpg", cv2.cvtColor(subgoal_frame, cv2.COLOR_RGB2BGR))
-            print(f"[DEBUG] stage idx={stage_idx} | goal={os.path.basename(stage_path)} "
-                  f"| subtask={stage_subtask!r} | dumped /tmp/sent_ego.jpg /tmp/sent_goal.jpg")
+            cv2.imwrite("/tmp/sent_ego.jpg", cv2.cvtColor(head[-1], cv2.COLOR_RGB2BGR))
+            print(f"[DEBUG] stage idx={stage_idx} | subtask={stage_subtask!r} "
+                  f"| instruction={instruction!r} | head={head.shape} | dumped /tmp/sent_ego.jpg")
 
         payload = {
-            "image": {
-                "video.egocentric": frame,
-                "subgoal.egocentric": subgoal_frame,
-            },
-            "state": {"states": states},  # single (43,) frame
-            "gt_action": None,
-            "dataset_name": None,
-            # "instruction": {
-            #     "task": self._task,
-            #     "subtask": self._subgoal_manager.get_subtask(),
-            # },
-            "instruction": instruction,
-            "history": None,
-            "condition": None,
-            "timestamp": None,
+            "observation/head": head,                                   # (9, H, W, 3) uint8
+            "observation/hand_joints": hand_joints.astype(np.float32),  # (14,)
+            "observation/qpos": body_q.astype(np.float32),              # (29,) leg/base15 + arm14
+            "observation/neck": neck_state.astype(np.float32),          # (2,)
+            "prompt": instruction,
+            "session_id": self._session_id,
+            # openpi_client.WebsocketClientPolicy does NOT auto-add the endpoint
+            # field; the server's handshake reads obs["endpoint"] first.
+            "endpoint": "infer",
         }
         return payload
 
     def _get_policy_chunk(self):
-        """
-        POST current observation to the HTTP policy server and return a chunk of
-        actions, repacked to internal publish layout [token(64) | hand(14)]
-        (78-D default) or [token(64) | hand(14) | neck(2)] (80-D --include-neck),
-        with FSQ quantization applied to the token. Returns None on failure.
+        """POST current observation to the DZ server and return a chunk of actions
+        in internal publish layout hand(14) + neck(2) + token(64), with FSQ
+        quantization applied to the token. Returns None on failure.
 
-        The PsiX server returns each action in repack.action_key order
-            [hand_joints(14) | body_token(64)] (| neck(2) appended when --include-neck)
-        i.e. hand_joints FIRST, then the 64-D sonic token, then neck last. We
-        reorder to [token(64) | hand(14)] (| neck(2)) so the downstream publish
-        loop + encoder-freeze logic match psi_sonic_client, and publish_token
-        receives [token(64) | left_hand(7) | right_hand(7)].
+        Server returns each action as [hand_joints(14) | neck(2) | token(64)].
         """
         payload = self._build_observation_payload()
 
         try:
-            resp = self._session.post(self._server_url, json=payload,
-                                      timeout=self._http_timeout)
-            resp.raise_for_status()
+            result = self._policy.infer(payload)
         except Exception as e:
-            print(f"[Inference] HTTP request error: {e}")
+            print(f"[Inference] WS request error: {e}")
             return None
 
         try:
-            data = resp.json()
-            action = data["action"] if isinstance(data, dict) else data
-            chunk = np.asarray(action, dtype=np.float32)
+            chunk = np.asarray(result, dtype=np.float32)
             if chunk.ndim == 1:
                 chunk = chunk.reshape(1, -1)
         except Exception as e:
             print(f"[Inference] Response parse error: {e}")
             return None
 
-        expected_dim = ACTION_DIM_NECK if self._include_neck else ACTION_DIM_DEFAULT
-        if chunk.shape[-1] != expected_dim:
-            print(f"[Inference] Unexpected action dim: {chunk.shape}, expected (*, {expected_dim})")
+        if chunk.shape[-1] != ACTION_DIM:
+            print(f"[Inference] Unexpected action dim: {chunk.shape}, expected (*, {ACTION_DIM})")
             return None
 
-        hand_joints = chunk[:, :HAND_DIM]
-        token_ori = chunk[:, HAND_DIM:HAND_DIM + TOKEN_DIM]
+        hand_joints = chunk[:, :HAND_DIM]                                       # (N, 14)
+        neck = chunk[:, HAND_DIM:HAND_DIM + NECK_DIM]                           # (N, 2)
+        token_ori = chunk[:, HAND_DIM + NECK_DIM:HAND_DIM + NECK_DIM + TOKEN_DIM]  # (N, 64)
         token_qtz = fsq_quantize(token_ori)
-        parts = [token_qtz, hand_joints]
-        if self._include_neck:
-            neck = chunk[:, HAND_DIM + TOKEN_DIM:HAND_DIM + TOKEN_DIM + NECK_DIM]
-            parts.append(neck)
-        chunk_out = np.concatenate(parts, axis=-1).astype(np.float32)
+        chunk_out = np.concatenate([hand_joints, neck, token_qtz], axis=-1).astype(np.float32)
 
         print(f"[Inference] Chunk received: shape={chunk_out.shape}, "
-              f"token range=[{token_ori.min():.4f},{token_ori.max():.4f}] → "
+              f"token range=[{token_ori.min():.4f},{token_ori.max():.4f}] -> "
               f"[{token_qtz.min():.4f},{token_qtz.max():.4f}]")
         return chunk_out
 
     # ---------- Threads ----------
     def _inference_worker(self):
-        """Wait for request, run policy, post result. Matches psi_sonic_client."""
-        # Wait for first robot state
         while self._running.is_set():
             state = self._state_sub.get_state()
             if state is not None:
@@ -554,19 +526,12 @@ class PsixSonicClient:
                 return
 
     def _publish_loop(self):
-        """
-        Main 30 Hz control loop.
-
-        State machine:
-          - EXECUTING: iterate through action chunk, one token per tick (1/30 s)
-          - WAITING:   chunk exhausted; send encoder-derived frozen token until
-                       next chunk arrives
-        Internal action layout is [token(64) | hand(14)] (set by _get_policy_chunk).
-        """
+        """Main 30 Hz control loop (open-loop chunk playback + encoder token freeze
+        between chunks). Internal action layout is hand(14) + neck(2) + token(64)."""
         dt = 1.0 / FREQ_POLICY
 
-        # Send start command and request first chunk
         self._token_publisher.send_command(start=True, stop=False, planner=True)
+        self._capture_frame()  # prime the ring buffer before the first inference
         print("[PublishLoop] Requesting first policy inference...")
         self._sequence_done_event.set()
         while self._sequence_done_event.is_set() and self._running.is_set():
@@ -577,7 +542,6 @@ class PsixSonicClient:
             chunk = self._pending_chunk
 
         idx = 0
-        using_last_action = False
         frozen_action = None
         last_action = None
         print(f"[PublishLoop] First chunk: shape={chunk.shape}. Starting execution.")
@@ -586,64 +550,59 @@ class PsixSonicClient:
             t_start = time.perf_counter()
 
             if idx < len(chunk):
-                # ── EXECUTING ──────────────────────────────────────────────
+                # ── EXECUTING ──
                 action = chunk[idx]
                 last_action = action.copy()
                 idx += 1
-                using_last_action = False
             else:
-                # ── WAITING for next chunk ─────────────────────────────────
-
-                # First tick after chunk exhausted: read robot state → run encoder → freeze token
+                # ── WAITING for next chunk ──
                 if idx == len(chunk):
                     state = self._state_sub.get_state()
                     if state is not None:
                         qpos = _mujoco29_to_isaaclab29(state["body_q_measured"])  # (29,)
                         base_quat = np.array(state["base_quat_measured"], dtype=np.float32)  # (4,) wxyz
 
-                        joint_pos = np.tile(qpos, (10, 1)).astype(np.float32)       # (10, 29)
+                        joint_pos = np.tile(qpos, (10, 1)).astype(np.float32)
                         joint_vel = np.zeros((10, 29), dtype=np.float32)
-                        body_quat = np.tile(base_quat, (10, 1)).astype(np.float32)  # (10, 4)
+                        body_quat = np.tile(base_quat, (10, 1)).astype(np.float32)
 
                         enc_token = self._encoder.encode(joint_pos, joint_vel, body_quat)  # (64,)
-                        # internal layout: token(64) + hand_joints(14) (+ neck(2) if --include-neck)
-                        # keep hand joints (and neck) from last action, replace body token
-                        if self._include_neck:
-                            frozen_action = np.concatenate(
-                                [enc_token, last_action[64:78], last_action[78:80]])
-                        else:
-                            frozen_action = np.concatenate([enc_token, last_action[64:78]])
+                        # Layout hand(14) + neck(2) + token(64): keep hand+neck from the
+                        # last action, replace the body token with the encoder freeze.
+                        frozen_action = np.concatenate([
+                            last_action[:HAND_DIM],                     # hand14
+                            last_action[HAND_DIM:HAND_DIM + NECK_DIM],  # neck2
+                            enc_token,                                  # token64
+                        ])
                         print(f"[PublishLoop] Chunk done ({len(chunk)} tokens), "
                               f"encoder freeze token computed.")
                     else:
                         frozen_action = last_action.copy()
-                        print(f"[PublishLoop] Chunk done, no robot state — repeating last action.")
+                        print("[PublishLoop] Chunk done, no robot state — repeating last action.")
                     self._sequence_done_event.set()
                     idx += 1
 
-                if not self._sequence_done_event.is_set():  # means inference done
+                if not self._sequence_done_event.is_set():  # inference done
                     with self._chunk_lock:
                         chunk = self._pending_chunk
                     frozen_action = None
                     idx = 0
-                    print(f"[PublishLoop] New chunk received: shape={chunk.shape}. "
-                          f"Resuming execution.")
-
-                    # directly execute the first action
+                    print(f"[PublishLoop] New chunk received: shape={chunk.shape}. Resuming.")
                     action = chunk[idx]
                     last_action = action.copy()
                     idx += 1
-                    using_last_action = False
                 else:
                     action = frozen_action
-                    using_last_action = True
 
-            self._token_publisher.publish_token(action[:HAND_DIM + TOKEN_DIM])
-            if self._include_neck and self._neck_publisher is not None:
-                neck = action[HAND_DIM + TOKEN_DIM:HAND_DIM + TOKEN_DIM + NECK_DIM]
+            self._token_publisher.publish_token(action)
+            if self._neck_publisher is not None:
+                neck = action[HAND_DIM:HAND_DIM + NECK_DIM]
                 self._neck_publisher.publish(neck[0], neck[1])
 
-            # Maintain 30 Hz
+            # Keep the 30 Hz ego buffer filled (incl. during freeze) so the next
+            # inference pulls a continuous stride-4 window from it.
+            self._capture_frame()
+
             elapsed = time.perf_counter() - t_start
             sleep_time = dt - elapsed
             if sleep_time > 0:
@@ -651,37 +610,22 @@ class PsixSonicClient:
 
     # ---------- Lifecycle ----------
     def start(self):
-        print("[PsixSonicClient] Starting...")
+        print("[DZSonicClient] Starting...")
         self._running.set()
-
-        # Start inference worker
         self._inference_thread = threading.Thread(target=self._inference_worker, daemon=True)
         self._inference_thread.start()
-
-        # Start publish loop
         self._publish_thread = threading.Thread(target=self._publish_loop, daemon=True)
         self._publish_thread.start()
-
-        print("[PsixSonicClient] Started successfully!")
+        print("[DZSonicClient] Started successfully!")
         return True
 
     def stop(self):
-        print("[PsixSonicClient] Stopping...")
+        print("[DZSonicClient] Stopping...")
         self._running.clear()
-
-        # Send stop command to WBC
         try:
             self._token_publisher.send_command(start=False, stop=True, planner=True)
         except Exception as e:
-            print(f"[PsixSonicClient] Error sending stop command: {e}")
-
-        # Close HTTP session
-        try:
-            self._session.close()
-        except Exception:
-            pass
-
-        # Clean up
+            print(f"[DZSonicClient] Error sending stop command: {e}")
         try:
             self._camera.close()
         except Exception:
@@ -692,30 +636,25 @@ class PsixSonicClient:
             self._neck_publisher.stop()
         if self._neck_state_reader is not None:
             self._neck_state_reader.stop()
-
-        print("[PsixSonicClient] Stopped.")
+        print("[DZSonicClient] Stopped.")
 
 
 # ---------------- Main ----------------
-def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_topic,
-         camera_address, episode_dir, task_instruction, subtasks,
+def main(host, port, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_topic,
+         camera_address, task_instruction, subtasks,
          include_neck=False, neck_pub_host=DEFAULT_NECK_PUB_HOST, neck_pub_port=DEFAULT_NECK_PUB_PORT,
          neck_state_zmq=DEFAULT_NECK_STATE_ZMQ):
     print("[MAIN] Initializing components...")
 
-    # 1. Initialize token publisher (ZMQ PUB, Protocol v4)
     token_publisher = TokenPublisher(host="*", port=zmq_pub_port, topic=zmq_topic)
     print(f"[MAIN] TokenPublisher bound on port {zmq_pub_port}, topic='{zmq_topic}'")
 
-    # 2. Initialize robot state subscriber (ZMQ SUB)
     state_sub = RobotStateSubscriber(host=zmq_host, port=zmq_sub_port, topic=zmq_sub_topic)
     print(f"[MAIN] State subscriber connected to {zmq_host}:{zmq_sub_port}, topic='{zmq_sub_topic}'")
 
-    # 3. Initialize camera (neck-mounted ZED when --include-neck, else RealSense)
     camera = ZedNeckCamera(address=camera_address) if include_neck else RSCamera(address=camera_address)
     print(f"[MAIN] Camera connected to {camera_address} (include_neck={include_neck})")
 
-    # 3c. Initialize neck publisher/state-reader when --include-neck
     neck_publisher = None
     neck_state_reader = None
     if include_neck:
@@ -724,14 +663,18 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
         print(f"[MAIN] Neck publisher bound on {neck_pub_host}:{neck_pub_port}, "
               f"state reader connected to {neck_state_zmq}")
 
-    # 3b. Initialize subgoal manager (subgoal images + per-stage subtask prompts)
-    subgoal_manager = SubgoalManager(episode_dir=episode_dir, subtasks=subtasks)
+    instruction_manager = InstructionManager(subtasks=subtasks)
     print(f"[MAIN] Task instruction: {task_instruction!r}")
 
-    # 4. Wait briefly for ZMQ PUB socket to establish connections
+    # Connect to the DZ policy server (openpi WebsocketPolicyServer; handshake on connect)
+    print(f"[MAIN] Connecting to DZ policy server at ws://{host}:{port} ...")
+    policy_client = WebsocketClientPolicy(host=host, port=port)
+    print(f"[MAIN] Connected. Server metadata: {policy_client.get_server_metadata()}")
+
     time.sleep(1.0)
 
-    # 5. Wait for first robot state
+    token_publisher.send_command(start=True, stop=False, planner=True)
+
     print("[MAIN] Waiting for robot state...")
     for i in range(30):
         state = state_sub.get_state()
@@ -744,13 +687,12 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
     else:
         print("[MAIN] WARNING: No robot state received after 15s, proceeding anyway...")
 
-    # 6. Create and start client
-    client = PsixSonicClient(
-        server_url=server_url,
+    client = DZSonicClient(
+        policy_client=policy_client,
         state_subscriber=state_sub,
         camera=camera,
         token_publisher=token_publisher,
-        subgoal_manager=subgoal_manager,
+        instruction_manager=instruction_manager,
         task_instruction=task_instruction,
         include_neck=include_neck,
         neck_publisher=neck_publisher,
@@ -762,17 +704,16 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
         client.stop()
         return
 
-    # 6b. Start stdin listener: each Enter advances the subgoal index
     def stdin_listener():
-        print("[MAIN] Press Enter to advance subgoal image.")
+        print("[MAIN] Press Enter to advance subtask.")
         while client._running.is_set():
             try:
                 line = sys.stdin.readline()
             except Exception:
                 break
-            if not line:  # EOF
+            if not line:
                 break
-            subgoal_manager.advance()
+            instruction_manager.advance()
 
     t_stdin = threading.Thread(target=stdin_listener, daemon=True)
     t_stdin.start()
@@ -799,13 +740,12 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(
-        description="Chunk-based PsiX (subtask + goal-image) Policy Client, non-RTC HTTP"
-    )
+    parser = argparse.ArgumentParser(description="Non-RTC DreamZero WebSocket Policy Client")
     parser.add_argument("--host", type=str, default="localhost",
-                        help="VLA policy server host")
-    parser.add_argument("--port", type=int, default=8014,
-                        help="VLA policy server port")
+                        help="DreamZero policy server host")
+    parser.add_argument("--port", type=int, default=48014,
+                        help="Local port reaching the DZ non-RTC server (SSH tunnel "
+                             "48014 -> nebula102:5000)")
     parser.add_argument("--zmq-host", type=str, default="localhost",
                         help="ZMQ host for robot state subscriber")
     parser.add_argument("--zmq-pub-port", type=int, default=5556,
@@ -818,21 +758,17 @@ if __name__ == "__main__":
                         help="ZMQ topic for robot state subscription")
     parser.add_argument("--camera-address", type=str, default="tcp://192.168.123.164:5558",
                         help="Camera ZMQ address")
-    parser.add_argument("--episode-dir", type=str,
-                        default="/mnt/data/weiduo/heng/GR00T-WholeBodyControl/data/real_pick_place/pick_place_eggplant_plastic_box/episode_1",
-                        help="Episode folder containing color/ and color_subgoal/ for subgoal images")
     parser.add_argument("--prompts-json", type=str,
-                        default="/mnt/data/weiduo/heng/GR00T-WholeBodyControl/data/real_pick_place/prompts.json",
+                        default="/home/xiawei/data/multi-task/prompts.json",
                         help="JSON mapping task-key -> {task_description, subtasks[]}")
-    parser.add_argument("--task-key", type=str, default="pick_place_eggplant_plastic_box",
-                        help="Key into prompts.json; selects the task_description and the "
-                             "per-stage subtask prompts.")
+    parser.add_argument("--task-key", type=str, default="pick_place_1",
+                        help="Key into prompts.json; selects task_description and per-stage subtasks.")
     parser.add_argument("--instruction", type=str, default=None,
-                        help="Override task instruction (else taken from prompts.json[task-key])")
+                        help="Override task instruction (sent verbatim; skips prompts.json)")
     parser.add_argument("--include-neck", action="store_true",
-                        help="Neck variant: states 45-dim (+neck2 appended), action chunk 80-dim "
-                             "(hand14 + token64 + neck2 appended). Also swaps RealSense for the "
-                             "neck-mounted ZED camera. Default (off) keeps the legacy 43/78-dim path.")
+                        help="Neck variant: send real 45-dim state (+neck2) and publish the "
+                             "action's neck(2) + use the neck-mounted ZED camera. Default (off) "
+                             "sends 43-dim state (server pads to 45) and ignores the action neck.")
     parser.add_argument("--neck-pub-host", type=str, default=DEFAULT_NECK_PUB_HOST,
                         help=f"Neck PUB bind host (default: {DEFAULT_NECK_PUB_HOST})")
     parser.add_argument("--neck-pub-port", type=int, default=DEFAULT_NECK_PUB_PORT,
@@ -842,10 +778,9 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # Resolve task instruction + per-stage subtasks from prompts.json (--task-key).
     task_instruction = args.instruction
     subtasks = []
-    if args.task_key:
+    if task_instruction is None and args.task_key:
         with open(args.prompts_json) as f:
             prompts = json.load(f)
         if args.task_key not in prompts:
@@ -860,16 +795,15 @@ if __name__ == "__main__":
     if task_instruction is None:
         task_instruction = TASK_INSTRUCTION
 
-    server_url = f"http://{args.host}:{args.port}/act"
     main(
-        server_url=server_url,
+        host=args.host,
+        port=args.port,
         zmq_host=args.zmq_host,
         zmq_pub_port=args.zmq_pub_port,
         zmq_sub_port=args.zmq_sub_port,
         zmq_topic=args.zmq_topic,
         zmq_sub_topic=args.zmq_sub_topic,
         camera_address=args.camera_address,
-        episode_dir=args.episode_dir,
         task_instruction=task_instruction,
         subtasks=subtasks,
         include_neck=args.include_neck,

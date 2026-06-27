@@ -142,3 +142,13 @@ mac ip: 192.168.123.158
 windows ip: 192.168.123.177
 
 
+export CHECKPOINT_DIR=.runs/psix_finetune/psix-sonic-subtask-g1.sonic_psix_neck_rtc.flow1000.cosine.lr5.0e-05.b128.gpus8.2606241510
+export CHECKPOINT_DIR=.runs/psix_finetune/psix-sonic-subtask-g1.sonic_psix_neck_rtc.flow1000.cosine.lr5.0e-05.b128.gpus8.2606220503
+export CHECKPOINT_STEP=40000
+python psix_rtc_sonic_client.py --include-neck
+rsync -avz \
+  --include='checkpoints/' \
+  --include='checkpoints/ckpt_40000/***' \
+  --exclude='checkpoints/*' \
+  hongyi@nebula100:~/psi/.runs/psix_finetune/psix-sonic-subtask-g1.sonic_psix_neck_no_rtc.flow1000.cosine.lr5.0e-05.b128.gpus8.2606261137/ \
+  .

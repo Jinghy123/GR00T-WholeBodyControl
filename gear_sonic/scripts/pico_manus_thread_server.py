@@ -777,6 +777,20 @@ def _manus25_to_tracking26(xyz25: np.ndarray, side: str) -> dict:
 # Resurrected from pico_manager_thread_server.py. Active only when
 # --use_pico_hand is passed; otherwise the Manus glove path below is used.
 
+# Which finger the Pico trigger drives, which in turn selects the gripper-IK
+# closed-pose gesture:
+#   True  -> index finger  => index-close gesture (thumb rotates to meet index = PINCH)
+#   False -> middle finger => middle-close gesture (thumb stays, plain grasp)
+# Set at startup from --pinch / --no-pinch (pico_manus) or PINCH (slimevr_pico).
+USE_PINCH = True
+
+
+def set_pinch(enabled: bool) -> None:
+    """Toggle pinch (index) vs grasp (middle) for the Pico-trigger hand path."""
+    global USE_PINCH
+    USE_PINCH = bool(enabled)
+
+
 def generate_finger_data(hand: str, trigger: float, grip: float) -> np.ndarray:
     """
     Generate finger position data from Pico controller button states.
@@ -792,11 +806,14 @@ def generate_finger_data(hand: str, trigger: float, grip: float) -> np.ndarray:
     fingertips = np.zeros([25, 4, 4])
 
     thumb = 0
-    middle = 10
+    # 5 = index (pinch), 10 = middle (grasp). Driving a finger sets the solver's
+    # thumb-to-that-finger distance to (1 - trigger), so its grip == trigger and the
+    # matching closed pose interpolates linearly with the trigger (continuous, not
+    # binary). See G1GripperInverseKinematicsSolver for the per-finger gestures.
+    driven = 5 if USE_PINCH else 10
     # Control thumb based on shoulder button state (index 4 is thumb tip)
     fingertips[4 + thumb, 0, 3] = 1.0  # open thumb
-    if trigger > 0.5:
-        fingertips[4 + middle, 0, 3] = 1.0  # close middle
+    fingertips[4 + driven, 0, 3] = float(np.clip(trigger, 0.0, 1.0))  # close ∝ trigger
 
     return fingertips
 
@@ -2785,6 +2802,17 @@ if __name__ == "__main__":
         action="store_true",
         help="Skip waiting for body tracking data (run with Manus only)",
     )
+    # Pico-trigger hand gesture: pinch (thumb+index) vs plain grasp (middle).
+    # Only matters with --use_pico_hand. Default: pinch.
+    parser.set_defaults(pinch=True)
+    parser.add_argument(
+        "--pinch", dest="pinch", action="store_true",
+        help="Pico trigger does a thumb+index PINCH (default; --use_pico_hand only)",
+    )
+    parser.add_argument(
+        "--no-pinch", dest="pinch", action="store_false",
+        help="Pico trigger does a plain middle-finger grasp instead of pinch",
+    )
     # Neck-motor publishing — drives the G1 NeckMotor over the same wire format
     # as pose_publisher.py. Default-on so a single process drives both hand and
     # neck teleop. Disable with --no_neck_pub for neck-only bring-ups using
@@ -2807,6 +2835,11 @@ if __name__ == "__main__":
         help="Multiplier on (yaw, pitch) before publishing (default: 1.5, matches pose_publisher.py)",
     )
     args = parser.parse_args()
+
+    # Pico-trigger hand gesture (pinch vs grasp). No-op unless --use_pico_hand.
+    set_pinch(args.pinch)
+    if args.use_pico_hand:
+        print(f"[hand] Pico trigger gesture: {'PINCH (thumb+index)' if args.pinch else 'GRASP (middle)'}")
 
     # Standalone VR3Pt test modes (exit after finishing)
     if args.vr3pt_test:
