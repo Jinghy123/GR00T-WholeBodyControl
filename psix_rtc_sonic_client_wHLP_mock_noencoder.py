@@ -15,7 +15,7 @@ import types
 
 import numpy as np
 
-import psix_rtc_sonic_client_wHLP as client_impl
+import ours.clients.psix_rtc_sonic_client_wHLP as client_impl
 
 
 class MockEncoderClient:

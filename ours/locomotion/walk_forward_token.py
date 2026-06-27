@@ -51,14 +51,14 @@ import numpy as np
 import onnxruntime as ort
 import zmq
 
-_GROOT_ROOT = os.path.dirname(os.path.abspath(__file__))
+_GROOT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, _GROOT_ROOT)
 
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
     build_command_message,
     pack_pose_message,
 )
-from encoder_client import EncoderClient
+from ours.common.encoder_client import EncoderClient
 
 
 # ── 常量 ────────────────────────────────────────────────────────────────────────

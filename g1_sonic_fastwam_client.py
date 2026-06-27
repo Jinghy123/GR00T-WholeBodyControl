@@ -43,7 +43,7 @@ from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
     build_command_message,
     pack_pose_message,
 )
-from encoder_client import EncoderClient
+from ours.common.encoder_client import EncoderClient
 
 # Joint order conversion: WBC publishes in Mujoco order, encoder expects IsaacLab order
 _MUJOCO_TO_ISAACLAB_DOF = np.array(

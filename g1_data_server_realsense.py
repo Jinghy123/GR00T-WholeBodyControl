@@ -36,7 +36,7 @@ import msgpack
 import numpy as np
 import zmq
 
-from episode_writer import EpisodeWriter
+from ours.recording.episode_writer import EpisodeWriter
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Configuration

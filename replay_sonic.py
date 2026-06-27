@@ -29,7 +29,7 @@ import numpy as np
 _GROOT_ROOT = os.path.expanduser("/mnt/data/weiduo/heng/GR00T-WholeBodyControl")
 sys.path.insert(0, _GROOT_ROOT)
 
-from g1_sonic_client import (
+from ours.clients.g1_sonic_client import (
     TokenPublisher,
     NeckPublisher,
     HAND_DIM,

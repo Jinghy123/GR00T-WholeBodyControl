@@ -72,7 +72,11 @@ import msgpack
 import numpy as np
 import zmq
 
-from episode_writer import EpisodeWriter
+_GROOT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _GROOT_ROOT not in sys.path:
+    sys.path.insert(0, _GROOT_ROOT)
+
+from ours.recording.episode_writer import EpisodeWriter
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Configuration

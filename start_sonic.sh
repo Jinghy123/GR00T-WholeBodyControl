@@ -37,7 +37,7 @@ send 0 "echo ${G1_PASS} | sudo -S chmod 777 /dev/ttyUSB0"
 send 0 "export LD_PRELOAD=/lib/aarch64-linux-gnu/libffi.so.7"
 send 0 "conda activate sonic"
 send 0 "cd ~/GR00T-WholeBodyControl"
-send 0 "python realsense_server.py \
+send 0 "python ours/g1_servers/realsense_server.py \
     --zed-only \
     --zmq-bind tcp://0.0.0.0:5558 \
     --enable-pico --pico-ip 192.168.0.240 \
@@ -64,7 +64,7 @@ send 2 "python gear_sonic/scripts/pico_manus_thread_server.py --use_pico_hand"
 tmux select-pane -t "${SESSION}:main.3" -T "record (data)"
 send 3 "cd ${REPO_DIR}"
 send 3 "source .venv_teleop/bin/activate"
-send 3 "python g1_data_server.py \
+send 3 "python ours/recording/g1_data_server.py \
     --neck-zmq       tcp://localhost:5570 \
     --neck-state-zmq tcp://192.168.123.164:5560"
 

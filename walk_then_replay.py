@@ -72,8 +72,8 @@ WBC_HOST, WBC_PORT, WBC_TOPIC = "localhost", 5557, "g1_debug"
 _GROOT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _GROOT_ROOT)
 
-from encoder_client import EncoderClient
-from walk_forward_token import (
+from ours.common.encoder_client import EncoderClient
+from ours.locomotion.walk_forward_token import (
     CONTROL_HZ, ENCODER_NUM_FRAMES, ENCODER_STEP_50HZ,
     MOTION_LOOK_AHEAD_50HZ, NUM_JOINTS,
     ENCODER_MODEL, PLANNER_MODEL,

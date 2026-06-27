@@ -51,7 +51,7 @@ from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
     pack_pose_message,
     build_command_message,
 )
-from encoder_client import EncoderClient
+from ours.common.encoder_client import EncoderClient
 
 # ---------------- Configuration ----------------
 TASK_INSTRUCTION = "pick up the green grapes and place it into the green bowl"

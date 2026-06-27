@@ -31,7 +31,7 @@ import zmq
 import msgpack
 from websocket import WebSocketApp
 
-_GROOT_ROOT = os.path.expanduser("~/hsc/GR00T-WholeBodyControl")
+_GROOT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _GROOT_ROOT not in sys.path:
     sys.path.insert(0, _GROOT_ROOT)
 
@@ -647,7 +647,7 @@ class RTCWebSocketClient:
         self._neck_publisher = neck_publisher
         self._neck_state_reader = neck_state_reader
         try:
-            from encoder_client import EncoderClient
+            from ours.common.encoder_client import EncoderClient
             self._encoder = EncoderClient(ENCODER_MODEL, mode=0)
         except Exception as e:
             print(f"[init-prev] encoder load failed ({e}); first chunk falls back to unconditioned")

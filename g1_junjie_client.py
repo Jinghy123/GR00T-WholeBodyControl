@@ -50,7 +50,7 @@ from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
     build_command_message,
     pack_pose_message,
 )
-from encoder_client import EncoderClient
+from ours.common.encoder_client import EncoderClient
 
 # WBC publishes qpos in Mujoco order; the ONNX encoder expects IsaacLab order.
 # (Same constant as g1_sonic_client.py.)

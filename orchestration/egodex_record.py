@@ -43,8 +43,8 @@ from scipy.spatial.transform import Rotation as R
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from encoder_client import EncoderClient  # noqa: E402
-from walk_forward_token import (  # noqa: E402
+from ours.common.encoder_client import EncoderClient  # noqa: E402
+from ours.locomotion.walk_forward_token import (  # noqa: E402
     ENCODER_MODEL, G1_DEFAULT_ANGLES_MUJOCO, _MUJOCO_TO_ISAACLAB_DOF,
     fsq_quantize, resample_30hz_to_50hz,
 )

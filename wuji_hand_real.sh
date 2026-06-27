@@ -20,7 +20,7 @@ else
 fi
 
 echo "Using Python: $PYTHON_BIN"
-$PYTHON_BIN "${SCRIPT_DIR}/wuji_hand_server.py" \
+$PYTHON_BIN "${SCRIPT_DIR}/ours/g1_servers/wuji_hand_server.py" \
     --hand_side ${hand_side} \
     --config ${retarget_config} \
     --tracking_host ${tracking_host} \

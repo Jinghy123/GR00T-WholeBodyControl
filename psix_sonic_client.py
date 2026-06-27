@@ -20,7 +20,7 @@ from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
     pack_pose_message,
     build_command_message,
 )
-from encoder_client import EncoderClient
+from ours.common.encoder_client import EncoderClient
 
 # json_numpy.patch() monkey-patches stdlib json so np.ndarray round-trips over HTTP.
 # The PsiX non-RTC server (psix_serve_sonic.py) (de)serializes with helpers.py's

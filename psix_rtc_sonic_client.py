@@ -60,7 +60,7 @@ def fsq_quantize(continuous_value, fsq_min=FSQ_MIN, fsq_max=FSQ_MAX, fsq_step=FS
 
 # Encode the current robot pose into a 64-D sonic body token (same encoder the non-RTC
 # client uses to "freeze" the body token), to seed the server's first-chunk RTC prev-action.
-from encoder_client import EncoderClient
+from ours.common.encoder_client import EncoderClient
 ENCODER_MODEL = "gear_sonic_deploy/policy/release/model_encoder.onnx"
 _MUJOCO_TO_ISAACLAB_DOF = np.array(
     [0, 6, 12, 1, 7, 13, 2, 8, 14, 3, 9, 15, 22, 4, 10, 16, 23, 5, 11, 17, 24, 18, 25, 19, 26, 20, 27, 21, 28],
