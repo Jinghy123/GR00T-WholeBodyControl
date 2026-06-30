@@ -4,7 +4,6 @@ import time
 import threading
 import json
 import signal
-from collections import deque
 
 import cv2
 import numpy as np
@@ -35,8 +34,21 @@ FSQ_STEP = 0.0625  # = 1/16
 # Control frequency
 FREQ_POLICY = 30  # Hz
 
-# Action layout: token(64) + hand_joints(14) = 78
-ACTION_DIM = 78
+# Action/state layout (matches psi_rtc_sonic_client conventions):
+#   default:        states(43) = hand(14) + arm(14) + leg(15)
+#                    action(78) = token(64) + hand_joints(14)
+#   --include-neck:  states(45) = states(43) + neck(2) [appended at the end]
+#                    action(80) = token(64) + hand_joints(14) + neck(2) [neck is the last 2 dims]
+HAND_DIM = 14
+NECK_DIM = 2
+TOKEN_DIM = 64
+ACTION_DIM_DEFAULT = 78
+ACTION_DIM_NECK = 80
+
+# Neck publisher configuration
+DEFAULT_NECK_PUB_HOST = "*"
+DEFAULT_NECK_PUB_PORT = 5570
+DEFAULT_NECK_STATE_ZMQ = "tcp://192.168.123.164:5560"
 
 # Encoder model path (for frozen token between chunks)
 ENCODER_MODEL = "gear_sonic_deploy/policy/release/model_encoder.onnx"
@@ -84,11 +96,39 @@ class RSCamera:
             self.context.term()
 
 
+# ---------------- ZedNeckCamera ----------------
+class ZedNeckCamera:
+    """Neck-mounted ZED camera (--include-neck). Server reply is 4-part
+    multipart [ego_rgb, ego_stereo, left_wrist, right_wrist]; only slot 0 used."""
+
+    def __init__(self, address="tcp://192.168.123.164:5558"):
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REQ)
+        self.socket.connect(address)
+
+    def get_frame(self):
+        self.socket.send(b"get_frame")
+        parts = self.socket.recv_multipart()
+        while len(parts) < 4:
+            parts.append(b"")
+        ego_rgb_jpeg = parts[0]
+        if not ego_rgb_jpeg:
+            return None
+        arr = np.frombuffer(ego_rgb_jpeg, dtype=np.uint8)
+        return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+    def close(self):
+        if self.socket:
+            self.socket.close()
+        if self.context:
+            self.context.term()
+
+
 # ---------------- RobotStateSubscriber ----------------
 class RobotStateSubscriber:
     """Subscribe to robot state published by g1_deploy_onnx_ref on ZMQ PUB port."""
 
-    def __init__(self, host="localhost", port=5557, topic="g1_debug", queue_size=30):
+    def __init__(self, host="localhost", port=5557, topic="g1_debug"):
         self._context = zmq.Context()
         self._socket = self._context.socket(zmq.SUB)
         self._socket.connect(f"tcp://{host}:{port}")
@@ -98,7 +138,7 @@ class RobotStateSubscriber:
 
         self._topic = topic
         self._lock = threading.Lock()
-        self._state_queue = deque(maxlen=queue_size)
+        self._latest_state = None
         self._running = True
         self._thread = threading.Thread(target=self._recv_loop, daemon=True)
         self._thread.start()
@@ -121,42 +161,69 @@ class RobotStateSubscriber:
             try:
                 state = msgpack.unpackb(payload, raw=False)
                 with self._lock:
-                    self._state_queue.append(state)
+                    self._latest_state = state
             except Exception as e:
                 print(f"[StateSubscriber] Unpack error: {e}")
 
     def get_state(self):
-        """Return the latest robot state dict, or None if queue is empty."""
+        """Return the latest robot state dict, or None if not yet received."""
         with self._lock:
-            return self._state_queue[-1] if self._state_queue else None
-
-    def get_all_states(self):
-        """Return a list of all queued robot states, padded with earliest frame to reach queue_size."""
-        with self._lock:
-            if not self._state_queue:
-                return []
-            states = list(self._state_queue)
-            if len(states) < self._state_queue.maxlen:
-                earliest = states[0]
-                padding = [earliest] * (self._state_queue.maxlen - len(states))
-                return padding + states
-            return states
-
-    def get_state_queue(self):
-        """Return a copy of the state queue (as deque)."""
-        with self._lock:
-            return deque(self._state_queue)
-
-    def clear_states(self):
-        """Clear all queued states."""
-        with self._lock:
-            self._state_queue.clear()
+            return self._latest_state
 
     def stop(self):
         self._running = False
         self._thread.join(timeout=0.5)
         self._socket.close(linger=0)
         self._context.term()
+
+
+# ---------------- NeckStateReader / NeckPublisher ----------------
+class NeckStateReader:
+    """SUB to realsense_server.py's neck present-position stream (JSON [yaw, pitch])."""
+
+    def __init__(self, addr):
+        self._ctx = zmq.Context.instance()
+        self._sock = self._ctx.socket(zmq.SUB)
+        self._sock.setsockopt(zmq.CONFLATE, 1)
+        self._sock.setsockopt(zmq.SUBSCRIBE, b"")
+        self._sock.setsockopt(zmq.LINGER, 0)
+        self._sock.connect(addr)
+        self._latest = None
+
+    def get_latest(self):
+        try:
+            raw = self._sock.recv(flags=zmq.NOBLOCK)
+        except zmq.Again:
+            return self._latest
+        try:
+            msg = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return self._latest
+        if isinstance(msg, (list, tuple)) and len(msg) >= 2:
+            self._latest = [float(msg[0]), float(msg[1])]
+        return self._latest
+
+    def stop(self):
+        self._sock.close(linger=0)
+
+
+class NeckPublisher:
+    """PUB of [yaw, pitch] JSON for the G1 NeckMotor (matches pose_publisher.py wire format)."""
+
+    def __init__(self, host=DEFAULT_NECK_PUB_HOST, port=DEFAULT_NECK_PUB_PORT):
+        self._ctx = zmq.Context()
+        self._sock = self._ctx.socket(zmq.PUB)
+        self._sock.setsockopt(zmq.SNDHWM, 1)
+        self._sock.setsockopt(zmq.LINGER, 0)
+        self._sock.bind(f"tcp://{host}:{port}")
+
+    def publish(self, yaw, pitch):
+        msg = json.dumps([float(yaw), float(pitch)]).encode("utf-8")
+        self._sock.send(msg)
+
+    def stop(self):
+        self._sock.close(linger=0)
+        self._ctx.term()
 
 
 # ---------------- TokenPublisher ----------------
@@ -206,13 +273,16 @@ class PsiSonicClient:
     """
 
     def __init__(self, server_url, state_subscriber, camera, token_publisher, instruction,
-                 http_timeout=30.0):
+                 http_timeout=30.0, include_neck=False, neck_publisher=None, neck_state_reader=None):
         self._server_url = server_url
         self._state_sub = state_subscriber
         self._camera = camera
         self._token_publisher = token_publisher
         self._instruction = instruction
         self._http_timeout = http_timeout
+        self._include_neck = include_neck
+        self._neck_publisher = neck_publisher
+        self._neck_state_reader = neck_state_reader
 
         # Encoder for frozen token
         self._encoder = EncoderClient(ENCODER_MODEL, mode=0)
@@ -232,20 +302,27 @@ class PsiSonicClient:
     # ---------- Policy request ----------
     def _build_observation_payload(self):
         """Capture current state + frame, build payload dict (json_numpy-aware)."""
-        # state = self._state_sub.get_state()
-        # assert state is not None, "Robot state not available"
-        states = self._state_sub.get_all_states()
-        assert len(states) > 0, "No robot states available"
+        state = self._state_sub.get_state()
+        assert state is not None, "Robot state not available"
 
-        state_list = []
-        for state in states:
-            body_q = np.array(state["body_q_measured"], dtype=np.float32)
-            left_hand_states = np.array(state["left_hand_q"], dtype=np.float32)
-            right_hand_states = np.array(state["right_hand_q"], dtype=np.float32)
-            state = np.concatenate((body_q, left_hand_states, right_hand_states), axis=0)
-            state_list.append(state)
-        
-        states_np = np.stack(state_list, axis=0)  # (N, 29)
+        body_q = np.array(state["body_q_measured"], dtype=np.float32)  # (29,) = [leg/base(15) | arm(14)]
+        left_hand_states = np.array(state["left_hand_q"], dtype=np.float32)   # (7,)
+        right_hand_states = np.array(state["right_hand_q"], dtype=np.float32) # (7,)
+
+        leg_states = body_q[:15]
+        arm_states = body_q[15:29]
+        states = np.concatenate(
+            (left_hand_states, right_hand_states, arm_states, leg_states), axis=0
+        )  # (43,)
+
+        if self._include_neck:
+            neck_latest = self._neck_state_reader.get_latest()
+            neck_state = (
+                np.asarray(neck_latest, dtype=np.float32)
+                if neck_latest is not None
+                else np.zeros(NECK_DIM, dtype=np.float32)
+            )
+            states = np.concatenate((states, neck_state), axis=0)  # (45,)
 
         frame = self._camera.get_frame()
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -253,7 +330,7 @@ class PsiSonicClient:
 
         payload = {
             "image": {"observation.images.egocentric": frame},
-            "state": {"states": states_np},
+            "state": {"states": states},
             "gt_action": None,
             "dataset_name": None,
             "instruction": self._instruction,
@@ -289,15 +366,19 @@ class PsiSonicClient:
             print(f"[Inference] Response parse error: {e}")
             return None
 
-        if chunk.shape[-1] != ACTION_DIM:
-            print(f"[Inference] Unexpected action dim: {chunk.shape}, expected (*, {ACTION_DIM})")
+        expected_dim = ACTION_DIM_NECK if self._include_neck else ACTION_DIM_DEFAULT
+        if chunk.shape[-1] != expected_dim:
+            print(f"[Inference] Unexpected action dim: {chunk.shape}, expected (*, {expected_dim})")
             return None
 
-        # Apply FSQ quantization on token part, leave hand joints unchanged
-        token_ori = chunk[:, :64]
-        hand_joints = chunk[:, 64:78]
+        # Apply FSQ quantization on token part, leave hand joints (and neck) unchanged
+        token_ori = chunk[:, :TOKEN_DIM]
+        hand_joints = chunk[:, TOKEN_DIM:TOKEN_DIM + HAND_DIM]
         token_qtz = fsq_quantize(token_ori)
-        chunk_out = np.concatenate([token_qtz, hand_joints], axis=-1).astype(np.float32)
+        parts = [token_qtz, hand_joints]
+        if self._include_neck:
+            parts.append(chunk[:, TOKEN_DIM + HAND_DIM:TOKEN_DIM + HAND_DIM + NECK_DIM])
+        chunk_out = np.concatenate(parts, axis=-1).astype(np.float32)
 
         print(f"[Inference] Chunk received: shape={chunk_out.shape}, "
               f"token range=[{token_ori.min():.4f},{token_ori.max():.4f}] → "
@@ -385,9 +466,11 @@ class PsiSonicClient:
                         body_quat = np.tile(base_quat, (10, 1)).astype(np.float32)  # (10, 4)
 
                         enc_token = self._encoder.encode(joint_pos, joint_vel, body_quat)  # (64,)
-                        # action layout: token(64) + hand_joints(14)
-                        # keep hand joints from last action, replace body token
-                        frozen_action = np.concatenate([enc_token, last_action[64:78]])
+                        # keep hand (and neck) from last action, replace body token
+                        parts = [enc_token, last_action[TOKEN_DIM:TOKEN_DIM + HAND_DIM]]
+                        if self._include_neck:
+                            parts.append(last_action[TOKEN_DIM + HAND_DIM:TOKEN_DIM + HAND_DIM + NECK_DIM])
+                        frozen_action = np.concatenate(parts)
                         print(f"[PublishLoop] Chunk done ({len(chunk)} tokens), "
                               f"encoder freeze token computed.")
                     else:
@@ -413,7 +496,10 @@ class PsiSonicClient:
                     action = frozen_action
                     using_last_action = True
 
-            self._token_publisher.publish_token(action)
+            self._token_publisher.publish_token(action[:TOKEN_DIM + HAND_DIM])
+            if self._include_neck and self._neck_publisher is not None:
+                neck = action[TOKEN_DIM + HAND_DIM:TOKEN_DIM + HAND_DIM + NECK_DIM]
+                self._neck_publisher.publish(neck[0], neck[1])
 
             # Maintain 30 Hz
             elapsed = time.perf_counter() - t_start
@@ -460,13 +546,18 @@ class PsiSonicClient:
             pass
         self._state_sub.stop()
         self._token_publisher.stop()
+        if self._neck_publisher is not None:
+            self._neck_publisher.stop()
+        if self._neck_state_reader is not None:
+            self._neck_state_reader.stop()
 
         print("[PsiSonicClient] Stopped.")
 
 
 # ---------------- Main ----------------
 def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_topic,
-         camera_address, instruction, state_history_length=1):
+         camera_address, instruction, include_neck=False, neck_pub_host=DEFAULT_NECK_PUB_HOST,
+         neck_pub_port=DEFAULT_NECK_PUB_PORT, neck_state_zmq=DEFAULT_NECK_STATE_ZMQ):
     print("[MAIN] Initializing components...")
 
     # 1. Initialize token publisher (ZMQ PUB, Protocol v4)
@@ -474,12 +565,21 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
     print(f"[MAIN] TokenPublisher bound on port {zmq_pub_port}, topic='{zmq_topic}'")
 
     # 2. Initialize robot state subscriber (ZMQ SUB)
-    state_sub = RobotStateSubscriber(host=zmq_host, port=zmq_sub_port, topic=zmq_sub_topic, queue_size=state_history_length)
+    state_sub = RobotStateSubscriber(host=zmq_host, port=zmq_sub_port, topic=zmq_sub_topic)
     print(f"[MAIN] State subscriber connected to {zmq_host}:{zmq_sub_port}, topic='{zmq_sub_topic}'")
 
-    # 3. Initialize camera
-    camera = RSCamera(address=camera_address)
-    print(f"[MAIN] Camera connected to {camera_address}")
+    # 3. Initialize camera (neck-mounted ZED when --include-neck, else RealSense)
+    camera = ZedNeckCamera(address=camera_address) if include_neck else RSCamera(address=camera_address)
+    print(f"[MAIN] Camera connected to {camera_address} (include_neck={include_neck})")
+
+    # 3b. Initialize neck publisher/state-reader when --include-neck
+    neck_publisher = None
+    neck_state_reader = None
+    if include_neck:
+        neck_publisher = NeckPublisher(host=neck_pub_host, port=neck_pub_port)
+        neck_state_reader = NeckStateReader(neck_state_zmq)
+        print(f"[MAIN] Neck publisher bound on {neck_pub_host}:{neck_pub_port}, "
+              f"state reader connected to {neck_state_zmq}")
 
     # 4. Wait briefly for ZMQ PUB socket to establish connections
     time.sleep(1.0)
@@ -502,6 +602,9 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
         camera=camera,
         token_publisher=token_publisher,
         instruction=instruction,
+        include_neck=include_neck,
+        neck_publisher=neck_publisher,
+        neck_state_reader=neck_state_reader,
     )
 
     if not client.start():
@@ -552,8 +655,17 @@ if __name__ == "__main__":
                         help="Camera ZMQ address")
     parser.add_argument("--instruction", type=str, default=None,
                         help="Task instruction for VLA policy")
-    parser.add_argument("--state-history-length", type=int, default=1,
-                        help="Number of past frames to include in state history")
+    parser.add_argument("--include-neck", action="store_true",
+                        help="Neck variant: states 45-dim (+neck2 appended), action 80-dim "
+                             "(token64 + hand14 + neck2 appended). Also swaps RealSense for "
+                             "the neck-mounted ZED camera. Default (off) keeps the legacy "
+                             "43/78-dim path.")
+    parser.add_argument("--neck-pub-host", type=str, default=DEFAULT_NECK_PUB_HOST,
+                        help=f"Neck PUB bind host (default: {DEFAULT_NECK_PUB_HOST})")
+    parser.add_argument("--neck-pub-port", type=int, default=DEFAULT_NECK_PUB_PORT,
+                        help=f"Neck PUB port (default: {DEFAULT_NECK_PUB_PORT})")
+    parser.add_argument("--neck-state-zmq", type=str, default=DEFAULT_NECK_STATE_ZMQ,
+                        help=f"Neck-state SUB address (default: {DEFAULT_NECK_STATE_ZMQ})")
 
     args = parser.parse_args()
 
@@ -569,5 +681,8 @@ if __name__ == "__main__":
         zmq_sub_topic=args.zmq_sub_topic,
         camera_address=args.camera_address,
         instruction=instruction,
-        state_history_length=args.state_history_length,
+        include_neck=args.include_neck,
+        neck_pub_host=args.neck_pub_host,
+        neck_pub_port=args.neck_pub_port,
+        neck_state_zmq=args.neck_state_zmq,
     )

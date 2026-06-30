@@ -7,7 +7,8 @@ to simulate different inference latencies.
 
 Pattern per cycle:
   1. Send CHUNK_SIZE tokens at 30 Hz  (EXECUTING)
-  2. Run encoder on current robot state → freeze token, send LATENCY_FRAMES times (WAITING)
+  2. For LATENCY_FRAMES ticks, re-read the live robot state and re-run the
+     encoder each tick → publish a fresh token at 30 Hz (WAITING)
   3. Repeat
 
 Usage:
@@ -17,7 +18,7 @@ Usage:
 """
 
 # ── Hard-coded defaults ────────────────────────────────────────────────────────
-DEFAULT_EPISODE_DIR    = "/home/xiawei/data/pick_bottle_and_turn_and_pour_into_cup/episode_35"
+DEFAULT_EPISODE_DIR    = "/home/hongyi/data/pick_place/demonstration_2026-06-20_01-10-15/episode_38"
 DEFAULT_ZMQ_HOST       = "*"
 DEFAULT_ZMQ_PUB_PORT   = 5556
 DEFAULT_ZMQ_TOPIC      = "pose"
@@ -255,12 +256,13 @@ def _send_one(publisher, token, left_hand, right_hand, dt, dry_run,
         time.sleep(sleep_t)
 
 
-def _compute_freeze_token(encoder, state_reader, last_token, last_left, last_right):
+def _compute_live_token(encoder, state_reader, last_token, last_left, last_right,
+                        verbose=False):
     """
-    Read current robot state and run encoder to produce a freeze token.
+    Read the *current* robot state and run encoder to produce a fresh token.
     Falls back to last_token if state is unavailable.
 
-    Returns (freeze_token, last_left, last_right) — hand joints unchanged.
+    Returns (token, last_left, last_right) — hand joints unchanged.
     """
     state = state_reader.get_state() if state_reader is not None else None
     if state is not None:
@@ -271,12 +273,14 @@ def _compute_freeze_token(encoder, state_reader, last_token, last_left, last_rig
         joint_vel = np.zeros((10, 29), dtype=np.float32)
         body_quat = np.tile(base_quat, (10, 1)).astype(np.float32)  # (10, 4)
 
-        freeze_token = encoder.encode(joint_pos, joint_vel, body_quat)  # (64,)
-        print(f"\n[ReplayLatency] Encoder freeze token computed from robot state.")
+        token = encoder.encode(joint_pos, joint_vel, body_quat)  # (64,)
+        if verbose:
+            print(f"\n[ReplayLatency] Encoder token computed from robot state.")
     else:
-        freeze_token = last_token
-        print(f"\n[ReplayLatency] No robot state available — repeating last token.")
-    return freeze_token, last_left, last_right
+        token = last_token
+        if verbose:
+            print(f"\n[ReplayLatency] No robot state available — repeating last token.")
+    return token, last_left, last_right
 
 
 def replay(episode_dir, zmq_host, zmq_pub_port, zmq_topic,
@@ -307,7 +311,7 @@ def replay(episode_dir, zmq_host, zmq_pub_port, zmq_topic,
     encoder      = None
     if not dry_run:
         state_reader = WBCStateReader(host=wbc_host, port=wbc_port, topic=wbc_topic)
-        encoder_path = os.path.join(_GROOT_ROOT, ENCODER_MODEL)
+        encoder_path = ENCODER_MODEL
         encoder = EncoderClient(encoder_path, mode=0)
 
     print("[ReplayLatency] Waiting for ZMQ connections...")
@@ -333,21 +337,33 @@ def replay(episode_dir, zmq_host, zmq_pub_port, zmq_topic,
                 _send_one(publisher, token, left_hand, right_hand, dt, dry_run,
                           neck_publisher=neck_publisher, neck=neck)
 
-            # ── WAITING: encoder freeze token for latency_frames ticks ────
+            # ── WAITING: re-encode the *live* robot state every tick ──────
+            # Instead of freezing one token, read the current state and run
+            # the encoder each frame so we publish a fresh token at 30 Hz.
+            # The encode is timed inside the per-frame budget so the real
+            # rate stays at `frequency` (warns if encode is too slow).
             last_token, last_left, last_right, last_neck = chunk[-1]
-            if not dry_run:
-                freeze_token, freeze_left, freeze_right = _compute_freeze_token(
-                    encoder, state_reader, last_token, last_left, last_right
-                )
-            else:
-                freeze_token, freeze_left, freeze_right = last_token, last_left, last_right
-
-            # Hold the last neck angle through the wait (no encoder freeze
-            # equivalent — head stays where it was at end of chunk).
             for h in range(latency_frames):
+                t0 = time.perf_counter()
+                if not dry_run:
+                    live_token, send_left, send_right = _compute_live_token(
+                        encoder, state_reader, last_token, last_left, last_right
+                    )
+                    publisher.publish_token(live_token, left_hand=send_left, right_hand=send_right)
+                    if neck_publisher is not None:
+                        # Hold the last neck angle through the wait (head stays
+                        # where it was at end of chunk).
+                        if last_neck is not None:
+                            neck_publisher.publish(*last_neck)
+                        else:
+                            neck_publisher.publish_last()
                 print(f"[ReplayLatency] chunk {chunk_idx+1}/{n_chunks}  hold   {h+1:4d}/{latency_frames}  [WAITING]", end="\r")
-                _send_one(publisher, freeze_token, freeze_left, freeze_right, dt, dry_run,
-                          neck_publisher=neck_publisher, neck=last_neck)
+                sleep_t = dt - (time.perf_counter() - t0)
+                if sleep_t > 0:
+                    time.sleep(sleep_t)
+                elif not dry_run:
+                    print(f"\n[ReplayLatency] WARN: encode+send took {-sleep_t*1e3:.1f}ms over budget "
+                          f"({dt*1e3:.1f}ms) — falling below {frequency}Hz.")
 
     except KeyboardInterrupt:
         print("\n[ReplayLatency] Interrupted by user.")
