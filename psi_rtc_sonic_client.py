@@ -302,7 +302,7 @@ class RTCWebSocketClient:
         if action.ndim > 1:
             action = action[0]
 
-        hand_joints = action[TOKEN_DIM:TOKEN_DIM+HAND_DIM]
+        hand_joints = action[TOKEN_DIM:HAND_DIM + TOKEN_DIM]
         token_ori = action[:TOKEN_DIM]
         token_qtz = fsq_quantize(token_ori)
 

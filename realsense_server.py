@@ -174,22 +174,10 @@ def zed_capture_thread(cfg: Any) -> None:
     right_mat = sl.Mat()
     runtime = sl.RuntimeParameters()
 
-    # Independent viewer PUB stream. Decoupled from the REP recording socket
-    # (5558) so a slow viewer never backpressures the recorder. PUB drops
-    # frames for slow subscribers, so the recording rate stays at full FPS.
-    viewer_pub = None
-    if getattr(cfg, "viewer_pub", ""):
-        try:
-            viewer_pub = zmq.Context.instance().socket(zmq.PUB)
-            viewer_pub.setsockopt(zmq.SNDHWM, 2)
-            viewer_pub.setsockopt(zmq.LINGER, 0)
-            viewer_pub.bind(cfg.viewer_pub)
-            print(f"[ZED] Viewer PUB bound: {cfg.viewer_pub}")
-        except Exception as e:
-            print(f"\033[91m[ZED] Viewer PUB bind failed: {e}\033[0m")
-            viewer_pub = None
-
     print(f"[ZED] Started: resolution={cfg.resolution_name} fps={cfg.fps}")
+
+    fps_t0 = time.time()
+    fps_count = 0
 
     while True:
         try:
@@ -224,19 +212,51 @@ def zed_capture_thread(cfg: Any) -> None:
                 frame_seq += 1
                 frame_cond.notify_all()
 
-            # Broadcast to viewers on the separate PUB. NOBLOCK + low SNDHWM
-            # means a stalled viewer just drops frames instead of stalling
-            # this capture thread or the REP recording path.
-            if viewer_pub is not None:
-                try:
-                    viewer_pub.send_multipart([enc_rgb, enc_stereo],
-                                              flags=zmq.NOBLOCK)
-                except zmq.Again:
-                    pass
+            fps_count += 1
+            now = time.time()
+            if now - fps_t0 >= 5.0:
+                print(f"[ZED] capture {fps_count / (now - fps_t0):.1f} fps")
+                fps_t0 = now
+                fps_count = 0
 
         except Exception as e:
             print(f"[ZED] Capture error: {e}")
             time.sleep(0.01)
+
+
+def viewer_pub_thread(cfg: Any) -> None:
+    """Sends frames to the live viewer on a separate thread so the PUB work
+    never rides the capture loop's critical path (off it, an attached viewer
+    can't slow frame production / recording)."""
+    if not getattr(cfg, "viewer_pub", ""):
+        return
+    try:
+        sock = zmq.Context.instance().socket(zmq.PUB)
+        sock.setsockopt(zmq.SNDHWM, 2)
+        sock.setsockopt(zmq.LINGER, 0)
+        sock.bind(cfg.viewer_pub)
+        print(f"[ZED] Viewer PUB bound: {cfg.viewer_pub}")
+    except Exception as e:
+        print(f"\033[91m[ZED] Viewer PUB bind failed: {e}\033[0m")
+        return
+
+    last_seq = 0
+    while True:
+        with frame_cond:
+            while frame_seq == last_seq:
+                frame_cond.wait(timeout=0.1)
+            enc_rgb = latest_ego_rgb_bytes
+            enc_stereo = latest_ego_stereo_bytes
+            last_seq = frame_seq
+        if enc_rgb is None:
+            continue
+        try:
+            sock.send_multipart(
+                [enc_rgb, enc_stereo if enc_stereo is not None else b""],
+                flags=zmq.NOBLOCK,
+            )
+        except zmq.Again:
+            pass
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1001,6 +1021,9 @@ def start_server(cfg: Any) -> None:
 
     threading.Thread(
         target=zed_capture_thread, args=(cfg,), daemon=True
+    ).start()
+    threading.Thread(
+        target=viewer_pub_thread, args=(cfg,), daemon=True
     ).start()
 
     # ── DISABLED: D405 wrists ────────────────────────────────────────────────

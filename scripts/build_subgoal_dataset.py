@@ -1,11 +1,10 @@
 """Rebuild the color_subgoal/ + prompts.json folder layout (consumed by
 psix_sonic_client.py's SubgoalManager) from a converted lerobot dataset.
 
-Source: /home/hongyi/data/g1_neck_0617/g1 (lerobot v3, task per episode,
-sub_goal_image_path column pointing at images/observation.images.subgoal/episode_XXXXXX/segment_NN.jpg)
-
-Output: /home/hongyi/data/real_g1_neck_0617/<task_folder>/episode_<i>/color_subgoal/segment_NN.jpg
-        /home/hongyi/data/real_g1_neck_0617/prompts.json
+Source: lerobot v3 dataset (task per episode, sub_goal_image_path column pointing
+        at images/observation.images.subgoal/episode_XXXXXX/segment_NN.jpg)
+Output: <DST>/<task_folder>/episode_<i>/color_subgoal/segment_NN.jpg
+        <DST>/prompts.json
 """
 import json
 import os
@@ -13,8 +12,8 @@ import shutil
 
 import pandas as pd
 
-SRC = "/home/hongyi/data/g1_neck_0617/g1"
-DST = "/home/hongyi/data/real_g1_neck_0617"
+SRC = "/home/hongyi/data/g1_neck30fps_0622/g1"
+DST = "/home/hongyi/data/real_pick_place"
 
 
 def load_jsonl(path):

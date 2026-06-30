@@ -30,8 +30,6 @@ python realsense_server.py \
     --pose-zmq tcp://192.168.123.222:5570
 ```
 
-> `--pose-zmq` 指向**桌面端**脖子发布者的 IP（此处 `192.168.0.105`）。
-
 ### 1.2 桌面端
 
 先启动 XRoboToolKit 守护进程：
@@ -81,29 +79,15 @@ python test_viewer.py --server 192.168.123.164 --port 5559 --show-stereo
 Manus 手套 SDK（在 `:8000` 推流）：
 
 ```bash
-~/hongyi/Unitree_Robotics/MANUS/Bidex_Manus_Teleop/MANUS_Core_2.4.0_SDK/SDKClient_Linux$ ./SDKClient_Linux.out
+../MANUS_Core_2.4.0_SDK/SDKClient_Linux$ ./SDKClient_Linux.out
 ```
 
-```
-connect g1 121
-```
 
 ---
 
 ## 2. 推理（Inference）
 
 ### 2.1 G1 板载
-
-先用 teleop 环境跑一次相机 server（清掉占用相机的进程）：
-
-```bash
-cd SONIC/
-conda activate teleop
-sudo killall -9 videohub_pc4
-python realsense_server.py
-```
-
-再用 sonic 环境启动相机 + 脖子 server：
 
 ```bash
 sudo chmod 777 /dev/ttyUSB0
@@ -117,9 +101,6 @@ python realsense_server.py \
     --pose-zmq tcp://192.168.123.222:5570
 ```
 
-> 推理时 `--pose-zmq` 指向 `192.168.123.222`（与遥操作的 `192.168.0.105` 不同），
-> 且不带 `--enable-pico`。
-
 ### 2.2 桌面端
 
 启动 WBC deploy：
@@ -131,10 +112,8 @@ source scripts/setup_env.sh
 ```
 
 图像客户端：
-22
 ```bash
-cd ~/hongyi/Unitree_Robotics/Humanoid-Teleop/teleop/image_server
-python image_client.py
+python test_viewer.py --server 192.168.123.164 --port 5559 --show-stereo
 ```
 
 端口转发：
@@ -161,10 +140,5 @@ pc ip: 192.168.123.222
 g1 ip: 192.168.123.164
 mac ip: 192.168.123.158
 windows ip: 192.168.123.177
-
-
-mac:
-ssh weiduoyuan@192.168.123.222
-./start_sonic.sh
 
 

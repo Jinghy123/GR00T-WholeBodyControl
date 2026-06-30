@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import collections
 import time
 
 import cv2
@@ -58,6 +59,9 @@ def run(args):
     frames = 0
     t0 = time.time()
     last_report = t0
+    # Sliding window of recent frame timestamps for an instantaneous FPS.
+    recv_times: collections.deque = collections.deque()
+    WINDOW_S = 2.0
 
     try:
         while True:
@@ -71,7 +75,8 @@ def run(args):
 
             while len(parts) < 2:
                 parts.append(b"")
-            ego, stereo = (_decode(p) for p in parts[:2])
+            ego = _decode(parts[0])
+            stereo = _decode(parts[1]) if args.show_stereo else None
 
             if ego is not None:
                 cv2.imshow("ZED Ego", ego)
@@ -80,8 +85,12 @@ def run(args):
 
             frames += 1
             now = time.time()
+            recv_times.append(now)
+            while recv_times and now - recv_times[0] > WINDOW_S:
+                recv_times.popleft()
             if now - last_report > 2.0:
-                fps = frames / (now - t0)
+                span = now - recv_times[0] if len(recv_times) > 1 else 0.0
+                fps = (len(recv_times) - 1) / span if span > 0 else 0.0
                 got = [n for n, x in zip(["ego", "stereo"],
                                           [ego, stereo]) if x is not None]
                 print(f"[viewer] {frames} frames, {fps:.1f} fps, streams={got}")
