@@ -20,7 +20,7 @@ Usage:
 # DEFAULT_EPISODE_DIR    = "/home/xiawei/hongyi/Unitree_Robotics/Humanoid-Teleop/teleop/data/g1_1001/Basic/Pick_bottle_and_turn_and_pour_into_cup/episode_16"
 # DEFAULT_EPISODE_DIR    = "/home/xiawei/hongyi/Unitree_Robotics/Humanoid-Teleop/teleop/data/g1_1001/Basic/Spray_the_bowl_and_wipe_it_and_stack_it_up/episode_1"
 # DEFAULT_EPISODE_DIR    = "/home/xiawei/data/unfold_a_tablet_cover_h1/episode_0"
-DEFAULT_EPISODE_DIR    = "/home/xiawei/data/Spray_the_bowl_and_wipe_it_and_stack_it_up/episode_10"
+DEFAULT_EPISODE_DIR    = "/mnt/data/weiduo/heng/data/pick_place/demonstration_2026-06-20_01-10-15/episode_21"
 DEFAULT_ZMQ_HOST        = "*"
 DEFAULT_ZMQ_PUB_PORT    = 5556
 DEFAULT_ZMQ_TOPIC      = "pose"
@@ -151,10 +151,10 @@ def _extract_neck(frame):
 # ── Load episode (new format: list of dict) ─────────────────────────────────
 
 def load_episode(episode_dir):
-    """Load episode from data_sonic.json (new format: list of dict)."""
-    json_path = os.path.join(episode_dir, "data_sonic.json")
+    """Load episode from data.json (new format: list of dict)."""
+    json_path = os.path.join(episode_dir, "data.json")
     if not os.path.exists(json_path):
-        raise FileNotFoundError(f"data_sonic.json not found in {episode_dir}")
+        raise FileNotFoundError(f"data.json not found in {episode_dir}")
 
     with open(json_path, "r") as f:
         data = json.load(f)

@@ -777,6 +777,20 @@ def _manus25_to_tracking26(xyz25: np.ndarray, side: str) -> dict:
 # Resurrected from pico_manager_thread_server.py. Active only when
 # --use_pico_hand is passed; otherwise the Manus glove path below is used.
 
+# Which finger the Pico trigger drives, which in turn selects the gripper-IK
+# closed-pose gesture:
+#   True  -> index finger  => index-close gesture (thumb rotates to meet index = PINCH)
+#   False -> middle finger => middle-close gesture (thumb stays, plain grasp)
+# Set at startup from --pinch / --no-pinch (pico_manus) or PINCH (slimevr_pico).
+USE_PINCH = False
+
+
+def set_pinch(enabled: bool) -> None:
+    """Toggle pinch (index) vs grasp (middle) for the Pico-trigger hand path."""
+    global USE_PINCH
+    USE_PINCH = bool(enabled)
+
+
 def generate_finger_data(hand: str, trigger: float, grip: float) -> np.ndarray:
     """
     Generate finger position data from Pico controller button states.
@@ -792,21 +806,36 @@ def generate_finger_data(hand: str, trigger: float, grip: float) -> np.ndarray:
     fingertips = np.zeros([25, 4, 4])
 
     thumb = 0
-    middle = 10
+    # 5 = index (pinch), 10 = middle (grasp). Driving a finger sets the solver's
+    # thumb-to-that-finger distance to (1 - trigger), so its grip == trigger and the
+    # matching closed pose interpolates linearly with the trigger (continuous, not
+    # binary). See G1GripperInverseKinematicsSolver for the per-finger gestures.
+    driven = 5 if USE_PINCH else 10
     # Control thumb based on shoulder button state (index 4 is thumb tip)
     fingertips[4 + thumb, 0, 3] = 1.0  # open thumb
-    if trigger > 0.5:
-        fingertips[4 + middle, 0, 3] = 1.0  # close middle
+    fingertips[4 + driven, 0, 3] = float(np.clip(trigger, 0.0, 1.0))  # close ∝ trigger
 
     return fingertips
+
+
+# When True, the Pico-trigger thumb only opens halfway (its closure is floored at
+# 0.5); index/middle keep full range. Set at startup from --half (pico_manus) or
+# HALF_THUMB (slimevr_pico) before init_hand_ik_solvers() runs.
+HALF_THUMB = False
+
+
+def set_half_thumb(enabled: bool) -> None:
+    """Toggle the half-open thumb limit for the Pico-trigger hand path."""
+    global HALF_THUMB
+    HALF_THUMB = bool(enabled)
 
 
 def init_hand_ik_solvers():
     """Initialize hand IK solvers if available."""
     if G1GripperInverseKinematicsSolver is not None:
-        left_solver = G1GripperInverseKinematicsSolver(side="left")
-        right_solver = G1GripperInverseKinematicsSolver(side="right")
-        print("Hand IK solvers initialized")
+        left_solver = G1GripperInverseKinematicsSolver(side="left", half_thumb=HALF_THUMB)
+        right_solver = G1GripperInverseKinematicsSolver(side="right", half_thumb=HALF_THUMB)
+        print(f"Hand IK solvers initialized (half_thumb={HALF_THUMB})")
         return left_solver, right_solver
     print("Warning: Hand IK solvers not available")
     return None, None
@@ -2785,6 +2814,22 @@ if __name__ == "__main__":
         action="store_true",
         help="Skip waiting for body tracking data (run with Manus only)",
     )
+    # Pico-trigger hand gesture: pinch (thumb+index) vs plain grasp (middle).
+    # Only matters with --use_pico_hand. Default: no-pinch (middle grasp).
+    parser.set_defaults(pinch=False)
+    parser.add_argument(
+        "--pinch", dest="pinch", action="store_true",
+        help="Pico trigger does a thumb+index PINCH (--use_pico_hand only)",
+    )
+    parser.add_argument(
+        "--no-pinch", dest="pinch", action="store_false",
+        help="Pico trigger does a plain middle-finger grasp (default)",
+    )
+    parser.add_argument(
+        "--half", dest="half_thumb", action="store_true",
+        help="Limit the thumb to half-open (closure floored at 0.5); index/middle "
+             "keep full range (--use_pico_hand only)",
+    )
     # Neck-motor publishing — drives the G1 NeckMotor over the same wire format
     # as pose_publisher.py. Default-on so a single process drives both hand and
     # neck teleop. Disable with --no_neck_pub for neck-only bring-ups using
@@ -2807,6 +2852,14 @@ if __name__ == "__main__":
         help="Multiplier on (yaw, pitch) before publishing (default: 1.5, matches pose_publisher.py)",
     )
     args = parser.parse_args()
+
+    # Pico-trigger hand gesture (pinch vs grasp) + half-open thumb. No-op unless
+    # --use_pico_hand. set_* must run before init_hand_ik_solvers() (in run_pico*).
+    set_pinch(args.pinch)
+    set_half_thumb(args.half_thumb)
+    if args.use_pico_hand:
+        print(f"[hand] Pico trigger gesture: {'PINCH (thumb+index)' if args.pinch else 'GRASP (middle)'}"
+              f", thumb={'HALF-open' if args.half_thumb else 'full'}")
 
     # Standalone VR3Pt test modes (exit after finishing)
     if args.vr3pt_test:
