@@ -40,14 +40,31 @@ def _decode_depth(buf, w=640, h=480):
 
 
 def run(args):
-    addr = f"tcp://{args.server}:{args.port}"
     ctx = zmq.Context()
-    sock = ctx.socket(zmq.REQ)
-    sock.setsockopt(zmq.RCVTIMEO, 3000)
-    sock.setsockopt(zmq.SNDTIMEO, 3000)
-    sock.setsockopt(zmq.LINGER, 0)
-    sock.connect(addr)
-    print(f"[viewer] connected to {addr}")
+
+    if args.sub:
+        # SUB mode: watch the server's viewer PUB (5559) without stealing frames
+        # from the REP recording/inference socket. Use this while recording.
+        port = args.port if args.port != 5556 else 5559
+        addr = f"tcp://{args.server}:{port}"
+        sock = ctx.socket(zmq.SUB)
+        sock.setsockopt(zmq.SUBSCRIBE, b"")
+        sock.setsockopt(zmq.RCVHWM, 2)
+        sock.setsockopt(zmq.CONFLATE, 0)
+        sock.setsockopt(zmq.RCVTIMEO, 3000)
+        sock.setsockopt(zmq.LINGER, 0)
+        sock.connect(addr)
+        print(f"[viewer] SUB connected to {addr}")
+    else:
+        # REQ mode: talk to the REP socket directly (do NOT use this while
+        # recording — it steals every other frame from the recorder).
+        addr = f"tcp://{args.server}:{args.port}"
+        sock = ctx.socket(zmq.REQ)
+        sock.setsockopt(zmq.RCVTIMEO, 3000)
+        sock.setsockopt(zmq.SNDTIMEO, 3000)
+        sock.setsockopt(zmq.LINGER, 0)
+        sock.connect(addr)
+        print(f"[viewer] REQ connected to {addr}")
 
     frames = 0
     t0 = time.time()
@@ -56,10 +73,13 @@ def run(args):
     try:
         while True:
             try:
-                sock.send(b"get")
+                if not args.sub:
+                    sock.send(b"get")
                 parts = sock.recv_multipart()
             except zmq.Again:
-                print("[viewer] timeout, reconnecting...")
+                print("[viewer] timeout...")
+                if args.sub:
+                    continue
                 sock.close()
                 sock = ctx.socket(zmq.REQ)
                 sock.setsockopt(zmq.RCVTIMEO, 3000)
@@ -105,6 +125,10 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--server", default="192.168.123.164")
     p.add_argument("--port", type=int, default=5556)
+    p.add_argument("--sub", action="store_true",
+                   help="SUB to the viewer PUB (default port 5559) instead of "
+                        "REQ to the REP socket. Use this while recording so the "
+                        "viewer never steals frames from the recorder.")
     p.add_argument("--show-ir", action="store_true", help="also show IR L|R window")
     p.add_argument("--show-depth", action="store_true", help="also show colorized depth")
     run(p.parse_args())

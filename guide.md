@@ -140,8 +140,16 @@ python g1_sonic_client.py --action-only --include-neck
 `--include-neck`（默认走 `RSCamera`，收 3-part RGB/IR/Depth）。
 
 相机 server 换成独立模块 `realsense_native_server.py`（不依赖 pyzed，直接用
-pyrealsense2 驱动原生相机），REP 绑 5558，回 `[RGB jpeg, IR L|R jpeg, depth raw]`，
-和客户端 `RSCamera`、`realsense_viewer.py` 的契约一致。
+pyrealsense2 驱动原生相机），三路输出**互不抢帧**：
+
+- **REP 5558**：只给录制/推理客户端（`RSCamera`/`RealSenseClient`），回
+  `[RGB jpeg, IR L|R jpeg, depth raw]`，契约与原客户端一致，满帧 30fps。
+  **REP 是一问一答轮流服务，这个口只能有一个客户端**——多一个连上来（比如
+  REQ 模式的 viewer）就各分一半帧，谁都只剩 15fps。
+- **PUB 5559**（`--viewer-pub`，默认开）：viewer 专用广播口，内容同上三分片。
+  随便开几个 viewer 都不影响录制（viewer 慢了只丢自己的帧）。
+- **`--enable-pico`**：把 RGB 用 H.264/TCP 推给 Pico 头显（单目第一视角，
+  从 ZED server 移植）。
 
 ### 3.1 遥操作（Teleop）
 
@@ -150,21 +158,31 @@ pyrealsense2 驱动原生相机），REP 绑 5558，回 `[RGB jpeg, IR L|R jpeg,
 
 #### 3.1.1 G1 板载
 
-只启动原生相机 server。录制端只取 RGB（`RealSenseClient` 只用 part 0 当 ego），
-所以这里用 `--no-ir --no-depth` 发纯 RGB 最干净，避免 IR 混进 stereo 槽：
+只启动原生相机 server（`--enable-pico` 把第一视角 RGB 推到 Pico 头显；用
+SlimeVR 身体源不需要头显画面时可去掉）：
 
 ```bash
-export LD_PRELOAD=/lib/aarch64-linux-gnu/libffi.so.7
 sudo killall -9 videohub_pc4
 conda activate ruohai
 cd ~/GR00T-WholeBodyControl
-python realsense_native_server.py --zmq-bind tcp://0.0.0.0:5558 --no-ir --no-depth
+python realsense_native_server.py --no-ir \
+    --enable-pico --pico-ip 192.168.0.241
 ```
 
 > 相比第 1.1 节去掉了：`sudo chmod 777 /dev/ttyUSB0`（脖子电机串口）、
-> `--enable-pico`（给 Pico 头显推 ZED 立体画面）、`--enable-neck-motor`、
-> `--pose-zmq`。原生相机不是立体的，Pico 头显里不会有第一视角画面；若用
-> SlimeVR 身体源则本来就不依赖头显画面。
+> `--enable-neck-motor`、`--pose-zmq`。Pico 里的第一视角是单目 RGB（原生相机
+> 不是立体的），不是 ZED 那种立体画面。
+>
+> 环境务必用 `ruohai`（系统源码编译的 librealsense 2.58 / v4l2 内核后端，枚举
+> 稳定、满帧率）；`vision` 里 pip 的 pyrealsense2 是 RSUSB/libusb 后端，USB2 上
+> 枚举不稳、帧率会被压到 15。`killall videohub_pc4` 是先释放占着相机的服务。
+> server 已自动关掉 `auto_exposure_priority`（否则暗光下 30→15）；房间很暗想
+> 锁死 30 可再加固定曝光，如 `--exposure 8000`。
+>
+> **USB2 带宽：保持 `--no-ir`。** 实测（640x480@30）：RGB 或 RGB+depth 满帧
+> 30fps；再开 IR 两路会掉到 ~22。想 IR 也满帧只能把相机插到 USB3 口
+> （机身 Bus 02 的 5000M 口）。录制只用 RGB，不需要 depth 的话可以再加
+> `--no-depth`，网络和 CPU 更省。
 
 #### 3.1.2 桌面端
 
@@ -205,14 +223,14 @@ source .venv_teleop/bin/activate
 python g1_data_server.py
 ```
 
-实时画面查看（原生相机用 `realsense_viewer.py`，直连 5558 的 REP）：
+实时画面查看：**一律用 `--sub`**（SUB 连 5559 广播口，录制时开着也不掉帧）：
 
 ```bash
-python realsense_viewer.py --server 192.168.123.164 --port 5558
+python realsense_viewer.py --server 192.168.123.164 --sub
 ```
 
-> `RSCamera`/`RealSenseClient`（客户端/录制）和 `realsense_viewer.py` 都是 REQ
-> 直连这个 REP 口，三者不能同时连同一个口。录制时不要再开 viewer。
+> 千万别在录制时用不带 `--sub` 的 REQ 模式连 5558——REP 轮流服务，viewer 会
+> 抢走录制端一半的帧，两边都只剩 15fps（实测踩过这个坑）。
 
 Manus 手套 SDK（在 `:8000` 推流，不变）：
 
@@ -225,18 +243,17 @@ Manus 手套 SDK（在 `:8000` 推流，不变）：
 #### 3.2.1 G1 板载
 
 ```bash
-export LD_PRELOAD=/lib/aarch64-linux-gnu/libffi.so.7
 sudo killall -9 videohub_pc4
 conda activate ruohai
 cd ~/GR00T-WholeBodyControl
-python realsense_native_server.py --zmq-bind tcp://0.0.0.0:5558
+python realsense_native_server.py --no-ir
 
 # 只要 RGB（最轻）：python realsense_native_server.py --no-ir --no-depth
 # 列设备：       python realsense_native_server.py --list-devices
 ```
 
-> 不再需要 `sudo chmod 777 /dev/ttyUSB0`（脖子电机串口），也不需要
-> `--enable-pico`（给 VR 头显推 ZED 立体画面）。
+> 不再需要 `sudo chmod 777 /dev/ttyUSB0`（脖子电机串口）；推理不需要
+> `--enable-pico`。`--no-ir` 的原因见 3.1.1（USB2 带宽，IR 会把 30fps 拖到 ~22）。
 
 #### 3.2.2 桌面端
 
@@ -248,14 +265,15 @@ source scripts/setup_env.sh
 ./deploy.sh --input-type zmq real
 ```
 
-图像查看（原生相机用 `realsense_viewer.py`，直连 5558 的 REP）：
+图像查看：**一律用 `--sub`**（SUB 连 5559 广播口，跑推理时开着也不抢帧）。
+看 depth 加 `--show-depth`；别用 `--show-ir`（server 是 `--no-ir`）：
 
 ```bash
-python realsense_viewer.py --server 192.168.123.164 --port 5558 --show-ir --show-depth
+python realsense_viewer.py --server 192.168.123.164 --sub --show-depth
 ```
 
-> 注意：`RSCamera`（推理客户端）和 `realsense_viewer.py` 都是 REQ 直连这个 REP
-> 口，两者不能同时连。测相机时用 viewer，跑推理时用客户端。
+> 不带 `--sub` 的 REQ 模式会直连 5558 的 REP 口，和推理客户端各抢一半帧
+> （两边都掉到 15fps）。只有单独调试相机、且没有其他客户端时才可以用 REQ 模式。
 
 端口转发：
 
