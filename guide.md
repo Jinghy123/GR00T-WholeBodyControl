@@ -158,13 +158,24 @@ pyrealsense2 驱动原生相机），三路输出**互不抢帧**：
 
 #### 3.1.1 G1 板载
 
-只启动原生相机 server（`--enable-pico` 把第一视角 RGB 推到 Pico 头显；用
-SlimeVR 身体源不需要头显画面时可去掉）：
+只启动原生相机 server（`--enable-pico` 把第一视角推到 Pico 头显；用
+SlimeVR 身体源不需要头显画面时可去掉）。头显画面二选一：
+
+**立体 IR（推荐遥操用，有真实深度感，灰度）**——把 D435i 左右红外拼成
+左|右立体帧（1280x480）推给 Pico，格式和 ZED 立体一样。会自动关掉 IR
+散斑投射器（否则满屏光点）：
 
 ```bash
 sudo killall -9 videohub_pc4
 conda activate ruohai
 cd ~/GR00T-WholeBodyControl
+python realsense_native_server.py --no-depth \
+    --enable-pico --pico-ip 192.168.0.241 --pico-source ir
+```
+
+**单目 RGB（彩色，无立体）**：
+
+```bash
 python realsense_native_server.py --no-ir \
     --enable-pico --pico-ip 192.168.0.241
 ```
@@ -179,10 +190,27 @@ python realsense_native_server.py --no-ir \
 > server 已自动关掉 `auto_exposure_priority`（否则暗光下 30→15）；房间很暗想
 > 锁死 30 可再加固定曝光，如 `--exposure 8000`。
 >
-> **USB2 带宽：保持 `--no-ir`。** 实测（640x480@30）：RGB 或 RGB+depth 满帧
-> 30fps；再开 IR 两路会掉到 ~22。想 IR 也满帧只能把相机插到 USB3 口
-> （机身 Bus 02 的 5000M 口）。录制只用 RGB，不需要 depth 的话可以再加
-> `--no-depth`，网络和 CPU 更省。
+> **USB2 带宽：RGB + depth + IR 三路开不满，最多选两路。** 实测（640x480@30）：
+> RGB+depth（`--no-ir`）满帧 30fps；RGB+双IR（`--no-depth`）也满帧 30fps；
+> 三路全开掉到 ~22。所以推 IR 立体给 Pico 时必须 `--no-depth`。三路都想满帧
+> 只能把相机插到 USB3 口（机身 Bus 02 的 5000M 口）。录制只用 RGB。
+
+**Pico 看不到画面时，按顺序排查（都踩过）：**
+
+1. 看 server 启动命令有没有带 `--enable-pico`——重启 server 时最容易漏掉。
+   连上时 server 会打印 `[PicoStreamer] Connected to Pico 192.168.0.241:12345`。
+2. G1 上 `ping 192.168.0.241`。不通的话是 G1 的 USB WiFi 网卡（rtl8852bu）
+   假死了——nmcli 显示已连接、信号满格，但实际链路不通。重启连接即可恢复：
+
+   ```bash
+   sudo nmcli connection down use-psi && sudo nmcli connection up use-psi
+   ```
+
+3. 确认推流 TCP 已建立：`ss -tn | grep 12345` 应有一条到
+   `192.168.0.241:12345` 的 ESTAB。server 的 Pico 线程每 2 秒自动重连，
+   网络恢复后不用重启 server。
+4. 画面卡顿但能看：WiFi 网段 RTT 波动大（实测 56–569ms），是无线环境问题，
+   不是 server 的问题。
 
 #### 3.1.2 桌面端
 

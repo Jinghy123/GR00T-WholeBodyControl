@@ -68,6 +68,7 @@ latest_rgb_bytes: Optional[bytes] = None
 latest_ir_bytes: Optional[bytes] = None
 latest_depth_bytes: Optional[bytes] = None
 latest_rgb_frame: Optional[np.ndarray] = None   # raw BGR ndarray, for Pico
+latest_ir_frame: Optional[np.ndarray] = None    # raw L|R gray ndarray, for Pico
 frame_seq = 0
 frame_cond = threading.Condition()
 
@@ -153,6 +154,21 @@ def _tune_color_sensor(profile, cfg: argparse.Namespace) -> None:
             print(f"[RealSense] could not set fixed exposure: {e}")
 
 
+def _tune_depth_sensor(profile, cfg: argparse.Namespace) -> None:
+    """Disable the IR dot-pattern projector when the IR pair is meant for human
+    viewing (--pico-source ir) — otherwise the whole view is covered in
+    structured-light speckles. Costs depth quality, so only done on demand."""
+    if not cfg.disable_emitter:
+        return
+    try:
+        depth_sensor = profile.get_device().first_depth_sensor()
+        if depth_sensor.supports(rs.option.emitter_enabled):
+            depth_sensor.set_option(rs.option.emitter_enabled, 0)
+            print("[RealSense] IR emitter disabled (clean stereo view, weaker depth)")
+    except Exception as e:
+        print(f"[RealSense] could not disable emitter: {e}")
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Native RealSense capture
 # ──────────────────────────────────────────────────────────────────────────────
@@ -160,7 +176,7 @@ def _tune_color_sensor(profile, cfg: argparse.Namespace) -> None:
 
 def capture_thread(cfg: argparse.Namespace) -> None:
     global latest_rgb_bytes, latest_ir_bytes, latest_depth_bytes
-    global latest_rgb_frame, frame_seq
+    global latest_rgb_frame, latest_ir_frame, frame_seq
 
     pipeline = rs.pipeline()
     config = rs.config()
@@ -184,6 +200,7 @@ def capture_thread(cfg: argparse.Namespace) -> None:
 
     profile = pipeline.start(config)
     _tune_color_sensor(profile, cfg)
+    _tune_depth_sensor(profile, cfg)
     print(
         f"[RealSense] Started: RGB {cfg.width}x{cfg.height}@{cfg.fps} "
         f"(depth={cfg.enable_depth}, ir={cfg.enable_ir})"
@@ -211,6 +228,7 @@ def capture_thread(cfg: argparse.Namespace) -> None:
             enc_rgb = _jpeg_encode(color_image, cfg.jpeg_quality)
 
             enc_ir = None
+            ir_lr = None
             if cfg.enable_ir:
                 irl = frames.get_infrared_frame(1)
                 irr = frames.get_infrared_frame(2)
@@ -232,6 +250,7 @@ def capture_thread(cfg: argparse.Namespace) -> None:
                 latest_ir_bytes = enc_ir
                 latest_depth_bytes = depth_raw
                 latest_rgb_frame = color_image
+                latest_ir_frame = ir_lr
                 frame_seq += 1
                 frame_cond.notify_all()
 
@@ -304,9 +323,11 @@ class PicoVideoStreamer:
         width: int = VR_WIDTH,
         height: int = VR_HEIGHT,
         fps: int = FPS,
+        source: str = "rgb",
     ):
         self.pico_ip = pico_ip
         self.port = port
+        self.source = source  # "rgb" (mono color) or "ir" (L|R stereo pair)
         self.vr_width = width
         self.vr_height = height
         self.fps = fps
@@ -411,12 +432,16 @@ class PicoVideoStreamer:
             with frame_cond:
                 while frame_seq == last_seq and self._running:
                     frame_cond.wait(timeout=0.1)
-                if latest_rgb_frame is not None:
-                    frame = latest_rgb_frame
+                src = latest_ir_frame if self.source == "ir" else latest_rgb_frame
+                if src is not None:
+                    frame = src
                     last_seq = frame_seq
 
             if frame is None:
                 continue
+
+            if frame.ndim == 2:  # IR L|R is grayscale; x264 pipeline expects BGR
+                frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
 
             h, w = frame.shape[:2]
             if not self._pipeline_started:
@@ -465,9 +490,14 @@ def start_server(cfg: argparse.Namespace) -> None:
             cfg.enable_pico = False
 
     if cfg.enable_pico and Gst is not None:
-        pico_streamer = PicoVideoStreamer(pico_ip=cfg.pico_ip, port=cfg.pico_port)
+        pico_streamer = PicoVideoStreamer(
+            pico_ip=cfg.pico_ip, port=cfg.pico_port, source=cfg.pico_source
+        )
         pico_streamer.start()
-        print(f"[PicoStreamer] Started RGB streaming to Pico {cfg.pico_ip}:{cfg.pico_port}")
+        print(
+            f"[PicoStreamer] Started {cfg.pico_source.upper()} streaming to "
+            f"Pico {cfg.pico_ip}:{cfg.pico_port}"
+        )
 
     context = zmq.Context.instance()
     sock = context.socket(zmq.REP)
@@ -539,9 +569,14 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--no-depth", dest="enable_depth", action="store_false",
                    help="Do not stream/serve the depth map")
     p.add_argument("--enable-pico", action="store_true",
-                   help="Stream RGB to the Pico headset over H.264/TCP")
+                   help="Stream video to the Pico headset over H.264/TCP")
     p.add_argument("--pico-ip", default=PICO_IP)
     p.add_argument("--pico-port", type=int, default=VIDEO_PORT)
+    p.add_argument("--pico-source", choices=("rgb", "ir"), default="rgb",
+                   help="What to stream to the Pico: 'rgb' = mono color frame; "
+                        "'ir' = the L|R infrared pair side by side (true stereo "
+                        "view, grayscale). 'ir' requires IR enabled (no --no-ir) "
+                        "and auto-disables the IR dot projector.")
     p.add_argument("--list-devices", action="store_true",
                    help="List connected RealSense devices and exit")
     p.set_defaults(enable_ir=True, enable_depth=True)
@@ -553,6 +588,11 @@ def main() -> None:
     if ns.list_devices:
         list_realsense_devices()
         return
+    # IR-to-Pico needs the IR pair captured, and the dot projector off so the
+    # operator isn't looking at a speckle field.
+    ns.disable_emitter = ns.enable_pico and ns.pico_source == "ir"
+    if ns.pico_source == "ir" and ns.enable_pico and not ns.enable_ir:
+        raise SystemExit("--pico-source ir requires IR capture (remove --no-ir)")
     start_server(ns)
 
 
