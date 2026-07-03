@@ -78,7 +78,7 @@ DEFAULT_NECK_STATE_ZMQ = "tcp://192.168.123.164:5560"
 
 # Policy server configuration
 DEFAULT_POLICY_HOST = "localhost"
-DEFAULT_POLICY_PORT = 5001
+DEFAULT_POLICY_PORT = 5000
 
 # Expected image resolution for policy server (height, width)
 # cv2.resize expects (width, height), so we store it as (672, 384)
@@ -112,8 +112,11 @@ TOKEN_DIM = 64
 # Image buffer
 IMAGE_BUFFER_SIZE = 100
 
-# TASK_PROMPT = "grasp the white paper cup and pour water into the kettle"
-TASK_PROMPT = "grasp the transparent water bottle and place it into the orange bowl"
+# TASK_PROMPT = "grasp the coke and place it into the white basket"
+# TASK_PROMPT = "pick up the coke and place it into the white basket"
+# TASK_PROMPT = "grasp the yellow bottle and pour the water into the pink pot"
+# TASK_PROMPT = "pick up the white dumpling and place it into the basket"
+TASK_PROMPT = "pick up the yellow banana and place it into the wooden box"
 # TASK_PROMPT = "pick up the gray hippo toy and place it into the orange bowl"
 
 def fsq_quantize(continuous_value, fsq_min=FSQ_MIN, fsq_max=FSQ_MAX, fsq_step=FSQ_STEP):

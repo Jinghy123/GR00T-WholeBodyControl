@@ -9,9 +9,19 @@ closed pose.
 import numpy as np
 
 from gear_sonic.utils.teleop.solver.solver import Solver
+
+# When half_thumb is on, the thumb's closure is floored at this fraction of its
+# fully-closed pose, even when released. 0.8 => thumb only opens to ~20%. Raise
+# toward 1.0 for a more aggressive (more tucked) thumb, lower toward 0 to relax.
+THUMB_REST_CLOSURE = 0.8
+
+
 class G1GripperInverseKinematicsSolver(Solver):
-    def __init__(self, side) -> None:
+    def __init__(self, side, half_thumb: bool = False) -> None:
         self.side = "L" if side.lower() == "left" else "R"
+        # When True, the thumb never opens past (1 - THUMB_REST_CLOSURE); the
+        # index/middle fingers still use the full range. See __call__.
+        self.half_thumb = bool(half_thumb)
 
     def register_robot(self, robot):
         pass
@@ -71,7 +81,7 @@ class G1GripperInverseKinematicsSolver(Solver):
 
         if max_grip == 0:
             # No grip - fully open
-            q_desired = q_open
+            q_desired = q_open.copy()
         elif index_grip == max_grip:
             # Index gesture (trigger only): interpolate to index close pose
             q_closed = self._get_index_close_q_desired()
@@ -88,6 +98,19 @@ class G1GripperInverseKinematicsSolver(Solver):
             # Pinky gesture: interpolate to pinky close pose
             q_closed = self._get_pinky_close_q_desired()
             q_desired = q_open + pinky_grip * (q_closed - q_open)
+
+        # --half: cap the thumb's opening at 50% — even when fully released. Floor
+        # the thumb joints (q[0]=abduction, q[1]/q[2]=curl; first 3 of the 7-DOF
+        # Dex3 vector) toward a canonical half-closed pose; index/middle keep the
+        # full range. The middle-close pose is the thumb reference so the floor is
+        # the same regardless of gesture / at rest (no jump on grip onset). Only
+        # raises a joint that is currently more open than the floor.
+        if self.half_thumb:
+            thumb_ref = self._get_middle_close_q_desired()
+            for i in (0, 1, 2):
+                floor_i = THUMB_REST_CLOSURE * thumb_ref[i]
+                if abs(q_desired[i]) < abs(floor_i):
+                    q_desired[i] = floor_i
 
         return q_desired
 

@@ -40,7 +40,7 @@ send 0 "cd ~/GR00T-WholeBodyControl"
 send 0 "python realsense_server.py \
     --zed-only \
     --zmq-bind tcp://0.0.0.0:5558 \
-    --enable-pico --pico-ip 192.168.0.240 \
+    --enable-pico --pico-ip 192.168.0.241 \
     --enable-neck-motor \
     --pose-zmq tcp://192.168.123.222:5570"
 
@@ -58,7 +58,7 @@ send 2 "export PYTHONPATH=\"\$GR00T_ROOT/external_dependencies/gmr_shim:\$GR00T_
 send 2 "export LD_LIBRARY_PATH=\"\$GR00T_ROOT/external_dependencies/XRoboToolkit-PC-Service-Pybind_X86_and_ARM64:\$LD_LIBRARY_PATH\""
 send 2 "export PYTHONPATH=\$PWD/GMR:\$PYTHONPATH"
 send 2 "source .venv_teleop/bin/activate"
-send 2 "python gear_sonic/scripts/pico_manus_thread_server.py --use_pico_hand"
+send 2 "python gear_sonic/scripts/slimevr_manus_thread_server.py"
 
 # ── Pane 3: Desktop — data recorder (neck cmd + state) ─────────────────────
 tmux select-pane -t "${SESSION}:main.3" -T "record (data)"
