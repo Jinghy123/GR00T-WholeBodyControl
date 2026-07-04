@@ -116,10 +116,13 @@ source scripts/setup_env.sh
 python test_viewer.py --server 192.168.123.164 --port 5559 --show-stereo
 ```
 
-端口转发：
+端口转发/启动server：
 
 ```bash
 ssh -L 5000:localhost:5000 nebula101
+
+cd /mnt/data/weiduo/heng/DreamZero-private
+bash start.sh
 ```
 
 回初始姿态，然后启动策略客户端（仅动作 + 含脖子）：
@@ -128,6 +131,9 @@ ssh -L 5000:localhost:5000 nebula101
 python apply_initial_pose.py
 
 python g1_sonic_client.py --action-only --include-neck
+
+# 或 RTC 版：python psix_rtc_sonic_client.py
+bash client.sh
 ```
 
 ---
@@ -303,10 +309,13 @@ python realsense_viewer.py --server 192.168.123.164 --sub --show-depth
 > 不带 `--sub` 的 REQ 模式会直连 5558 的 REP 口，和推理客户端各抢一半帧
 > （两边都掉到 15fps）。只有单独调试相机、且没有其他客户端时才可以用 REQ 模式。
 
-端口转发：
+端口转发/启动server：
 
 ```bash
 ssh -L 5000:localhost:5000 nebula101
+
+cd /mnt/data/weiduo/heng/DreamZero-private
+bash start.sh
 ```
 
 回初始姿态，然后启动策略客户端（**去掉 `--include-neck`**）：
@@ -316,6 +325,7 @@ python apply_initial_pose.py
 
 python g1_sonic_client.py --action-only
 # 或 RTC 版：python psix_rtc_sonic_client.py
+bash client.sh
 ```
 
 
