@@ -198,3 +198,6 @@ teleop_vids/
 .claude/settings.local.json
 
 data/
+realsense_wheels_aarch64/
+realsense_env_backup/
+eval-*

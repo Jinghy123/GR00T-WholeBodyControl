@@ -21,7 +21,7 @@ from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
 )
 
 # ---------------- Configuration ----------------
-TASK_INSTRUCTION = "default/grasp_the_silver_bottle_and_pour_water_into_the_kettle"
+TASK_INSTRUCTION = "Clean up the table"
 
 # FSQ configuration (must match g1_sonic_client / encoder)
 FSQ_MIN = -0.625

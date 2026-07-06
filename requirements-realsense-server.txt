@@ -1,0 +1,28 @@
+# Minimal deps for realsense_native_server.py (runs on the G1 board, aarch64 / Jetson-Tegra).
+#
+# The board has NO internet, so create the env offline and install the pip deps from
+# aarch64 wheels copied over from the host:
+#   # on the host (has internet): download aarch64 cp310 wheels
+#   pip download --only-binary=:all: \
+#       --platform manylinux2014_aarch64 --platform manylinux_2_28_aarch64 \
+#       --python-version 310 --abi cp310 -d rs_wheels_aarch64 \
+#       numpy==2.2.6 opencv-python==4.13.0.92 pyzmq==27.1.0
+#   scp rs_wheels_aarch64/*.whl requirements-realsense-server.txt unitree@192.168.123.164:~/rs_wheels_aarch64/
+#   # on the board (offline): minimal env from the local conda pkg cache, then install wheels
+#   conda create -n realsense --offline python=3.10 pip -y && conda activate realsense
+#   pip install --no-index --find-links ~/rs_wheels_aarch64 -r ~/rs_wheels_aarch64/requirements-realsense-server.txt
+#
+# Run the server with PYTHONNOUSERSITE=1 so the board's ~/.local site-packages can't
+# shadow this env (auto_deploy_neckless.sh already exports it).
+numpy==2.2.6
+opencv-python==4.13.0.92
+pyzmq==27.1.0
+
+# pyrealsense2: do NOT `pip install` from PyPI on this board. The generic PyPI aarch64
+# wheel (2.55.1.6486) enumerates 0 devices here — the Jetson/Tegra USB backend needs a
+# platform-specific librealsense build. Use the working build already on the board
+# (imports as 2.58.2) by copying it into the env, e.g.:
+#   SP=~/miniforge3/envs
+#   cp -a $SP/ruohai/lib/python3.10/site-packages/pyrealsense2      $SP/realsense/lib/python3.10/site-packages/
+#   cp -a $SP/ruohai/lib/python3.10/site-packages/pyrealsense2-*.dist-info $SP/realsense/lib/python3.10/site-packages/
+# pyrealsense2==2.58.2   # provided by the board's platform build (see note above)
