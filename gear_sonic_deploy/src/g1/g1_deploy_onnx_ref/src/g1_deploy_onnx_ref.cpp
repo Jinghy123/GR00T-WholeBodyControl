@@ -326,6 +326,48 @@ class G1Deploy {
     std::shared_ptr<const MotionSequence> return_transition_static_ref_;  // restored when done
 
     // =========================================================================
+    // Smooth teleop takeover: on the first streamed pose consumed by the
+    // encoder (protocol v1/v2/v3), lerp token_state_data_ from the standing
+    // token to the live token over ENTRY_TRANSITION_STEPS ticks, FSQ-quantized.
+    // Direct token streaming (protocol v4, replay/inference) is not blended.
+    // =========================================================================
+    static constexpr int ENTRY_TRANSITION_STEPS = 25;  // ~0.5 s at 50 Hz
+    static constexpr double FSQ_MIN = -0.625, FSQ_MAX = 0.625, FSQ_STEP = 0.0625;
+    bool entry_transition_active_ = false;
+    int  entry_transition_step_ = 0;
+    bool entry_prev_streamed_ = false;
+    std::vector<double> entry_transition_start_token_;
+
+    void StartEntryTransition(const char* source) {
+      entry_transition_start_token_.assign(token_state_data_.begin(), token_state_data_.end());
+      entry_transition_step_ = 0;
+      entry_transition_active_ = true;
+      std::cout << "[EntrySmooth] Blending " << source << " tokens over "
+                << ENTRY_TRANSITION_STEPS << " ticks." << std::endl;
+    }
+
+    // Blend token_state_data_ (holding the live token) toward the standing
+    // snapshot, FSQ-quantize, write back. Call once per control tick while active.
+    void BlendEntryToken() {
+      if (!entry_transition_active_) return;
+      double alpha = static_cast<double>(entry_transition_step_) /
+                     static_cast<double>(ENTRY_TRANSITION_STEPS);
+      alpha = std::clamp(alpha, 0.0, 1.0);
+      for (size_t i = 0; i < token_state_data_.size(); ++i) {
+        double v = (1.0 - alpha) * entry_transition_start_token_[i]
+                 + alpha * token_state_data_[i];
+        v = std::round(std::clamp(v, FSQ_MIN, FSQ_MAX) / FSQ_STEP) * FSQ_STEP;
+        token_state_data_[i] = std::clamp(v, FSQ_MIN, FSQ_MAX);
+      }
+      if (entry_transition_step_ >= ENTRY_TRANSITION_STEPS) {
+        entry_transition_active_ = false;
+        std::cout << "[EntrySmooth] Done, following live tokens." << std::endl;
+      } else {
+        entry_transition_step_++;
+      }
+    }
+
+    // =========================================================================
     // Logging / recording streams
     // =========================================================================
     std::unique_ptr<std::ofstream> target_motion_file_;
@@ -1696,6 +1738,18 @@ class G1Deploy {
         return false;
       }
 
+      // Smooth takeover edge (streamed pose): snapshot the standing token on the
+      // first tick the streamed motion is consumed, before it is overwritten.
+      const bool is_streamed = current_motion_ && current_motion_->name == "streamed";
+      if (is_streamed && !entry_prev_streamed_) {
+        StartEntryTransition("streamed-pose");
+      }
+      entry_prev_streamed_ = is_streamed;
+      if (!is_streamed && entry_transition_active_) {
+        entry_transition_active_ = false;
+        std::cout << "[EntrySmooth] Cancelled (streaming stopped)." << std::endl;
+      }
+
       // Gather encoder observations (populate encoder's internal input buffer)
       if (!GatherEncoderObservations()) {
         std::cerr << "✗ Error: Failed to gather encoder observations!" << std::endl;
@@ -1723,6 +1777,13 @@ class G1Deploy {
         const double v = static_cast<double>(token_buffer[i]);
         token_state_data_[i] = v;
         target_buffer[offset + i] = v;
+      }
+
+      if (entry_transition_active_) {
+        BlendEntryToken();
+        for (size_t i = 0; i < token_dim; ++i) {
+          target_buffer[offset + i] = token_state_data_[i];
+        }
       }
       return true;
     }
@@ -2667,6 +2728,17 @@ class G1Deploy {
     /// in the thread-safe low_state_buffer_.
     void LowStateHandler(const void* message) {
       LowState_ low_state = *(const LowState_*)message;
+
+      // Diagnostic: arrival gap is ~2 ms at 500 Hz; print only on anomalies.
+      {
+        static auto last_arrival = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        const double gap_ms = std::chrono::duration<double, std::milli>(now - last_arrival).count();
+        last_arrival = now;
+        if (gap_ms > 100.0) {
+          std::cout << "[Diag] LowState arrival gap: " << gap_ms << " ms" << std::endl;
+        }
+      }
 
       // Only perform CRC check if not disabled (for MuJoCo simulation compatibility)
       if (!disable_crc_check_) {

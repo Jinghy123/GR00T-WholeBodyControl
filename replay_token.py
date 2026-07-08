@@ -20,7 +20,7 @@ Usage:
 # DEFAULT_EPISODE_DIR    = "/home/xiawei/hongyi/Unitree_Robotics/Humanoid-Teleop/teleop/data/g1_1001/Basic/Pick_bottle_and_turn_and_pour_into_cup/episode_16"
 # DEFAULT_EPISODE_DIR    = "/home/xiawei/hongyi/Unitree_Robotics/Humanoid-Teleop/teleop/data/g1_1001/Basic/Spray_the_bowl_and_wipe_it_and_stack_it_up/episode_1"
 # DEFAULT_EPISODE_DIR    = "/home/xiawei/data/unfold_a_tablet_cover_h1/episode_0"
-DEFAULT_EPISODE_DIR    = "/mnt/data/weiduo/heng/data/pick_place/demonstration_2026-06-20_01-10-15/episode_21"
+DEFAULT_EPISODE_DIR    = "/home/hongyi/data/demonstration_2026-07-01_19-25-55/episode_1"
 DEFAULT_ZMQ_HOST        = "*"
 DEFAULT_ZMQ_PUB_PORT    = 5556
 DEFAULT_ZMQ_TOPIC      = "pose"
