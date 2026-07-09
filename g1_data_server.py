@@ -94,7 +94,7 @@ WBC_TOPIC = "g1_debug"
 WUJI_STATE_HOST = "localhost"  # Host running wuji_hand_server.py
 WUJI_STATE_PORT = 5560         # ZMQ PUB port for wuji measured state / action
 
-DATA_FOLDER = os.path.expanduser("/mnt/data/weiduo/heng/data")
+DATA_FOLDER = os.path.join(os.getcwd(), "data")
 TASK_NAME   = "demonstration"
 FPS         = 30
 

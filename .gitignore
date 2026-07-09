@@ -198,3 +198,4 @@ teleop_vids/
 .claude/settings.local.json
 
 data/
+eval-*

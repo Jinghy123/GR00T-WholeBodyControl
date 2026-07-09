@@ -331,7 +331,7 @@ class G1Deploy {
     // token to the live token over ENTRY_TRANSITION_STEPS ticks, FSQ-quantized.
     // Direct token streaming (protocol v4, replay/inference) is not blended.
     // =========================================================================
-    static constexpr int ENTRY_TRANSITION_STEPS = 25;  // ~0.5 s at 50 Hz
+    static constexpr int ENTRY_TRANSITION_STEPS = 75;  // ~0.5 s at 50 Hz
     static constexpr double FSQ_MIN = -0.625, FSQ_MAX = 0.625, FSQ_STEP = 0.0625;
     bool entry_transition_active_ = false;
     int  entry_transition_step_ = 0;
