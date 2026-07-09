@@ -331,6 +331,39 @@ bash client.sh
 
 
 
+## 4. 带脖子 + 脖子上装 RealSense（不用 ZED mini）
+
+和第 1 节的区别只有一个：脖子上的相机从 ZED mini 换成 RealSense，板载 server 用
+`realsense_native_server.py`（已内置和 `realsense_server.py` 相同的脖子电机驱动，
+`--enable-neck-motor` / `--pose-zmq` / `--neck-state-pub` 同名同义）。
+桌面端（deploy、pico_manus_thread_server、g1_data_server）与第 1.2 节**完全相同**：
+`g1_data_server.py` 照旧带两个 `--neck-*` 参数，state/action 的脖子两维不变，
+录的图自动是 RealSense RGB。
+
+### 4.1 G1 板载
+
+```bash
+sudo chmod 777 /dev/ttyUSB0
+sudo killall -9 videohub_pc4
+conda activate ruohai        # 需要 pip install dynamixel-sdk（一次性）
+cd ~/GR00T-WholeBodyControl
+python realsense_native_server.py --no-depth \
+    --enable-pico --pico-ip 192.168.0.241 --pico-source ir \
+    --enable-neck-motor \
+    --pose-zmq tcp://192.168.123.222:5570
+```
+
+> 头显画面二选一同 3.1.1（`--pico-source ir` 立体灰度需 `--no-depth`；
+> 单目彩色用 `--no-ir` 且去掉 `--pico-source ir`）。USB2 带宽限制同 3.1.1。
+
+### 4.2 桌面端
+
+全部照抄第 1.2 节：deploy、`pico_manus_thread_server.py`、
+`g1_data_server.py --neck-zmq tcp://localhost:5570 --neck-state-zmq tcp://192.168.123.164:5560`。
+实时画面查看用 `realsense_viewer.py --server 192.168.123.164 --sub`（不是 test_viewer.py）。
+
+---
+
 slimevr -1 +1
 pico +1 -1
 
