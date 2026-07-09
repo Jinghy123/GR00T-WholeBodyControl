@@ -183,8 +183,8 @@ class RTCTokenPolicyClient:
         # d_wrap for that one step and route its measured latency to _Qw only, so the
         # normal estimate _Q stays tight and the spike never causes a "frozen too few"
         # discontinuity.
-        self._Q = deque([self._d], maxlen=6)                  # normal-step latencies
-        self._Qw = deque([self._d_max], maxlen=3)             # wrap-step latencies (start conservative)
+        self._Q = deque([self._d], maxlen=12)                  # normal-step latencies
+        self._Qw = deque([self._d_max], maxlen=10)             # wrap-step latencies (start conservative)
         self._d_normal = self._d                              # d to send on normal steps
         self._d_wrap = self._d_max                            # d to send on wrap steps
         # Whether the NEXT re-plan we fire is predicted (by the server) to be a KV-wrap.
