@@ -172,8 +172,23 @@ class RTCTokenPolicyClient:
         # d must satisfy the server constraint 0 < d <= s <= H - d.
         self._d_max = min(self._s, self._H - self._s)
         self._d = int(np.clip(self._d_init, 1, self._d_max))
-        # adaptive delay buffer (Psi0-style: d = max(recent real latencies in ticks))
-        self._Q = deque([self._d], maxlen=6)
+        # Adaptive delay buffers (Psi0-style: d = max(recent real latencies in ticks)).
+        # We keep TWO estimators because the server has two latency regimes:
+        #   * normal re-plans (fast, append one latent to the KV cache), and
+        #   * periodic KV-wrap re-plans (~every local_attn_size steps: the server
+        #     re-encodes the CLIP anchor + rebuilds the KV cache -> a latency spike).
+        # Mixing the spike into the normal deque would inflate d for every fast step
+        # (needless extra frozen prefix). Instead the server tells us (via
+        # rtc_next_is_wrap) when the NEXT re-plan will wrap; we then send the larger
+        # d_wrap for that one step and route its measured latency to _Qw only, so the
+        # normal estimate _Q stays tight and the spike never causes a "frozen too few"
+        # discontinuity.
+        self._Q = deque([self._d], maxlen=6)                  # normal-step latencies
+        self._Qw = deque([self._d_max], maxlen=3)             # wrap-step latencies (start conservative)
+        self._d_normal = self._d                              # d to send on normal steps
+        self._d_wrap = self._d_max                            # d to send on wrap steps
+        # Whether the NEXT re-plan we fire is predicted (by the server) to be a KV-wrap.
+        self._next_replan_is_wrap = False
 
         # ---- hardware / protocol I/O (identical to the non-RTC client) ----
         if include_neck:
@@ -282,6 +297,10 @@ class RTCTokenPolicyClient:
             "execution_horizon": int(self._s),
             "guidance_weight": float(self._gw),
             "mask_schedule": self._mask_schedule,
+            # Ask the server for the richer response (adds rtc_next_is_wrap so we can
+            # pre-size d for the periodic KV-wrap latency spike). Legacy servers ignore
+            # this key and still return a bare ndarray, which _infer handles.
+            "rtc_return_meta": True,
         }
         if self._include_neck:
             obs["observation/neck"] = (
@@ -305,9 +324,18 @@ class RTCTokenPolicyClient:
     def _infer(self, images, qpos, hand, neck):
         commit = self._take_commit_flag()
         obs = self._build_obs(images, qpos, hand, neck, commit)
-        raw = self._client.infer(obs)                    # (H, action_dim) raw
+        resp = self._client.infer(obs)
+        # New server returns {"actions", "rtc_next_is_wrap"}; legacy server returns a
+        # bare (H, action_dim) ndarray. Support both so the client never hard-depends
+        # on the wrap-prediction protocol.
+        if isinstance(resp, dict):
+            raw = resp["actions"]
+            next_is_wrap = bool(resp.get("rtc_next_is_wrap", False))
+        else:
+            raw = resp
+            next_is_wrap = False
         assert raw.shape[0] == self._H, f"expected {self._H} actions, got {raw.shape}"
-        return self._quantize_chunk(raw)
+        return self._quantize_chunk(raw), next_is_wrap
 
     # ------------------------------------------------------------------ freeze
 
@@ -371,8 +399,13 @@ class RTCTokenPolicyClient:
         # (current_start_frame == 0, encodes the single frame as the anchor).
         print("[RTC] init inference (1 frame)...")
         t0 = time.time()
-        chunk = self._infer(sample["img"], sample["qpos"], sample["hand"], sample["neck"])
-        print(f"[RTC] init done in {(time.time()-t0)*1000:.1f}ms, chunk={chunk.shape}")
+        chunk, next_is_wrap = self._infer(
+            sample["img"], sample["qpos"], sample["hand"], sample["neck"]
+        )
+        # Seed the wrap prediction for the FIRST re-plan (normally False right after init).
+        self._next_replan_is_wrap = next_is_wrap
+        print(f"[RTC] init done in {(time.time()-t0)*1000:.1f}ms, chunk={chunk.shape}, "
+              f"next_is_wrap={next_is_wrap}")
         self._A_cur = chunk
         self._t = 0
         self._last_action = chunk[0].copy()
@@ -419,11 +452,21 @@ class RTCTokenPolicyClient:
                 continue
             try:
                 t0 = time.time()
-                chunk = self._infer(req["images"], req["qpos"], req["hand"], req["neck"])
+                chunk, next_is_wrap = self._infer(
+                    req["images"], req["qpos"], req["hand"], req["neck"]
+                )
                 dt = (time.time() - t0) * 1000
                 with self._pending_lock:
-                    self._pending = chunk
-                print(f"[RTC] re-plan inference {dt:.1f}ms  (d={self._d})")
+                    self._pending = {
+                        "chunk": chunk,
+                        # was THIS re-plan a wrap? (routes its latency to the right deque)
+                        "fire_is_wrap": bool(req.get("fire_is_wrap", False)),
+                        # will the NEXT re-plan be a wrap? (server prediction)
+                        "next_is_wrap": next_is_wrap,
+                    }
+                print(f"[RTC] re-plan inference {dt:.1f}ms  (d={self._d} "
+                      f"{'WRAP' if req.get('fire_is_wrap') else 'norm'}"
+                      f" -> next_wrap={next_is_wrap})")
             except Exception as e:
                 print(f"[RTC] re-plan inference failed: {e}")
 
@@ -439,11 +482,18 @@ class RTCTokenPolicyClient:
             print(f"[RTC][WARN] obs_buffer too short (n={n}<= s//2={mid_off}); "
                   f"using buffer[0] as mid frame (only at very start)")
         images = np.stack([mid["img"], fresh["img"]], axis=0)  # (2, H, W, 3), earliest first
+        # If the server predicted this upcoming re-plan is a KV-wrap (spike), send the
+        # larger, wrap-specific frozen prefix so the extra latency is fully covered and
+        # we don't fall into a "frozen too few" discontinuity. Tag the request so the
+        # swap handler routes the measured latency to the right estimator.
+        fire_is_wrap = self._next_replan_is_wrap
+        self._d = self._d_wrap if fire_is_wrap else self._d_normal
         req = {
             "images": images,
             "qpos": fresh["qpos"],
             "hand": fresh["hand"],
             "neck": fresh["neck"],
+            "fire_is_wrap": fire_is_wrap,
         }
         with self._infer_req_lock:
             self._infer_req = req
@@ -461,12 +511,15 @@ class RTCTokenPolicyClient:
               f"d_init={self._d} gw={self._gw} scheme={'optionc' if self._optionc else 'stride1'}")
         while self._running.is_set():
             # (0) swap in a freshly-planned chunk, if ready.
-            new_chunk = None
+            pending = None
             with self._pending_lock:
                 if self._pending is not None:
-                    new_chunk = self._pending
+                    pending = self._pending
                     self._pending = None
-            if new_chunk is not None:
+            if pending is not None:
+                new_chunk = pending["chunk"]
+                fire_is_wrap = pending["fire_is_wrap"]     # was the just-finished re-plan a wrap?
+                next_is_wrap = pending["next_is_wrap"]     # will the NEXT re-plan be a wrap?
                 # Bookkeeping: A_new[0] aligns with the OLD chunk's world index W+s
                 # (server shift-by-s). We already executed s worth of overlap while
                 # inference ran, so drop those s indices from t.
@@ -474,15 +527,29 @@ class RTCTokenPolicyClient:
                 self._A_cur = new_chunk
                 self._t = self._t - self._s
                 d_real = self._t if self._t > 0 else 0  # ticks burned during inference
-                self._Q.append(max(d_real, 1))
-                self._d = int(np.clip(max(self._Q), 1, self._d_max))
+                # Route this latency to the matching estimator so the (slower) wrap
+                # spike never inflates the fast-path d, and vice-versa.
+                if fire_is_wrap:
+                    self._Qw.append(max(d_real, 1))
+                else:
+                    self._Q.append(max(d_real, 1))
+                self._d_normal = int(np.clip(max(self._Q), 1, self._d_max))
+                self._d_wrap = int(np.clip(max(self._Qw), 1, self._d_max))
+                # Prediction (from the server) for the re-plan we fire next, plus the d
+                # we will send for it. Keeping self._d in sync makes the heartbeat/trigger
+                # logs show the value that will actually be sent.
+                self._next_replan_is_wrap = next_is_wrap
+                self._d = self._d_wrap if next_is_wrap else self._d_normal
                 self._frozen_action = None
                 self._in_flight = False
                 outran = self._t < 0
                 if outran:
                     self._t = 0  # inference outran the chunk; resume at head
                 print(f"[RTC][swap] gtick={gtick} new chunk in: t {t_old}->{self._t} "
-                      f"d_real={d_real} d={self._d} Q={list(self._Q)} chunk={tuple(new_chunk.shape)}")
+                      f"d_real={d_real} ({'WRAP' if fire_is_wrap else 'norm'}) "
+                      f"d={self._d} (dn={self._d_normal} dw={self._d_wrap}) "
+                      f"next_wrap={next_is_wrap} Q={list(self._Q)} Qw={list(self._Qw)} "
+                      f"chunk={tuple(new_chunk.shape)}")
                 if outran:
                     print(f"[RTC][WARN] gtick={gtick} inference OUTRAN the chunk "
                           f"(t_old={t_old} > H+? ); clamped t->0. Inference too slow for s={self._s}.")
