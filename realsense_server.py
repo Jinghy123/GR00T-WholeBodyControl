@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import glob
 import io
 import json
 import math
@@ -94,7 +95,16 @@ RESOLUTION_MAP = {
 }
 
 # Neck-motor configuration — edit these in place to recalibrate.
-NECK_PORT             = "/dev/ttyUSB0"
+# The FTDI adapter re-enumerates as ttyUSB1 if it drops while a process still
+# holds ttyUSB0 open (transient USB errors, cable jiggle), so prefer the stable
+# /dev/serial/by-id symlink and fall back to the first ttyUSB device.
+def _find_neck_port() -> str:
+    candidates = sorted(glob.glob("/dev/serial/by-id/usb-FTDI*-port0"))
+    if not candidates:
+        candidates = sorted(glob.glob("/dev/ttyUSB*"))
+    return candidates[0] if candidates else "/dev/ttyUSB0"
+
+NECK_PORT             = _find_neck_port()
 NECK_BAUD             = 2_000_000
 NECK_YAW_ID           = 0
 NECK_PITCH_ID         = 1

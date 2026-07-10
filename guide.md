@@ -16,7 +16,7 @@ G1 + 灵巧手的遥操作与策略推理操作步骤。分**遥操作（Teleop�
 开放电机串口、强制加载系统 libffi（GStreamer 需要）、激活环境，启动相机 + 脖子 server：
 
 ```bash
-sudo chmod 777 /dev/ttyUSB0
+sudo chmod 777 /dev/ttyUSB*
 
 export LD_PRELOAD=/lib/aarch64-linux-gnu/libffi.so.7
 
@@ -90,7 +90,7 @@ Manus 手套 SDK（在 `:8000` 推流）：
 ### 2.1 G1 板载
 
 ```bash
-sudo chmod 777 /dev/ttyUSB0
+sudo chmod 777 /dev/ttyUSB*
 export LD_PRELOAD=/lib/aarch64-linux-gnu/libffi.so.7
 conda activate sonic
 cd ~/GR00T-WholeBodyControl
@@ -343,7 +343,7 @@ bash client.sh
 ### 4.1 G1 板载
 
 ```bash
-sudo chmod 777 /dev/ttyUSB0
+sudo chmod 777 /dev/ttyUSB*
 sudo killall -9 videohub_pc4
 conda activate ruohai        # 需要 pip install dynamixel-sdk（一次性）
 cd ~/GR00T-WholeBodyControl
