@@ -209,6 +209,7 @@ show_usage() {
     echo "  --planner PATH          Set the planner model path (default: planner/example.onnx)"
     echo "  --motion-data PATH      Set the motion data path (default: reference/example/)"
     echo "  --input-type TYPE       Set the input type (default: zmq_manager)"
+    echo "  --record                Enable motion recording (saves streamed/planner motion CSVs)"
     echo "  --output-type TYPE      Set the output type (default: ros2)"
     echo "  --zmq-host HOST         Set the ZMQ host (default: localhost)"
     echo "  --default-motion NAME   Set the default motion to load on startup"
@@ -326,6 +327,10 @@ while [[ $# -gt 0 ]]; do
             DEFAULT_MOTION_NAME="$2"
             shift 2
             ;;
+        --record)
+            ENABLE_RECORD=true
+            shift
+            ;;
         sim|real)
             INTERFACE_MODE="$1"
             shift
@@ -395,6 +400,13 @@ EXTRA_ARGS=""
 if [[ "$ENV_TYPE" == "sim" ]]; then
     EXTRA_ARGS="--disable-crc-check"
     echo -e "${YELLOW}📋 Simulation mode: CRC check will be disabled${NC}"
+    echo ""
+fi
+
+# Motion recording (--record)
+if [[ "$ENABLE_RECORD" == "true" ]]; then
+    EXTRA_ARGS="$EXTRA_ARGS --enable-motion-recording"
+    echo -e "${YELLOW}📋 Motion recording enabled (reference/recorded_motion/)${NC}"
     echo ""
 fi
 
