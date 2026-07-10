@@ -384,3 +384,30 @@ rsync -avz \
   --exclude='checkpoints/*' \
   hongyi@nebula100:~/psi/.runs/psix_finetune/psix-sonic-subtask-g1.sonic_psix_neck_no_rtc.flow1000.cosine.lr5.0e-05.b128.gpus8.2606261137/ \
   .
+
+---
+
+## WiFi 延迟排查(2026-07-09)
+
+**症状**:ping 不丢包,但每隔整 15 秒出现一组阶梯式尖峰(约 3900→2900→1900→900 ms)。
+
+**原因**:本机开着 GNOME"设置-WiFi"面板(`gnome-control-center wifi`)时,
+系统每 15 秒强制扫描一次周围网络;单射频 USB 网卡扫描时离开当前信道约 4 秒,
+期间所有流量被缓存,表现为不丢包但延迟爆炸。
+
+**解决**:测延迟 / 遥操作前关掉 WiFi 设置窗口:
+
+```bash
+pkill gnome-control-center
+```
+
+**相关信息**:
+
+- G1 上没有 wlan0,WiFi 网卡是 `wlxfc23cd913281`(rtl8852bu USB)
+- 桌面端 USB WiFi 网卡是 `wlx7419f816d8d1`(Realtek 8811CU)
+- G1 已存好 `use-psi_5G` 连接(5G 信道 112,已强制 wpa-psk 避开 WPA3 坑),切换:
+  `sudo nmcli connection up use-psi_5G`(ssh 会话里 nmcli 必须 sudo,polkit 限制)
+- G1 在 use-psi 网段的 IP:192.168.0.8(DHCP,可能变)
+- G1 网卡省电模式默认开着,遥操作如有周期性小抖动可关掉:
+  `sudo iw dev wlxfc23cd913281 set power_save off`(重启失效)
+- 正常参考值:桌面 ↔ G1 全 WiFi 链路(双方都在 use-psi_5G)约 3-8 ms,0 丢包
