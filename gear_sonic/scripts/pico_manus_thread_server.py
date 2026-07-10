@@ -1173,6 +1173,29 @@ class PicoReader:
                 print(f"[PicoReader] read error: {e}")
 
 
+def _start_neck_reset_listener(streamer, log_prefix="PoseServer"):
+    """Toggle neck reset from the terminal: type `r` + Enter.
+
+    While active, the streamer publishes [0, 0] on the neck PUB (5570) instead
+    of the retargeted head pose, easing the neck back to its initial position
+    (the on-robot NeckMotor applies its own EMA smoothing). Type `r` + Enter
+    again to resume head tracking. Runs as a daemon thread reading stdin so the
+    neck can be re-centered without killing this server.
+    """
+    def _loop():
+        for line in sys.stdin:
+            if line.strip().lower() == "r":
+                streamer.neck_reset_active = not streamer.neck_reset_active
+                if streamer.neck_reset_active:
+                    print(f"[{log_prefix}] Neck RESET: holding (0, 0). "
+                          "Type r+Enter to resume head tracking.")
+                else:
+                    print(f"[{log_prefix}] Neck reset OFF: following head tracking again.")
+    t = threading.Thread(target=_loop, daemon=True, name="neck-reset-listener")
+    t.start()
+    return t
+
+
 def _pose_stream_common(
     socket,
     buffer_size: int,
@@ -1263,6 +1286,10 @@ def _pose_stream_common(
         left_hand_solver=left_hand_solver,
         right_hand_solver=right_hand_solver,
     )
+
+    if neck_pub is not None:
+        _start_neck_reset_listener(streamer, log_prefix=log_prefix)
+        print(f"[{log_prefix}] Neck reset: type r+Enter to hold the neck at (0, 0), r+Enter again to resume")
 
     if stop_event is None:
         stop_event = threading.Event()
@@ -1623,6 +1650,7 @@ class PoseStreamer:
         self.neck_pub = neck_pub            # ZMQ PUB socket for neck [yaw, pitch] JSON
         self.neck_retarget_scale = float(neck_retarget_scale)
         self._last_neck_publish_time = 0.0
+        self.neck_reset_active = False      # r+Enter toggle: hold neck at (0, 0)
 
         self.device = (
             torch.device("cuda") if use_cuda and torch.cuda.is_available() else torch.device("cpu")
@@ -1705,13 +1733,23 @@ class PoseStreamer:
         --pose-zmq subscriber consumes this stream unchanged. Safe to call from
         either run_once (POSE mode) or the manager loop (any mode).
         """
-        if self.neck_pub is None or _human_head_to_robot_neck is None:
-            return
-        if body_poses_np is None:
+        if self.neck_pub is None:
             return
         if current_time is None:
             current_time = time.time()
         if current_time - self._last_neck_publish_time < (1.0 / 50.0):
+            return
+        if self.neck_reset_active:
+            # Reset mode (r+Enter): hold the neck at its initial position.
+            # Skips head retargeting entirely so it keeps publishing even
+            # when body tracking data is unavailable.
+            try:
+                self.neck_pub.send(json.dumps([0.0, 0.0]).encode("utf-8"))
+            except Exception:
+                return
+            self._last_neck_publish_time = current_time
+            return
+        if _human_head_to_robot_neck is None or body_poses_np is None:
             return
         smplx_data = _body_poses_to_smplx_dict(body_poses_np)
         if smplx_data is None:
@@ -1757,6 +1795,9 @@ class PoseStreamer:
                         self._wuji_success_printed = True
 
         if sample is None:
+            # Keep the neck reset stream alive even without body tracking data.
+            if self.neck_reset_active:
+                self.publish_neck_once(None, current_time=current_time)
             time.sleep(0.005)
             return
 
@@ -2481,6 +2522,10 @@ def run_pico_manager(
         right_hand_solver=right_hand_solver,
     )
 
+    if neck_pub is not None:
+        _start_neck_reset_listener(pose_streamer, log_prefix="Manager")
+        print("[Manager] Neck reset: type r+Enter to hold the neck at (0, 0), r+Enter again to resume")
+
     # State machine diagram:
     #
     #   Chain 1 (by_pressed enters/exits, left_axis_click toggles sub-mode):
@@ -2649,9 +2694,10 @@ def run_pico_manager(
             # tracking the operator while the user is in PLANNER, etc.
             if pose_streamer.neck_pub is not None:
                 latest_sample = pose_streamer.reader.get_latest()
-                if latest_sample is not None:
+                if latest_sample is not None or pose_streamer.neck_reset_active:
                     pose_streamer.publish_neck_once(
-                        latest_sample["body_poses_np"], current_time=current_time
+                        latest_sample["body_poses_np"] if latest_sample is not None else None,
+                        current_time=current_time,
                     )
 
             # Run one iteration of the new mode
