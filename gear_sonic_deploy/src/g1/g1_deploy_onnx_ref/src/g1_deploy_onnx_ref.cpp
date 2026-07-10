@@ -316,6 +316,7 @@ class G1Deploy {
     // drifts), so balance is maintained throughout.
     static constexpr int RETURN_TRANSITION_STEPS = 75;  // ~1.5 s at 50 Hz
     bool return_transition_pending_ = false;            // set on the streaming-exit edge
+    bool return_prev_streamed_ = false;                 // streamed-pose exit edge detector
     bool return_transition_active_ = false;
     int  return_transition_step_ = 0;
     std::array<double, 29> return_transition_start_{};   // robot pose at exit (isaaclab order)
@@ -3239,8 +3240,21 @@ class G1Deploy {
      * reference is restored.
      */
     void UpdateReturnTransition() {
-      // Cancel if streaming resumed (external tokens are driving again).
-      if ((return_transition_pending_ || return_transition_active_) && !is_using_encoder_) {
+      // Streamed-pose exit edge (protocol v1/v2/v3, encoder mode): toggling ZMQ
+      // streaming off swaps current_motion_ from the "streamed" motion back to a
+      // preloaded reference, which would snap the robot just like the token-stream
+      // exit. Detect that edge here and request the same smooth return. Safety
+      // resets swap to "temporary_motion" (freeze in place) and must not be
+      // redirected toward the standing pose.
+      const bool now_streamed = current_motion_ && current_motion_->name == "streamed";
+      if (return_prev_streamed_ && !now_streamed && is_using_encoder_ &&
+          current_motion_ && current_motion_->name != "temporary_motion") {
+        return_transition_pending_ = true;
+      }
+      return_prev_streamed_ = now_streamed;
+
+      // Cancel if streaming resumed (external tokens or streamed poses are driving again).
+      if ((return_transition_pending_ || return_transition_active_) && (!is_using_encoder_ || now_streamed)) {
         return_transition_pending_ = false;
         return_transition_active_ = false;
         return_transition_motion_.reset();
