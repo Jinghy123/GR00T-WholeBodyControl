@@ -12,6 +12,7 @@ import json
 import signal
 import struct
 from base64 import b64encode, b64decode
+from datetime import datetime
 
 import cv2
 import numpy as np
@@ -32,6 +33,10 @@ from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
 # ---------------- Configuration ----------------
 # TASK_INSTRUCTION = "grasp the pink chip can and place it into the orange plate"
 TASK_INSTRUCTION = "pick up the green grapes and place it into the green bowl"
+DEFAULT_BAGEL_IMAGE_ROOT = "/home/weiduoyuan/Desktop/psi/.logs/bagel_gen_images"
+DEFAULT_WM_DUMP_DIR = os.path.join(
+    DEFAULT_BAGEL_IMAGE_ROOT, datetime.now().strftime("%Y%m%d-%H%M%S")
+)
 
 # FSQ configuration (must match g1_sonic_client / encoder)
 FSQ_MIN = -0.625
@@ -126,7 +131,7 @@ class WmSubgoalProvider:
     makes that response stale and therefore unable to overwrite the current goal.
     """
 
-    def __init__(self, base_url, subtasks, task="", period=0.8, timeout=120.0,
+    def __init__(self, base_url, subtasks, task="", period=3.0, timeout=120.0,
                  jpeg_quality=90, stale_warn=5.0,
                  dump_dir="/tmp/psix_wm_client"):
         subtasks = [str(s).strip() for s in (subtasks or [])]
@@ -145,7 +150,9 @@ class WmSubgoalProvider:
         self._period = float(period)
         self._timeout = float(timeout)
         self._jpeg_quality = int(jpeg_quality)
-        self._stale_warn = float(stale_warn)
+        # Kept in the constructor for CLI/API compatibility. Prompt/goal mismatch
+        # now gates immediately instead of waiting for a warning threshold.
+        _ = float(stale_warn)
         self._dump_dir = os.path.abspath(os.path.expanduser(dump_dir))
 
         self._lock = threading.Lock()
@@ -195,6 +202,28 @@ class WmSubgoalProvider:
         if rgb.dtype != np.uint8 or rgb.ndim != 3 or rgb.shape[2] != 3:
             raise ValueError(f"bad decoded goal: {rgb.dtype} {rgb.shape}")
         return np.ascontiguousarray(rgb)
+
+    def _save_bagel_goal(self, encoded_jpeg, request, generation):
+        """Best-effort persistence of a newly accepted BAGEL response JPEG."""
+        status = f"accepted-gen{int(generation):06d}"
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        filename = (
+            f"{stamp}_stage{int(request['stage']):02d}_"
+            f"epoch{int(request['epoch']):04d}_"
+            f"req{int(request['request_id']):06d}_{status}.jpg"
+        )
+        path = os.path.join(self._dump_dir, filename)
+        try:
+            os.makedirs(self._dump_dir, exist_ok=True)
+            data = b64decode(encoded_jpeg, validate=True)
+            with open(path, "wb") as f:
+                f.write(data)
+            print(f"[wm] saved BAGEL goal: {path}", flush=True)
+            return path
+        except Exception as exc:
+            # Image logging must never interrupt WM refresh or robot control.
+            print(f"[wm] WARNING: failed to save BAGEL goal ({exc})", flush=True)
+            return None
 
     def update_latest_ego(self, rgb_uint8):
         """Atomically replace the latest camera frame without sharing camera sockets."""
@@ -250,7 +279,12 @@ class WmSubgoalProvider:
         return snap
 
     def advance_prompt(self):
-        """Advance language immediately and wake the serialized WM worker now."""
+        """Advance language, invalidate the old-stage goal, and wake WM now.
+
+        A prompt and goal image are one condition.  Once the prompt changes, the
+        previous stage's image must not be paired with it, so consumers stay gated
+        until a goal generated from the new prompt lands.
+        """
         with self._lock:
             if self._prompt_stage >= len(self._subtasks) - 1:
                 stage = self._prompt_stage
@@ -259,11 +293,18 @@ class WmSubgoalProvider:
                 self._prompt_stage += 1
                 self._prompt_epoch += 1
                 self._prompt_changed_at = time.monotonic()
+                self._last_good_goal = None
+                self._goal_stage = None
+                self._goal_updated_at = None
                 stage = self._prompt_stage
                 changed = True
             subtask = self._subtasks[stage]
         if changed:
-            print(f"[wm] prompt -> stage {stage}: {subtask!r}; waking WM now", flush=True)
+            print(
+                f"[wm] prompt -> stage {stage}: {subtask!r}; "
+                "gated until its WM goal lands",
+                flush=True,
+            )
         else:
             print(f"[wm] already at last prompt stage {stage}; refreshing WM now", flush=True)
         self._wake_evt.set()
@@ -360,7 +401,8 @@ class WmSubgoalProvider:
                 )
             if str(payload.get("subtask", "")) != request["subtask"]:
                 raise ValueError("response subtask does not match the requested stage")
-            goal = self._decode_jpeg(payload["subgoal_jpeg"])
+            encoded_goal = payload["subgoal_jpeg"]
+            goal = self._decode_jpeg(encoded_goal)
         except Exception as exc:
             with self._lock:
                 if (self._pending_goal is not None and
@@ -408,6 +450,7 @@ class WmSubgoalProvider:
             )
             return
 
+        self._save_bagel_goal(encoded_goal, request, generation)
         if first_for_stage:
             try:
                 os.makedirs(self._dump_dir, exist_ok=True)
@@ -430,7 +473,8 @@ class WmSubgoalProvider:
     def _poll_loop(self):
         print(
             f"[wm] worker started url={self._base_url} period={self._period:.2f}s "
-            f"timeout={self._timeout:.1f}s JPEG={self._jpeg_quality}", flush=True
+            f"timeout={self._timeout:.1f}s JPEG={self._jpeg_quality} "
+            f"image_log={self._dump_dir}", flush=True
         )
         try:
             next_due = time.monotonic()
@@ -745,7 +789,8 @@ class RTCWebSocketClient:
         self._action_stale_timeout = float(action_stale_timeout)
         if self._action_stale_timeout <= 0:
             raise ValueError("action stale timeout must be positive")
-        self._wm_stale_warn = float(wm_stale_warn)
+        # Kept for call-site compatibility; stale prompt/goal pairs now gate immediately.
+        _ = float(wm_stale_warn)
         self._dbg_last_generation = -1
         self._include_neck = include_neck
         self._neck_publisher = neck_publisher
@@ -756,7 +801,6 @@ class RTCWebSocketClient:
         self._last_hold_reason = None
         self._last_problem_log_at = -float("inf")
         self._last_gate_log_at = -float("inf")
-        self._last_stale_goal_log_at = -float("inf")
         self._send_count = 0
         self._send_rate_started_at = time.monotonic()
         self._action_count = 0
@@ -941,12 +985,16 @@ class RTCWebSocketClient:
 
                 fresh, obs_age, state_age, camera_age = self._freshness()
                 wm = self._wm.snapshot()
+                wm_condition_ready = wm["goal"] is not None and not wm["goal_stale"]
                 try:
                     condition_ready, version, barrier_reason = \
                         self._accept_version_for_condition(version, wm)
                 except ValueError as exc:
                     self._stop_or_hold_wbc(f"invalid VLA action stream: {exc}")
                     print(f"[client] ERROR: rejected action: {exc}", flush=True)
+                    return
+                if not wm_condition_ready:
+                    self._stop_or_hold_wbc("no WM goal for the current prompt")
                     return
                 if not condition_ready:
                     if now - self._last_barrier_log_at >= 1.0:
@@ -955,9 +1003,6 @@ class RTCWebSocketClient:
                             f"[safety] holding queued action version={version}: "
                             f"{barrier_reason}", flush=True
                         )
-                    return
-                if wm["goal"] is None:
-                    self._stop_or_hold_wbc("no last-good WM goal")
                     return
                 if not fresh:
                     self._stop_or_hold_wbc(
@@ -1083,14 +1128,15 @@ class RTCWebSocketClient:
 
                 wm = self._wm.snapshot()
                 subgoal_frame = wm["goal"]
-                if subgoal_frame is None:
-                    self._stop_or_hold_wbc("waiting for first WM goal")
+                if subgoal_frame is None or wm["goal_stale"]:
+                    self._stop_or_hold_wbc("waiting for WM goal for the current prompt")
                     now = time.monotonic()
                     if now - self._last_gate_log_at >= 2.0:
                         self._last_gate_log_at = now
                         print(
-                            f"[client] gated: waiting for first WM goal; "
+                            f"[client] gated: waiting for current-prompt WM goal; "
                             f"stage={wm['prompt_stage']} epoch={wm['prompt_epoch']} "
+                            f"goal_stage={wm['goal_stage']} "
                             f"error={wm['last_wm_error']!r}", flush=True
                         )
                     time.sleep(max(0.0, OBS_SEND_INTERVAL - (time.monotonic() - tick_started)))
@@ -1101,19 +1147,6 @@ class RTCWebSocketClient:
                         f"WM goal must be RGB uint8 HxWx3, got "
                         f"{subgoal_frame.dtype} {subgoal_frame.shape}"
                     )
-
-                if (wm["goal_stale"] and
-                        wm["mismatch_age_s"] >= self._wm_stale_warn):
-                    now = time.monotonic()
-                    if now - self._last_stale_goal_log_at >= 2.0:
-                        self._last_stale_goal_log_at = now
-                        print(
-                            f"[wm] WARNING goal_stale=true prompt_stage={wm['prompt_stage']} "
-                            f"goal_stage={wm['goal_stage']} "
-                            f"mismatch_age={wm['mismatch_age_s']:.1f}s "
-                            f"error={wm['last_wm_error']!r}; continuing with last-good goal",
-                            flush=True,
-                        )
 
                 if wm["goal_generation"] != self._dbg_last_generation:
                     self._dbg_last_generation = wm["goal_generation"]
@@ -1407,30 +1440,30 @@ if __name__ == "__main__":
     parser.add_argument("--camera-timeout-ms", type=int, default=DEFAULT_CAMERA_TIMEOUT_MS,
                         help="Camera ZMQ send/receive timeout; timed-out REQ sockets recover")
     parser.add_argument("--episode-dir", type=str,
-                        default="/mnt/data/weiduo/heng/GR00T-WholeBodyControl/data/real_pick_place/pick_place_eggplant_plastic_box/episode_1",
+                        default="/mnt/data/weiduo/heng/GR00T-WholeBodyControl/data/real_clean_up_table/cleanup_table_1_episode_11",
                         help="Deprecated compatibility option; live goals now come from WM")
     parser.add_argument("--prompts-json", type=str,
-                        default="/mnt/data/weiduo/heng/GR00T-WholeBodyControl/data/real_pick_place/prompts.json",
+                        default="/mnt/data/weiduo/heng/GR00T-WholeBodyControl/data/real_clean_up_table/prompts.json",
                         help="JSON mapping task-key -> {task_description, subtasks[]}")
-    parser.add_argument("--task-key", type=str, default="cleanup_table_1_episode_13",
+    parser.add_argument("--task-key", type=str, default="cleanup_table_1_episode_11",
                         help="Key into prompts.json (e.g. pick_place_1); selects the "
                              "task_description and the per-stage subtask prompts.")
     parser.add_argument("--instruction", type=str, default=None,
                         help="Override task instruction (else taken from prompts.json[task-key])")
-    parser.add_argument("--wm-host", type=str, default="192.168.0.142",
+    parser.add_argument("--wm-host", type=str, default="192.168.123.240",
                         help="BAGEL WM server Wi-Fi address")
     parser.add_argument("--wm-port", type=int, default=8016,
                         help="BAGEL WM HTTP port")
-    parser.add_argument("--wm-period", type=float, default=0.8,
+    parser.add_argument("--wm-period", type=float, default=3.0,
                         help="Serialized WM refresh period in seconds")
     parser.add_argument("--wm-timeout", type=float, default=120.0,
                         help="Timeout for one POST /wm request")
     parser.add_argument("--jpeg-quality", type=int, default=90,
                         help="JPEG quality for ego/subgoal Wi-Fi transport (1-100)")
     parser.add_argument("--wm-stale-warn", type=float, default=5.0,
-                        help="Warn after prompt/last-good-goal mismatch lasts this many seconds")
-    parser.add_argument("--wm-dump-dir", type=str, default="/tmp/psix_wm_client",
-                        help="Directory for first ego/goal debug images per stage")
+                        help="Deprecated compatibility option; mismatched prompt/goal now gates immediately")
+    parser.add_argument("--wm-dump-dir", type=str, default=DEFAULT_WM_DUMP_DIR,
+                        help="Exact directory for all BAGEL response images; default has a run timestamp")
     parser.add_argument("--observation-stale-timeout", type=float, default=0.5,
                         help="Stop/hold WBC if state, camera, or last VLA observation is older")
     parser.add_argument("--action-stale-timeout", type=float, default=0.5,
