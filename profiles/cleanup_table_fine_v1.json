@@ -1,0 +1,99 @@
+{
+  "schema_version": "wm-semantic-profile/1",
+  "profile_name": "cleanup_table_fine",
+  "profile_version": 1,
+  "task_text": "Clean up the table",
+  "granularity": "fine",
+  "labels": [
+    "Pick up the banana",
+    "Pick up the brown elephant toy",
+    "Pick up the corn toy",
+    "Pick up the duck toy",
+    "Pick up the grapes",
+    "Pick up the silver bottle",
+    "Pick up the transparent bottle",
+    "Pick up the yellow tiger toy",
+    "Place the banana into the brown box",
+    "Place the brown elephant toy into the brown box",
+    "Place the corn toy into the brown box",
+    "Place the duck toy into the brown box",
+    "Place the grapes into the brown box",
+    "Place the silver bottle into the brown box",
+    "Place the transparent bottle into the brown box",
+    "Place the yellow tiger toy into the brown box",
+    "Retract and end"
+  ],
+  "done_sentinel": "__done__",
+  "label_source": {
+    "datasets": [
+      ".data/real/cleanup_table_2026-07-01_train/g1",
+      ".data/real/cleanup_table_2026-07-01_val/g1"
+    ],
+    "columns": [
+      "subtask_prompt",
+      "next_subtask"
+    ],
+    "episodes_checked": 20
+  },
+  "grammar": {
+    "pairs": [
+      {
+        "object": "banana",
+        "pick": "Pick up the banana",
+        "place": "Place the banana into the brown box"
+      },
+      {
+        "object": "brown elephant toy",
+        "pick": "Pick up the brown elephant toy",
+        "place": "Place the brown elephant toy into the brown box"
+      },
+      {
+        "object": "corn toy",
+        "pick": "Pick up the corn toy",
+        "place": "Place the corn toy into the brown box"
+      },
+      {
+        "object": "duck toy",
+        "pick": "Pick up the duck toy",
+        "place": "Place the duck toy into the brown box"
+      },
+      {
+        "object": "grapes",
+        "pick": "Pick up the grapes",
+        "place": "Place the grapes into the brown box"
+      },
+      {
+        "object": "silver bottle",
+        "pick": "Pick up the silver bottle",
+        "place": "Place the silver bottle into the brown box"
+      },
+      {
+        "object": "transparent bottle",
+        "pick": "Pick up the transparent bottle",
+        "place": "Place the transparent bottle into the brown box"
+      },
+      {
+        "object": "yellow tiger toy",
+        "pick": "Pick up the yellow tiger toy",
+        "place": "Place the yellow tiger toy into the brown box"
+      }
+    ],
+    "terminal": "Retract and end",
+    "rules": [
+      "episode = (pick_i, place_i){1..8} then terminal",
+      "place must immediately follow the pick of the same object",
+      "terminal only after >=1 completed (pick, place) pair",
+      "done only after terminal"
+    ]
+  },
+  "normalize": {
+    "strip_whitespace": true,
+    "collapse_internal_spaces": true,
+    "strip_terminal_punctuation": true,
+    "casefold_for_match": true
+  },
+  "aliases": {},
+  "vla_instruction_template": "Task: {task_lower}. Subtask: {canonical_subtask}",
+  "notes": "Fine vocabulary; matches Cosmos arm_SF cleanup corpus and BAGEL fine training strings verbatim. Scene object ORDER varies per episode; the grammar constrains pairing + terminal, not object order.",
+  "profile_hash": "80b1aa7c2b71e314aa88dffa080b689957dbe8c6a8aedc4a4c66e81bc1b8cb78"
+}
