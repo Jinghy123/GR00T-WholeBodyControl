@@ -564,8 +564,12 @@ class TokenPolicyClient:
                  neck_pub_host, neck_pub_port,
                  neck_state_zmq,
                  action_only=False,
-                 include_neck=False):
+                 include_neck=False,
+                 use_realsense=False):
         self._include_neck = include_neck
+        # Neck-mounted RealSense outputs 640x480 natively; keep that size instead
+        # of stretching to the ZED-era 672x384 (must match the training data).
+        self._img_resolution = (640, 480) if use_realsense else POLICY_IMAGE_RESOLUTION
 
         # Initialize components. In neck mode the camera is the neck-mounted ZED
         # served by realsense_server.py --zed-only --enable-neck-motor (4-part
@@ -645,13 +649,14 @@ class TokenPolicyClient:
             selected = [self.image_buffer[i].copy() for i in frame_indices]  # (T, H, W, 3)
         selected = np.stack(selected, axis=0) # (T, H, W, 3) or (1, H, W, 3)
 
-        # Resize images to match policy server's expected resolution (672x384)
-        # Only needed for ZedNeckCamera (include_neck mode) which outputs 672x376
+        # Resize images to match policy server's expected resolution (672x384,
+        # or 640x480 RealSense-native with --use-realsense).
+        # Only needed in include_neck mode; no-neck frames are sent raw.
         if self._include_neck:
             if selected.ndim == 4:  # (T, H, W, 3)
-                selected = np.stack([cv2.resize(frame, POLICY_IMAGE_RESOLUTION) for frame in selected], axis=0)
+                selected = np.stack([cv2.resize(frame, self._img_resolution) for frame in selected], axis=0)
             elif selected.ndim == 3:  # (H, W, 3)
-                selected = cv2.resize(selected, POLICY_IMAGE_RESOLUTION)
+                selected = cv2.resize(selected, self._img_resolution)
 
         if len(frame_indices) == 1:
             selected = selected[0]  # (H, W, 3)
@@ -914,6 +919,10 @@ def main():
                             "state +observation/neck(2). Server must be launched with the same "
                             "--include-neck flag and a neck ckpt. Default (off) keeps the legacy "
                             "78-dim hand+token path with no neck I/O.")
+    parser.add_argument("--use-realsense", action="store_true",
+                       help="Neck camera is a RealSense (640x480 native): resize the "
+                            "include-neck egocentric frame to 640x480 instead of the "
+                            "ZED-era 672x384. Use with checkpoints trained on RealSense data.")
 
     args = parser.parse_args()
 
@@ -941,6 +950,7 @@ def main():
         neck_state_zmq=args.neck_state_zmq,
         action_only=args.action_only,
         include_neck=args.include_neck,
+        use_realsense=args.use_realsense,
     )
 
     try:

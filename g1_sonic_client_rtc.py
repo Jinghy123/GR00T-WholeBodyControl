@@ -141,6 +141,7 @@ class RTCTokenPolicyClient:
         neck_pub_port,
         neck_state_zmq,
         include_neck=False,
+        use_realsense=False,
         execution_horizon=12,
         inference_delay=10,
         guidance_weight=5.0,
@@ -150,6 +151,9 @@ class RTCTokenPolicyClient:
         tick_log_every=1,
     ):
         self._include_neck = include_neck
+        # Neck-mounted RealSense outputs 640x480 natively; keep that size instead
+        # of stretching to the ZED-era 672x384 (must match the training data).
+        self._img_resolution = (640, 480) if use_realsense else POLICY_IMAGE_RESOLUTION
         self._prompt = prompt
         self._action_dim = ACTION_DIM_NECK if include_neck else ACTION_DIM_DEFAULT
         self._tick_log_every = max(int(tick_log_every), 1)  # per-tick heartbeat throttle
@@ -250,9 +254,10 @@ class RTCTokenPolicyClient:
             return None
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.uint8)
         # ZED (neck) outputs 672x376 -> resize to the server's expected 672x384.
+        # With --use-realsense the target is 640x480 (RealSense native) instead.
         # RealSense (no-neck) frames are sent raw; the server transform resizes.
         if self._include_neck:
-            rgb = cv2.resize(rgb, POLICY_IMAGE_RESOLUTION)
+            rgb = cv2.resize(rgb, self._img_resolution)
 
         state = self._state_reader.get_state()
         if state is None:
@@ -699,9 +704,13 @@ def main():
     parser.add_argument("--tick-log-every", type=int, default=1,
                         help="Print the per-tick heartbeat (t/s/d) every N ticks. 1=every tick "
                              "(30 lines/s); events (trigger/swap/freeze/miss) always print.")
+    parser.add_argument("--use-realsense", action="store_true",
+                        help="Neck camera is a RealSense (640x480 native): resize the "
+                             "include-neck egocentric frame to 640x480 instead of the "
+                             "ZED-era 672x384. Use with checkpoints trained on RealSense data.")
     args = parser.parse_args()
 
-    print(f"[RTC] include_neck={args.include_neck}, "
+    print(f"[RTC] include_neck={args.include_neck}, use_realsense={args.use_realsense}, "
           f"action_dim={ACTION_DIM_NECK if args.include_neck else ACTION_DIM_DEFAULT}")
     print(f"[RTC] H={ACTION_HORIZON} s={args.execution_horizon} d_init={args.inference_delay} "
           f"gw={args.guidance_weight} mask={args.mask_schedule}")
@@ -722,6 +731,7 @@ def main():
         neck_pub_port=args.neck_pub_port,
         neck_state_zmq=args.neck_state_zmq,
         include_neck=args.include_neck,
+        use_realsense=args.use_realsense,
         execution_horizon=args.execution_horizon,
         inference_delay=args.inference_delay,
         guidance_weight=args.guidance_weight,

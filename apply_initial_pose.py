@@ -20,7 +20,8 @@ from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
     build_command_message,
     pack_pose_message,
 )
-from encoder_client import EncoderClient
+# EncoderClient (onnxruntime) is imported lazily — only the data.json path
+# needs it; the LeRobot episode mode uses the recorded token directly.
 
 # Joint order conversion: WBC publishes in Mujoco order, encoder expects IsaacLab order
 _MUJOCO_TO_ISAACLAB_DOF = np.array(
@@ -72,13 +73,50 @@ def load_initial_pose(data_path):
     return initial_pose
 
 
+def load_initial_pose_lerobot(episode_dir):
+    """Load the first frame's recorded action from a LeRobot parquet episode.
+
+    Uses the recorded action.token_state directly (no encoder) — exactly what
+    replay_token.py sends at frame 1, so the robot moves to the replay's
+    starting pose before the stream begins.
+    """
+    import glob
+    import pyarrow.parquet as pq
+
+    paths = sorted(glob.glob(os.path.join(episode_dir, "data", "chunk-*", "*.parquet")))
+    if not paths:
+        raise FileNotFoundError(f"no data/chunk-*/ parquet found under {episode_dir}")
+    table = pq.read_table(paths[0])
+    cols = set(table.column_names)
+    if "action.token_state" not in cols:
+        raise ValueError(f"{paths[0]} has no action.token_state column")
+
+    token = np.asarray(table["action.token_state"][0].as_py(), dtype=np.float32)
+    hand = (np.asarray(table["action.hand_cmd"][0].as_py(), dtype=np.float32)
+            if "action.hand_cmd" in cols else np.zeros(HAND_DIM, dtype=np.float32))
+    neck = (np.asarray(table["action.neck"][0].as_py(), dtype=np.float32)
+            if "action.neck" in cols else np.zeros(NECK_DIM, dtype=np.float32))
+
+    return {
+        'token': token,          # (64,) recorded token, sent as-is
+        'hand_joints': hand,     # (14,) commanded hand joints
+        'neck': neck,            # (2,) commanded [yaw, pitch]
+    }
+
+
 def apply_initial_pose(pose, zmq_host, zmq_port, zmq_topic, neck_pub_host, neck_pub_port):
     """Publish the initial pose to the robot."""
 
-    # Initialize encoder
-    print("[Encoder] Loading model...")
-    encoder = EncoderClient(ENCODER_MODEL, mode=0)
-    print("[Encoder] Model loaded")
+    if 'token' in pose:
+        # LeRobot episode mode: the recorded token is used directly.
+        encoder = None
+        print("[Encoder] Skipped — using recorded token from the episode.")
+    else:
+        # Initialize encoder
+        from encoder_client import EncoderClient
+        print("[Encoder] Loading model...")
+        encoder = EncoderClient(ENCODER_MODEL, mode=0)
+        print("[Encoder] Model loaded")
 
     # Create ZMQ context
     ctx = zmq.Context()
@@ -115,19 +153,24 @@ def apply_initial_pose(pose, zmq_host, zmq_port, zmq_topic, neck_pub_host, neck_
 
     time.sleep(0.1)
 
-    # Encode the initial pose to get token
-    # Convert qpos from Mujoco order to IsaacLab order (encoder expects IsaacLab)
-    qpos_isaaclab = _mujoco29_to_isaaclab29(pose['qpos'])
-    base_quat = pose['quat']  # (4,) wxyz
+    if encoder is None:
+        token = pose['token']
+        base_quat = None
+        print(f"[Token] Using recorded token, range=[{token.min():.4f},{token.max():.4f}]")
+    else:
+        # Encode the initial pose to get token
+        # Convert qpos from Mujoco order to IsaacLab order (encoder expects IsaacLab)
+        qpos_isaaclab = _mujoco29_to_isaaclab29(pose['qpos'])
+        base_quat = pose['quat']  # (4,) wxyz
 
-    # Prepare encoder inputs (matching g1_sonic_client.py _publish_loop)
-    joint_pos = np.tile(qpos_isaaclab, (10, 1)).astype(np.float32)  # (10, 29)
-    joint_vel = np.zeros((10, 29), dtype=np.float32)
-    body_quat = np.tile(base_quat, (10, 1)).astype(np.float32)  # (10, 4)
+        # Prepare encoder inputs (matching g1_sonic_client.py _publish_loop)
+        joint_pos = np.tile(qpos_isaaclab, (10, 1)).astype(np.float32)  # (10, 29)
+        joint_vel = np.zeros((10, 29), dtype=np.float32)
+        body_quat = np.tile(base_quat, (10, 1)).astype(np.float32)  # (10, 4)
 
-    # Encode to get token
-    token = encoder.encode(joint_pos, joint_vel, body_quat)  # (64,)
-    print(f"[Encoder] Generated token from qpos, range=[{token.min():.4f},{token.max():.4f}]")
+        # Encode to get token
+        token = encoder.encode(joint_pos, joint_vel, body_quat)  # (64,)
+        print(f"[Encoder] Generated token from qpos, range=[{token.min():.4f},{token.max():.4f}]")
 
     # Build action: hand(14) + neck(2) + token(64) = 80 (include-neck mode)
     action = np.concatenate([
@@ -141,8 +184,9 @@ def apply_initial_pose(pose, zmq_host, zmq_port, zmq_topic, neck_pub_host, neck_
         "token_state": action[HAND_DIM + NECK_DIM:HAND_DIM + NECK_DIM + TOKEN_DIM].reshape(1, -1),
         "left_hand_joints": action[:7].reshape(1, 7),
         "right_hand_joints": action[7:14].reshape(1, 7),
-        "body_quat_w": np.asarray(base_quat, dtype=np.float32).reshape(1, 4),
     }
+    if base_quat is not None:
+        pose_data["body_quat_w"] = np.asarray(base_quat, dtype=np.float32).reshape(1, 4)
     msg = pack_pose_message(pose_data, topic=zmq_topic, version=4)
     token_pub.send(msg)
     print(f"[TokenPub] Sent action with body_quat_w={base_quat}")
@@ -175,6 +219,10 @@ def main():
     parser.add_argument("--data", type=str,
                        default="/mnt/data/weiduo/heng/GR00T-WholeBodyControl/data.json",
                        help="Path to data.json file")
+    parser.add_argument("--episode-dir", type=str, default="",
+                       help="LeRobot parquet episode dir (data/chunk-*/); uses the "
+                            "first frame's recorded action.token_state instead of "
+                            "the encoder. Takes precedence over --data.")
     parser.add_argument("--zmq-host", type=str, default=DEFAULT_ZMQ_HOST,
                        help="ZMQ publisher bind host (default: *)")
     parser.add_argument("--zmq-port", type=int, default=DEFAULT_ZMQ_PORT,
@@ -189,11 +237,15 @@ def main():
     args = parser.parse_args()
 
     # Load initial pose
-    print(f"[Load] Reading initial pose from {args.data}")
-    pose = load_initial_pose(args.data)
-
-    print(f"[Pose] qpos[0:5]: {pose['qpos'][:5]}")
-    print(f"[Pose] quat (wxyz): {pose['quat']}")
+    if args.episode_dir:
+        print(f"[Load] Reading first-frame action from LeRobot episode {args.episode_dir}")
+        pose = load_initial_pose_lerobot(args.episode_dir)
+        print(f"[Pose] token[0:5]: {pose['token'][:5]}")
+    else:
+        print(f"[Load] Reading initial pose from {args.data}")
+        pose = load_initial_pose(args.data)
+        print(f"[Pose] qpos[0:5]: {pose['qpos'][:5]}")
+        print(f"[Pose] quat (wxyz): {pose['quat']}")
     print(f"[Pose] hand_joints: {pose['hand_joints']}")
     print(f"[Pose] neck (yaw, pitch) from actions: {pose['neck']}")
 

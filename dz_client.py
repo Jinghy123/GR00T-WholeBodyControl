@@ -346,7 +346,8 @@ class DZSonicClient:
 
     def __init__(self, policy_client, state_subscriber, camera, token_publisher,
                  instruction_manager, task_instruction,
-                 include_neck=False, neck_publisher=None, neck_state_reader=None):
+                 include_neck=False, neck_publisher=None, neck_state_reader=None,
+                 use_realsense=False):
         self._policy = policy_client
         self._state_sub = state_subscriber
         self._camera = camera
@@ -357,6 +358,9 @@ class DZSonicClient:
         self._include_neck = include_neck
         self._neck_publisher = neck_publisher
         self._neck_state_reader = neck_state_reader
+        # Neck-mounted RealSense outputs 640x480 natively; keep that size instead
+        # of stretching to the ZED-era 672x384 (must match the training data).
+        self._img_wh = (640, 480) if use_realsense else POLICY_IMAGE_WH
 
         # One session id per run; server resets its video frame buffer when it changes.
         self._session_id = uuid.uuid4().hex
@@ -385,7 +389,7 @@ class DZSonicClient:
         if frame is None:
             return
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame = cv2.resize(frame, POLICY_IMAGE_WH).astype(np.uint8)
+        frame = cv2.resize(frame, self._img_wh).astype(np.uint8)
         with self._frame_lock:
             self._frame_buffer.append(frame)
 
@@ -642,7 +646,8 @@ class DZSonicClient:
 # ---------------- Main ----------------
 def main(host, port, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_topic,
          camera_address, task_instruction, subtasks,
-         include_neck=False, neck_pub_host=DEFAULT_NECK_PUB_HOST, neck_pub_port=DEFAULT_NECK_PUB_PORT,
+         include_neck=False, use_realsense=False,
+         neck_pub_host=DEFAULT_NECK_PUB_HOST, neck_pub_port=DEFAULT_NECK_PUB_PORT,
          neck_state_zmq=DEFAULT_NECK_STATE_ZMQ):
     print("[MAIN] Initializing components...")
 
@@ -697,6 +702,7 @@ def main(host, port, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
         include_neck=include_neck,
         neck_publisher=neck_publisher,
         neck_state_reader=neck_state_reader,
+        use_realsense=use_realsense,
     )
 
     if not client.start():
@@ -769,6 +775,10 @@ if __name__ == "__main__":
                         help="Neck variant: send real 45-dim state (+neck2) and publish the "
                              "action's neck(2) + use the neck-mounted ZED camera. Default (off) "
                              "sends 43-dim state (server pads to 45) and ignores the action neck.")
+    parser.add_argument("--use-realsense", action="store_true",
+                        help="Neck camera is a RealSense (640x480 native): resize frames to "
+                             "640x480 instead of the ZED-era 672x384. Use with checkpoints "
+                             "trained on RealSense data.")
     parser.add_argument("--neck-pub-host", type=str, default=DEFAULT_NECK_PUB_HOST,
                         help=f"Neck PUB bind host (default: {DEFAULT_NECK_PUB_HOST})")
     parser.add_argument("--neck-pub-port", type=int, default=DEFAULT_NECK_PUB_PORT,
@@ -807,6 +817,7 @@ if __name__ == "__main__":
         task_instruction=task_instruction,
         subtasks=subtasks,
         include_neck=args.include_neck,
+        use_realsense=args.use_realsense,
         neck_pub_host=args.neck_pub_host,
         neck_pub_port=args.neck_pub_port,
         neck_state_zmq=args.neck_state_zmq,

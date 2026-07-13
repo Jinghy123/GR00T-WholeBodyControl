@@ -362,6 +362,122 @@ python realsense_native_server.py --no-depth \
 `g1_data_server.py --neck-zmq tcp://localhost:5570 --neck-state-zmq tcp://192.168.123.164:5560`。
 实时画面查看用 `realsense_viewer.py --server 192.168.123.164 --sub`（不是 test_viewer.py）。
 
+### 4.3 推理（Inference）
+
+和第 3.2 节的区别：加回整条脖子链路；和第 2 节的区别：ZED 换成脖子上的
+RealSense。客户端照常带 `--include-neck`，**代码不用改**：`ZedNeckCamera`
+只解第 0 分片的 RGB JPEG，native server 的 3-part 回复第 0 片正是 RGB JPEG，
+直接兼容。
+
+#### 4.3.1 G1 板载
+
+```bash
+sudo chmod 777 /dev/ttyUSB0
+sudo killall -9 videohub_pc4
+conda activate ruohai
+cd ~/GR00T-WholeBodyControl
+python realsense_native_server.py --no-ir \
+    --enable-neck-motor \
+    --pose-zmq tcp://192.168.123.222:5570
+```
+
+> 推理不需要 `--enable-pico`；`--no-ir` 保证 RGB+depth 满 30fps（USB2 带宽
+> 见 3.1.1）。启动后确认 `[Neck]` 无红字、开始出帧，再启桌面端客户端。
+
+#### 4.3.2 桌面端
+
+WBC deploy、端口转发、policy server 与第 2.2 节完全相同：
+
+```bash
+cd gear_sonic_deploy
+source scripts/setup_env.sh
+./deploy.sh --input-type zmq real
+
+ssh -L 5000:localhost:5000 nebula101
+cd /mnt/data/weiduo/heng/DreamZero-private
+bash start.sh
+```
+
+回初始姿态，然后启动策略客户端（**带 `--include-neck`**，checkpoint 是
+RealSense 数据训练的再加 `--use-realsense`，见下面分辨率说明）：
+
+```bash
+python apply_initial_pose.py
+
+# psix（发原图，服务端 resize，无 --use-realsense）：
+python psix_rtc_sonic_client.py --include-neck
+
+# 或 RTC 版：
+python g1_sonic_client_rtc.py \
+    --policy-host 127.0.0.1 --policy-port 5000 \
+    --prompt "..." \
+    --execution-horizon 12 --inference-delay 10 --guidance-weight 5.0 --kv-scheme stride1 \
+    --include-neck --use-realsense
+
+# 或非 RTC 版：
+python g1_sonic_client.py --action-only --include-neck --use-realsense
+
+# 或 DZ 版（policy 在 nebula102，48014 端口没有公网映射，必须先转发：
+#   ssh -N -f -L 48014:localhost:48014 nebula102
+# --host 填别的 IP 连不上，走默认 localhost）：
+python dz_client.py --include-neck --use-realsense
+```
+
+画面查看照旧 `python realsense_viewer.py --server 192.168.123.164 --sub`。
+
+> 两个注意点：
+> - **启动顺序**：等 G1 server 开始出帧再启客户端——刚启动时 REP 可能回空
+>   分片，客户端会在 `cvtColor(None)` 处崩掉（ZED 时代同理，不是新问题）。
+> - **分辨率 / `--use-realsense`**：RealSense 出 640x480（4:3），ZED 时代的
+>   客户端会拉伸到 672x384（16:9），画面被压扁。加 `--use-realsense` 后保持
+>   640x480 原样发送。**跟着 checkpoint 走**：ZED 图训练的老 ckpt 不加，
+>   RealSense 图训练的新 ckpt 加。各客户端行为：
+>
+>   | 客户端 | 默认 | `--use-realsense` |
+>   |---|---|---|
+>   | `g1_sonic_client.py` | include-neck 时 resize 672x384 | resize 640x480 |
+>   | `g1_sonic_client_rtc.py` | 同上 | 同上 |
+>   | `dz_client.py` | 所有帧 resize 672x384 | 所有帧 640x480 |
+>   | `psix_rtc_sonic_client.py` | 发原图，服务端处理 | 不需要此 flag |
+
+### 4.4 Replay（重放录制的 token + neck）
+
+把 4.3.2 的「策略客户端」换成 `replay_token.py`，**不需要** policy server 和
+端口转发。支持两种录制格式：`data.json` 目录和 LeRobot parquet 目录
+（`data/chunk-*/file-*.parquet`，读 `action.token_state` / `action.hand_cmd` /
+`action.neck`）。端口、协议、故障排查细节见 [REPLAY_GUIDE.md](REPLAY_GUIDE.md)。
+
+G1 板载同 4.3.1。桌面端环境用 `sonic`（已装 pyarrow）：
+
+```bash
+# 1. WBC deploy 同 4.3.2
+
+# 2. 停掉占 5570 的进程（否则 replay 的 neck PUB bind 失败）
+pkill -f pico_manus_thread_server.py; pkill -f pose_publisher.py
+
+# 3. 回到该集的起始姿态（直接用第一帧录的 token，不走 encoder；
+#    跑完自动退出并释放 5556/5570）
+conda activate sonic
+PYTHONPATH=$PWD python apply_initial_pose.py --episode-dir data/<episode_dir>
+
+# 4. replay token + neck
+PYTHONPATH=$PWD python replay_token.py --episode-dir data/<episode_dir> --enable-neck
+```
+
+replay 的同时录制（相机装在脖子上，录下的画面跟着脖子转）：
+
+```bash
+source .venv_teleop/bin/activate
+python g1_data_server.py \
+    --neck-zmq       tcp://localhost:5570 \
+    --neck-state-zmq tcp://192.168.123.164:5560
+```
+
+键盘 `s` 开始 / `q` 保存 / `d` 丢弃；replay 开始发帧后按 `s`，结束按 `q`。
+输出在 `./data/demonstration_<session>/episode_<N>/`（data.json 格式，
+之后可直接再 replay）。录制期间看画面一律用 `realsense_viewer.py --sub`，
+别用 REQ 模式连 5558 抢帧。
+
 ---
 
 slimevr -1 +1

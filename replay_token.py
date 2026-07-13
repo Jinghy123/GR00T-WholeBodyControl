@@ -150,11 +150,66 @@ def _extract_neck(frame):
 
 # ── Load episode (new format: list of dict) ─────────────────────────────────
 
+def _load_lerobot_frames(episode_dir):
+    """Load frames from a LeRobot-format episode dir (data/chunk-*/ *.parquet).
+
+    Maps the parquet action columns onto the data.json frame layout so the
+    replay loop below works unchanged:
+        action.token_state (64) -> actions["token"]
+        action.hand_cmd    (14) -> actions["hand_joints"]
+        action.neck        (2)  -> actions["neck"]
+    Returns (frames, frequency) or None if the dir is not LeRobot format.
+    """
+    import glob
+    paths = sorted(glob.glob(os.path.join(episode_dir, "data", "chunk-*", "*.parquet")))
+    if not paths:
+        return None
+    import pyarrow.parquet as pq
+
+    frames = []
+    frequency = None
+    for p in paths:
+        t = pq.read_table(p)
+        cols = set(t.column_names)
+        if "action.token_state" not in cols:
+            raise ValueError(f"{p} has no action.token_state column")
+        tokens = t["action.token_state"].to_pylist()
+        hands = t["action.hand_cmd"].to_pylist() if "action.hand_cmd" in cols else [None] * len(tokens)
+        necks = t["action.neck"].to_pylist() if "action.neck" in cols else [None] * len(tokens)
+        valid = (
+            t["monitoring.sonic_token_valid"].to_pylist()
+            if "monitoring.sonic_token_valid" in cols else [1] * len(tokens)
+        )
+        for tok, hand, neck, ok in zip(tokens, hands, necks, valid):
+            actions = {"token": tok if ok else []}
+            if hand is not None:
+                actions["hand_joints"] = hand
+            if neck is not None:
+                actions["neck"] = neck
+            frames.append({"actions": actions})
+
+        # Derive the recording frequency from the joint-state timestamps (ns).
+        if frequency is None and "time_stamp.joint_state" in cols:
+            ts = t["time_stamp.joint_state"].to_pylist()
+            if len(ts) > 1:
+                import numpy as _np
+                dt_ns = float(_np.median(_np.diff(_np.asarray(ts, dtype=_np.float64))))
+                if dt_ns > 0:
+                    frequency = round(1e9 / dt_ns)
+
+    print(f"[ReplayToken] Loaded {len(frames)} frames from LeRobot parquet ({len(paths)} file(s))"
+          f", estimated frequency: {frequency or DEFAULT_RECORDING_FREQ} Hz")
+    return frames, (frequency or DEFAULT_RECORDING_FREQ)
+
+
 def load_episode(episode_dir):
-    """Load episode from data.json (new format: list of dict)."""
+    """Load episode from data.json (list of dict) or a LeRobot parquet dir."""
     json_path = os.path.join(episode_dir, "data.json")
     if not os.path.exists(json_path):
-        raise FileNotFoundError(f"data.json not found in {episode_dir}")
+        lerobot = _load_lerobot_frames(episode_dir)
+        if lerobot is not None:
+            return lerobot
+        raise FileNotFoundError(f"neither data.json nor data/chunk-*/ parquet found in {episode_dir}")
 
     with open(json_path, "r") as f:
         data = json.load(f)
