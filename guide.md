@@ -393,6 +393,7 @@ cd gear_sonic_deploy
 source scripts/setup_env.sh
 ./deploy.sh --input-type zmq real
 
+# 启动server
 ssh -L 5000:localhost:5000 nebula101
 cd /mnt/data/weiduo/heng/DreamZero-private
 bash start.sh
@@ -402,7 +403,7 @@ bash start.sh
 RealSense 数据训练的再加 `--use-realsense`，见下面分辨率说明）：
 
 ```bash
-python apply_initial_pose.py
+python apply_initial_pose.py # 如果pose teleop时候选择一致则不用跑
 
 # psix（发原图，服务端 resize，无 --use-realsense）：
 python psix_rtc_sonic_client.py --include-neck
