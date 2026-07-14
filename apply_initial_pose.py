@@ -13,7 +13,8 @@ import time
 import numpy as np
 import zmq
 
-_GROOT_ROOT = os.path.expanduser("/mnt/data/weiduo/heng/GR00T-WholeBodyControl")
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+_GROOT_ROOT = PROJECT_ROOT
 sys.path.insert(0, _GROOT_ROOT)
 
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
@@ -235,6 +236,13 @@ def main():
                        help=f"Neck PUB port (default: {DEFAULT_NECK_PUB_PORT})")
 
     args = parser.parse_args()
+
+    # --distance is a shortcut to the data_<distance>.json files.
+    if args.distance:
+        args.data = f"data_{args.distance}.json"
+
+    # Resolve --data relative to the project root unless an absolute path was given.
+    data_path = args.data if os.path.isabs(args.data) else os.path.join(PROJECT_ROOT, args.data)
 
     # Load initial pose
     if args.episode_dir:

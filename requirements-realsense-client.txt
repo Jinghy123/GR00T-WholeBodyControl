@@ -1,0 +1,7 @@
+# Minimal deps for realsense_viewer.py (runs on the local host).
+# Install into the `realsense` conda env (Python 3.10):
+#   conda create -n realsense python=3.10 -y && conda activate realsense
+#   pip install -r requirements-realsense-client.txt
+numpy==2.2.6
+opencv-python==4.13.0.92
+pyzmq==27.1.0
