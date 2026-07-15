@@ -31,6 +31,32 @@ def _decode_jpeg(buf):
     return cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
 
+def _load_overlay_frame(path, swap_channels=False):
+    """First frame of a video file, for blending over the live RGB view.
+
+    swap_channels flips B<->R so the overlay renders in false color and stands
+    out against the similarly-colored live camera view.
+    """
+    cap = cv2.VideoCapture(path)
+    ok, frame = cap.read()
+    cap.release()
+    if not ok or frame is None:
+        raise SystemExit(f"[viewer] could not read first frame from {path}")
+    if swap_channels:
+        frame = np.ascontiguousarray(frame[:, :, ::-1])
+    print(f"[viewer] overlay: first frame of {path} ({frame.shape[1]}x{frame.shape[0]}"
+          f"{', channels swapped' if swap_channels else ''})")
+    return frame
+
+
+def _show(name, img, scale):
+    """imshow with an optional display-only scale (frame data untouched)."""
+    if scale != 1.0:
+        img = cv2.resize(img, None, fx=scale, fy=scale,
+                         interpolation=cv2.INTER_LINEAR)
+    cv2.imshow(name, img)
+
+
 def _decode_depth(buf, w=640, h=480):
     if not buf or len(buf) != w * h * 2:
         return None
@@ -40,6 +66,11 @@ def _decode_depth(buf, w=640, h=480):
 
 
 def run(args):
+    overlay = (
+        _load_overlay_frame(args.overlay, swap_channels=args.overlay_swap_channels)
+        if args.overlay else None
+    )
+
     ctx = zmq.Context()
 
     if args.sub:
@@ -95,15 +126,21 @@ def run(args):
 
             rgb = _decode_jpeg(parts[0])
             if rgb is not None:
-                cv2.imshow("RealSense RGB", rgb)
+                if overlay is not None:
+                    if overlay.shape[:2] != rgb.shape[:2]:
+                        overlay = cv2.resize(overlay, (rgb.shape[1], rgb.shape[0]))
+                    rgb = cv2.addWeighted(
+                        rgb, 1.0 - args.overlay_alpha, overlay, args.overlay_alpha, 0
+                    )
+                _show("RealSense RGB", rgb, args.scale)
             if args.show_ir:
                 ir = _decode_jpeg(parts[1])
                 if ir is not None:
-                    cv2.imshow("RealSense IR L|R", ir)
+                    _show("RealSense IR L|R", ir, args.scale)
             if args.show_depth:
                 depth = _decode_depth(parts[2])
                 if depth is not None:
-                    cv2.imshow("RealSense Depth", depth)
+                    _show("RealSense Depth", depth, args.scale)
 
             frames += 1
             now = time.time()
@@ -131,6 +168,18 @@ def main():
                         "viewer never steals frames from the recorder.")
     p.add_argument("--show-ir", action="store_true", help="also show IR L|R window")
     p.add_argument("--show-depth", action="store_true", help="also show colorized depth")
+    p.add_argument("--overlay", default="",
+                   help="video file whose FIRST frame is alpha-blended over the "
+                        "live RGB window (e.g. to line the camera up with a "
+                        "recorded episode)")
+    p.add_argument("--overlay-alpha", type=float, default=0.5,
+                   help="overlay opacity, 0..1 (default 0.5)")
+    p.add_argument("--overlay-swap-channels", action="store_true",
+                   help="swap the overlay's B<->R channels (false color) so it "
+                        "contrasts with the live camera view")
+    p.add_argument("--scale", type=float, default=1.0,
+                   help="display-only window scale factor (default 1.0); the "
+                        "frame data itself is never resized")
     run(p.parse_args())
 
 

@@ -21,7 +21,14 @@ from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
 )
 
 # ---------------- Configuration ----------------
-TASK_INSTRUCTION = "Clean up the table"
+# TASK_INSTRUCTION = "Walk towards the table, pick up the grapes, and place them in the bowl."
+# TASK_INSTRUCTION = "Walk towards the table, pick up the duck, and place it in the box."
+
+TASK_INSTRUCTION = "Pick up the eggplant and place it in the basket."
+# TASK_INSTRUCTION = "Walk towards the table, pick up the eggplant, and place it in the basket."
+
+# TASK_INSTRUCTION = "Pick up the crumpled paper ball and place it in the tray."
+# TASK_INSTRUCTION = "Walk towards the table, pick up the crumpled paper ball, and place it in the tray."
 
 # FSQ configuration (must match g1_sonic_client / encoder)
 FSQ_MIN = -0.625
