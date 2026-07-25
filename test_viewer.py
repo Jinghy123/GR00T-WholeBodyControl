@@ -32,6 +32,24 @@ def _decode(jpeg_bytes):
     return cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
 
+def _load_overlay_frame(path, swap_channels=False):
+    """First frame of a video file, for blending over the live ego view.
+
+    swap_channels flips B<->R so the overlay renders in false color and stands
+    out against the similarly-colored live camera view.
+    """
+    cap = cv2.VideoCapture(path)
+    ok, frame = cap.read()
+    cap.release()
+    if not ok or frame is None:
+        raise SystemExit(f"[viewer] could not read first frame from {path}")
+    if swap_channels:
+        frame = np.ascontiguousarray(frame[:, :, ::-1])
+    print(f"[viewer] overlay: first frame of {path} ({frame.shape[1]}x{frame.shape[0]}"
+          f"{', channels swapped' if swap_channels else ''})")
+    return frame
+
+
 def _make_sock(ctx, addr):
     s = ctx.socket(zmq.SUB)
     s.setsockopt(zmq.SUBSCRIBE, b"")
@@ -47,6 +65,11 @@ def run(args):
     ctx = zmq.Context()
     sock = _make_sock(ctx, addr)
     print(f"[viewer] connected to {addr}")
+
+    overlay = (
+        _load_overlay_frame(args.overlay, swap_channels=args.overlay_swap_channels)
+        if args.overlay else None
+    )
 
     # DISABLED: D405 wrists — only ZED windows are created.
     windows = ["ZED Ego"]
@@ -79,6 +102,12 @@ def run(args):
             stereo = _decode(parts[1]) if args.show_stereo else None
 
             if ego is not None:
+                if overlay is not None:
+                    if overlay.shape[:2] != ego.shape[:2]:
+                        overlay = cv2.resize(overlay, (ego.shape[1], ego.shape[0]))
+                    ego = cv2.addWeighted(
+                        ego, 1.0 - args.overlay_alpha, overlay, args.overlay_alpha, 0
+                    )
                 cv2.imshow("ZED Ego", ego)
             if args.show_stereo and stereo is not None:
                 cv2.imshow("ZED Stereo L|R", stereo)
@@ -116,6 +145,14 @@ def main():
                    help="also open a window for the ZED stereo L|R view")
     p.add_argument("--duration", type=float, default=0,
                    help="auto-exit after N seconds (0 = run until 'q'/ESC)")
+    p.add_argument("--overlay", default="",
+                   help="video file whose first frame is blended over the live "
+                        "ego view (e.g. to line the camera up with an episode)")
+    p.add_argument("--overlay-alpha", type=float, default=0.5,
+                   help="overlay opacity, 0..1 (default 0.5)")
+    p.add_argument("--overlay-swap-channels", action="store_true",
+                   help="swap the overlay's B<->R channels (false color) so it "
+                        "stands out against the live view")
     run(p.parse_args())
 
 

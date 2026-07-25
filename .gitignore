@@ -201,3 +201,5 @@ data/
 realsense_wheels_aarch64/
 realsense_env_backup/
 eval-*
+.evals
+.data

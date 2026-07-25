@@ -48,6 +48,7 @@ import signal
 from collections import deque
 
 import cv2
+from matplotlib.table import table
 import numpy as np
 import zmq
 import msgpack
@@ -65,7 +66,19 @@ from encoder_client import EncoderClient
 
 
 # ---------------- Configuration ----------------
-TASK_INSTRUCTION = "Clean up the table"
+# TASK_INSTRUCTION = "Clean up the table"
+TASK_INSTRUCTION = "Walk towards the table, pick up the grapes, and place them in the bowl."
+# TASK_INSTRUCTION = "Pick up the crumpled paper ball and place it in the tray."
+# TASK_INSTRUCTION = "Pick up the eggplant and place it in the basket."
+# TASK_INSTRUCTION = "Walk towards the table, pick up the eggplant, and place it in the basket."
+# TASK_INSTRUCTION = "Walk towards the table, pick up the duck, and place it in the box."
+# TASK_INSTRUCTION = "Walk towards the table, pick up the crumpled paper ball, and place it in the tray."
+
+# TASK_INSTRUCTION = "Pick up the grapes, and place them in the bowl."
+# TASK_INSTRUCTION = "pick up the gray hippo toy and place it into the orange bowl"
+# TASK_INSTRUCTION = "pick up the banana and place it into the wooden box"
+TASK_INSTRUCTION = "pick up the eggplant and place it into the transparent box"
+
 
 # FSQ configuration (must match g1_sonic_client / encoder)
 FSQ_MIN = -0.625
@@ -833,9 +846,9 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8000,
                         help="Local port reaching the Cosmos HTTP server (port-forwarded 8000)")
     parser.add_argument("--domain-name", type=str, default=None,
-                        choices=["g1_sonic_neck", "g1_sonic_neckless"],
+                        choices=["g1_sonic_neck_realsense", "g1_sonic_neck_zedmini", "g1_sonic_neckless"],
                         help="Embodiment tag sent to the server. Default: derived from "
-                             "--include-neck (g1_sonic_neck if set, else g1_sonic_neckless).")
+                             "--include-neck (g1_sonic_neck_realsense if set, else g1_sonic_neckless).")
     parser.add_argument("--image-size", type=int, default=DEFAULT_IMAGE_SIZE,
                         help="Server ego-frame resize target (matches training; 256 for g1)")
     parser.add_argument("--zmq-host", type=str, default="localhost",
