@@ -200,6 +200,8 @@ teleop_vids/
 data/
 realsense_wheels_aarch64/
 realsense_env_backup/
+zed_recordings/
+hlpwm_logs/
 eval-*
 .evals
 .data
