@@ -603,10 +603,11 @@ class PolicyClientManager:
             except Exception as e:
                 print(f"[PolicyClient] Failed to send reset: {e}")
 
-    def close(self):
+    def close(self, send_reset=True):
         """Clean up resources."""
         if self._client:
-            self.reset()
+            if send_reset:
+                self.reset()
             self._client = None
 
 
@@ -637,6 +638,7 @@ class TokenPolicyClient:
                  hand_state_saturation_fraction_threshold=0.6,
                  invalid_hand_state_fallback="dataset_initial",
                  hand_state_fallback_values=None,
+                 max_invalid_hand_state_fallbacks=1,
                  send_recording_frames=True,
                  max_recording_frames=120):
         self._dry_run = bool(dry_run)
@@ -661,6 +663,7 @@ class TokenPolicyClient:
             self._invalid_hand_state_fallback_mode,
             hand_state_fallback_values,
         )
+        self._max_invalid_hand_state_fallbacks = int(max_invalid_hand_state_fallbacks)
         self._invalid_hand_state_fallback_count = 0
         self._last_policy_state_for_sanity = None
         self._send_recording_frames = bool(send_recording_frames)
@@ -772,7 +775,11 @@ class TokenPolicyClient:
             if report.ok:
                 self._last_policy_state_for_sanity = state
                 return state
-            if state is not None and self._invalid_hand_state_fallback is not None:
+            fallback_allowed = (
+                self._max_invalid_hand_state_fallbacks < 0
+                or self._invalid_hand_state_fallback_count < self._max_invalid_hand_state_fallbacks
+            )
+            if state is not None and self._invalid_hand_state_fallback is not None and fallback_allowed:
                 patched = state_with_hand_fallback(state, self._invalid_hand_state_fallback)
                 patched_report = hand_state_health_report(
                     patched,
@@ -793,6 +800,16 @@ class TokenPolicyClient:
                     f"fallback_mode={self._invalid_hand_state_fallback_mode} "
                     f"fallback_reason={patched_report.reason}"
                 )
+            elif state is not None and self._invalid_hand_state_fallback is not None and not fallback_allowed:
+                now = time.perf_counter()
+                if now - last_log >= 1.0:
+                    print(
+                        "[WBCState] Invalid hand fallback budget exhausted; waiting for measured hand state. "
+                        f"fallback_count={self._invalid_hand_state_fallback_count} "
+                        f"max_fallbacks={self._max_invalid_hand_state_fallbacks} "
+                        f"reason={report.reason}"
+                    )
+                    last_log = now
             now = time.perf_counter()
             if deadline is not None and now >= deadline:
                 print(
@@ -1072,7 +1089,10 @@ class TokenPolicyClient:
                     frame_indices = RELATIVE_OFFSETS # get previous 4 frames relative to current step
                     with self.image_buffer_lock:
                         len_image_buffer = len(self.image_buffer)
-                    assert len_image_buffer >= ACTION_HORIZON, f"Expected at least {ACTION_HORIZON} frames in image buffer, got {len_image_buffer}"
+                    if len_image_buffer < ACTION_HORIZON:
+                        raise RuntimeError(
+                            f"Expected at least {ACTION_HORIZON} frames in image buffer, got {len_image_buffer}"
+                        )
                 
                 t0 = time.time()
                 chunk = self._get_policy_chunk(frame_indices)
@@ -1384,8 +1404,8 @@ class TokenPolicyClient:
         if recording_frames is not None:
             reset_info["recording/head"] = recording_frames
             print(f"[Recording] Sending {len(recording_frames)} final frames with reset.")
-            self._policy_client.reset(reset_info)
-        self._policy_client.close()
+        self._policy_client.reset(reset_info)
+        self._policy_client.close(send_reset=False)
 
         print("[TokenPolicyClient] Stopped!")
 
@@ -1460,6 +1480,8 @@ def main():
                        help="Replace invalid WBC fallback/default hand state before policy requests; dataset_initial is the 0422 first-frame median hand_joints")
     parser.add_argument("--hand-state-fallback-values", default=None,
                        help="14 comma-separated floats used when --invalid-hand-state-fallback=custom")
+    parser.add_argument("--max-invalid-hand-state-fallbacks", type=int, default=1,
+                       help="Maximum invalid hand-state replacements before requiring measured hand state; negative means unlimited")
     parser.add_argument("--send-recording-frames", action=argparse.BooleanOptionalAction, default=True,
                        help="Send continuous record-only camera frames to FastWAM server for complete input_video.mp4")
     parser.add_argument("--max-recording-frames", type=int, default=120,
@@ -1482,6 +1504,7 @@ def main():
             f"start_after_first_chunk={args.start_after_first_chunk}; "
             f"require_valid_hand_state={args.require_valid_hand_state}; "
             f"invalid_hand_state_fallback={args.invalid_hand_state_fallback}; "
+            f"max_invalid_hand_state_fallbacks={args.max_invalid_hand_state_fallbacks}; "
             f"send_recording_frames={args.send_recording_frames}"
         )
 
@@ -1514,6 +1537,7 @@ def main():
         hand_state_saturation_fraction_threshold=args.hand_state_saturation_fraction_threshold,
         invalid_hand_state_fallback=args.invalid_hand_state_fallback,
         hand_state_fallback_values=args.hand_state_fallback_values,
+        max_invalid_hand_state_fallbacks=args.max_invalid_hand_state_fallbacks,
         send_recording_frames=args.send_recording_frames,
         max_recording_frames=args.max_recording_frames,
     )

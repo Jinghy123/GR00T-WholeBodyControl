@@ -7,6 +7,7 @@ workflow and its launch commands remain unchanged.
 import os
 import sys
 import time
+import uuid
 import threading
 import json
 import signal
@@ -133,7 +134,8 @@ class WmSubgoalProvider:
 
     def __init__(self, base_url, subtasks, task="", period=3.0, timeout=120.0,
                  jpeg_quality=90, stale_warn=5.0,
-                 dump_dir="/tmp/psix_wm_client"):
+                 dump_dir="/tmp/psix_wm_client", mode="future", seconds=None,
+                 session_id=None):
         subtasks = [str(s).strip() for s in (subtasks or [])]
         if not subtasks or any(not s for s in subtasks):
             raise ValueError("[wm] prompts.json must provide at least one non-empty subtask")
@@ -143,6 +145,10 @@ class WmSubgoalProvider:
             raise ValueError("[wm] timeout must be positive")
         if not 1 <= jpeg_quality <= 100:
             raise ValueError("[wm] jpeg quality must be in [1, 100]")
+        if mode not in ("future", "subgoal"):
+            raise ValueError(f"[wm] mode must be 'future' or 'subgoal', got {mode!r}")
+        if seconds is not None and float(seconds) != 0 and not 0 < float(seconds) <= 60:
+            raise ValueError(f"[wm] seconds out of sane range: {seconds!r}")
 
         self._base_url = base_url.rstrip("/")
         self._subtasks = subtasks
@@ -150,6 +156,20 @@ class WmSubgoalProvider:
         self._period = float(period)
         self._timeout = float(timeout)
         self._jpeg_quality = int(jpeg_quality)
+        # Which prediction path the WM server is serving. The zedmini deployment
+        # checkpoints are trained FUTURE-only, so that is the default; "subgoal"
+        # is for the annotated-completion servers. Sent to the server, which
+        # rejects a mismatch instead of silently answering with the wrong kind
+        # of prediction.
+        self._mode = mode
+        # Future-mode prediction horizon, sent explicitly on every request so the
+        # deployed horizon never depends on how the server happened to be
+        # launched. None (or 0) means "defer to the server's default". The
+        # server clamps to its trained window and quantizes to 0.1 s.
+        self._seconds = None if seconds in (None, 0) else float(seconds)
+        # Stable per-run id: the server keys replay protection on
+        # (session, req_id), so it must not change mid-episode.
+        self._session_id = session_id or f"wm-{uuid.uuid4().hex[:12]}"
         # Kept in the constructor for CLI/API compatibility. Prompt/goal mismatch
         # now gates immediately instead of waiting for a warning threshold.
         _ = float(stale_warn)
@@ -278,6 +298,32 @@ class WmSubgoalProvider:
         snap.pop("goal")
         return snap
 
+    def get_seconds(self):
+        """Current future horizon: a float, or None meaning "server default"."""
+        with self._lock:
+            return self._seconds
+
+    def set_seconds(self, seconds):
+        """Change the future horizon at runtime and regenerate immediately.
+
+        ``None`` defers to the server's own default. Unlike a prompt change this
+        does NOT invalidate the last-good goal: the scene and the instruction are
+        unchanged, only how far ahead the next prediction looks, so the existing
+        goal stays valid to serve until the new one lands.
+        """
+        if seconds is not None:
+            seconds = float(seconds)
+            if not 0 < seconds <= 60:
+                raise ValueError(f"[wm] seconds out of sane range: {seconds!r}")
+        if self._mode != "future":
+            print(f"[wm] mode={self._mode!r}: horizon is ignored (future mode only)", flush=True)
+        with self._lock:
+            self._seconds = seconds
+        shown = "server default" if seconds is None else f"{seconds}s"
+        print(f"[wm] horizon -> {shown}; regenerating now "
+              "(server clamps to its trained window)", flush=True)
+        self._wake_evt.set()
+
     def advance_prompt(self):
         """Advance language, invalidate the old-stage goal, and wake WM now.
 
@@ -364,6 +410,8 @@ class WmSubgoalProvider:
                 "epoch": self._prompt_epoch,
                 "subtask": self._subtasks[self._prompt_stage],
                 "ego": self._latest_ego,
+                # snapshot under the lock: :sec can change it from the stdin thread
+                "seconds": self._seconds,
             }
             self._pending_goal = {
                 "requested_stage": request["stage"],
@@ -380,13 +428,29 @@ class WmSubgoalProvider:
 
         t0 = time.perf_counter()
         try:
+            # Hardened /wm envelope: transport, task, robot_episode_session_id,
+            # req_id and prompt_gen are all required. `stage` is the prompt
+            # generation (it advances with the subtask sequence).
+            #
+            # FUTURE mode takes NO subtask guidance: those checkpoints were
+            # trained with the whole task text standing in for the subtask, so
+            # the caption is built from `task` alone and sending the stage
+            # subtask would imply it steers the prediction, which it does not.
+            # The stage still drives the VLA instruction — this only scopes
+            # what the WM sees.
             body = {
-                "jpeg": True,
+                "transport": "jpeg",
                 "ego_jpeg": self._encode_jpeg(request["ego"], self._jpeg_quality),
-                "subtask": request["subtask"],
                 "task": self._task,
+                "robot_episode_session_id": self._session_id,
                 "req_id": request["request_id"],
+                "prompt_gen": int(request["stage"]),
+                "mode": self._mode,
             }
+            if self._mode == "subgoal":
+                body["subtask"] = request["subtask"]
+            elif request["seconds"] is not None:
+                body["seconds"] = request["seconds"]
             response = self._session.post(
                 f"{self._base_url}/wm", json=body, timeout=self._timeout
             )
@@ -1288,7 +1352,7 @@ class RTCWebSocketClient:
 def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_topic,
          camera_address, camera_timeout_ms, task_instruction, subtasks,
          wm_base_url, wm_period, wm_timeout, jpeg_quality, wm_stale_warn,
-         wm_dump_dir, observation_stale_timeout, action_stale_timeout,
+         wm_dump_dir, wm_mode, wm_seconds, observation_stale_timeout, action_stale_timeout,
          dry_run=False,
          include_neck=False):
     if include_neck:
@@ -1322,6 +1386,8 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
         jpeg_quality=jpeg_quality,
         stale_warn=wm_stale_warn,
         dump_dir=wm_dump_dir,
+        mode=wm_mode,
+        seconds=wm_seconds,
     )
     print(f"[MAIN] WM provider: {wm_base_url}; {len(subtasks)} prompt stages")
     print(f"[MAIN] Task instruction: {task_instruction!r}")
@@ -1361,6 +1427,8 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
 
     def stdin_listener():
         print("[MAIN] Enter: advance prompt now | :restart: stage 0 + fresh startup goal")
+        print("[MAIN] :sec <x>: future horizon in seconds (e.g. ':sec 1.6'; "
+              "':sec server' defers to the server default) | :sec: show current")
         while running.is_set():
             try:
                 line = sys.stdin.readline()
@@ -1373,6 +1441,15 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
                 wm_provider.advance_prompt()
             elif command == ":restart":
                 wm_provider.restart()
+            elif command == ":sec" or command.startswith(":sec "):
+                arg = command[len(":sec"):].strip()
+                if not arg:
+                    print(f"[MAIN] horizon = {wm_provider.get_seconds()}")
+                    continue
+                try:
+                    wm_provider.set_seconds(None if arg == "server" else float(arg))
+                except ValueError as error:
+                    print(f"[MAIN] {error}")
             else:
                 print(f"[MAIN] unknown command {command!r}")
 
@@ -1460,6 +1537,17 @@ if __name__ == "__main__":
                         help="Timeout for one POST /wm request")
     parser.add_argument("--jpeg-quality", type=int, default=90,
                         help="JPEG quality for ego/subgoal Wi-Fi transport (1-100)")
+    parser.add_argument("--wm-mode", type=str, default="future", choices=("future", "subgoal"),
+                        help="WM prediction mode the server is serving. The zedmini deployment "
+                             "checkpoints are trained future-only (default: future). In future "
+                             "mode no subtask is sent: the caption is built from the task alone, "
+                             "matching training.")
+    parser.add_argument("--wm-seconds", type=float, default=3.2,
+                        help="future-mode prediction horizon in seconds (default: 3.2, the "
+                             "longest trained bin). Always sent explicitly so the horizon does "
+                             "not silently depend on how the server was launched; the server "
+                             "still clamps to its trained window (0.8-4.0) and quantizes to "
+                             "0.1 s. Pass 0 to fall back to the server's own default.")
     parser.add_argument("--wm-stale-warn", type=float, default=5.0,
                         help="Deprecated compatibility option; mismatched prompt/goal now gates immediately")
     parser.add_argument("--wm-dump-dir", type=str, default=DEFAULT_WM_DUMP_DIR,
@@ -1537,6 +1625,8 @@ if __name__ == "__main__":
         jpeg_quality=args.jpeg_quality,
         wm_stale_warn=args.wm_stale_warn,
         wm_dump_dir=args.wm_dump_dir,
+        wm_mode=args.wm_mode,
+        wm_seconds=args.wm_seconds,
         observation_stale_timeout=args.observation_stale_timeout,
         action_stale_timeout=args.action_stale_timeout,
         dry_run=args.dry_run,
