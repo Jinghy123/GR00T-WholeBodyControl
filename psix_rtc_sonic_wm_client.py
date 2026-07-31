@@ -76,6 +76,17 @@ TOKEN_DIM = 64
 ACTION_DIM_DEFAULT = 78
 ACTION_DIM_NECK = 80
 
+# VLA goal-image input size as (H, W). Training pinned BOTH the ego and the goal
+# to `--data.transform.model.resize.size 240 320` (H,W ordering, see psi
+# config/augmentation.py: `size: ... # H,W`), and PsixModelTransform runs the one
+# `t1 = Compose([resize, center_crop, ...])` over observations and subgoal alike.
+# Deployment reads that same transform back out of the checkpoint
+# (serve_psix.py `_img_transform`), so 320x240 is the model's native input --
+# confirmed live by the served /info: transforms resize [240,320] + center_crop
+# [240,320]. The paired center_crop is a no-op at that size, so the effective
+# operation is a plain resize; see resize_goal_for_vla.
+VLA_GOAL_HW = (240, 320)
+
 ACTION_ACK_KEYS = (
     "action_vla_session_id",
     "action_condition_id",
@@ -171,6 +182,32 @@ _MUJOCO_TO_ISAACLAB_DOF = np.array(
 )
 def _mujoco29_to_isaaclab29(qpos):
     return np.asarray(qpos, dtype=np.float32).reshape(29)[_MUJOCO_TO_ISAACLAB_DOF].copy()
+
+
+def resize_goal_for_vla(rgb):
+    """Resize a goal image to the VLA's trained ``VLA_GOAL_HW`` input.
+
+    A plain resize, no crop: psi pairs ``v2.Resize((240, 320))`` with
+    ``v2.CenterCrop((240, 320))``, and cropping a 240x320 image to 240x320 does
+    nothing, so the effective transform is the resize alone.
+
+    Two details are copied from that resize rather than chosen here:
+
+    * Aspect ratio is NOT preserved. ``v2.Resize`` with an explicit (H, W)
+      stretches to the exact target, so a non-4:3 goal is distorted the same way
+      training distorted it.
+    * NEAREST, matching ``ResizeImage.__call__``. This keeps the function a true
+      pass-through: pinning the size here produces the same pixels the VLA would
+      have produced from the unresized goal, instead of quietly substituting a
+      better-quality (INTER_AREA) downsample the model never saw.
+    """
+    if rgb.shape[:2] == VLA_GOAL_HW:
+        return rgb
+    return np.ascontiguousarray(
+        cv2.resize(rgb, (VLA_GOAL_HW[1], VLA_GOAL_HW[0]),
+                   interpolation=cv2.INTER_NEAREST)
+    )
+
 
 # ---------------- Serialization utilities ----------------
 from numpy.lib.format import dtype_to_descr, descr_to_dtype
@@ -488,8 +525,20 @@ class WmSubgoalProvider:
                  goal_hard_age=DEFAULT_WM_GOAL_HARD_AGE,
                  dump_dir="/tmp/psix_wm_client", mode="future", seconds=None):
         subtasks = [str(s).strip() for s in (subtasks or [])]
-        if not subtasks or any(not s for s in subtasks):
-            raise ValueError("[wm] prompts.json must provide at least one non-empty subtask")
+        if not subtasks:
+            raise ValueError("[wm] prompts.json must provide at least one subtask stage")
+        # An empty subtask is a first-class stage, not a config error: training's
+        # PsixModelTransform does `instruction = f"Task: {instruction}"` whenever
+        # `sub_task` is empty, and packs without an `annotation.sub_task` (e.g. the
+        # zedmini10 set) were trained entirely on that Task-only form. Requiring
+        # non-empty text here forced `Task: X. Subtask: Y` onto those checkpoints.
+        # Subgoal mode still needs one, because there the subtask IS the WM
+        # request's caption; future mode builds the caption from `task` alone.
+        if mode == "subgoal" and any(not s for s in subtasks):
+            raise ValueError(
+                "[wm] subgoal mode conditions the WM on the subtask, so every "
+                "prompts.json stage must be non-empty (future mode may be empty)"
+            )
         if period <= 0:
             raise ValueError("[wm] period must be positive")
         if timeout <= 0:
@@ -1119,7 +1168,15 @@ class WmSubgoalProvider:
                     f"response req_id {payload.get('req_id')!r} does not match "
                     f"request {request['request_id']}"
                 )
-            if str(payload.get("subtask", "")) != request["subtask"]:
+            # Only meaningful when we actually sent a subtask. Future mode builds
+            # the caption from `task` alone and omits the field, so the server has
+            # nothing to echo and answers `subtask: null` (`subtask_from_task:
+            # true`) — requiring an echo here rejected every future-mode goal.
+            # Staleness is still covered: req_id / prompt_gen / episode session are
+            # matched above, and the stage/epoch/subtask recheck below compares the
+            # request against current client state, not the server's echo.
+            if (self._mode != "future" and
+                    str(payload.get("subtask", "")) != request["subtask"]):
                 raise ValueError("response subtask does not match the requested stage")
             if ("robot_episode_session_id" in payload and
                     str(payload["robot_episode_session_id"]) != self._episode_session_id):
@@ -1338,9 +1395,12 @@ class EpisodeSubgoalProvider:
         self._episode_dir = os.path.abspath(os.path.expanduser(episode_dir))
         self._subtasks = [str(s).strip() for s in (subtasks or [])]
         self._task = str(task).strip()
-        if not self._subtasks or any(not s for s in self._subtasks):
+        # Empty stages are allowed for the same reason as the WM provider: they
+        # yield training's Task-only instruction. This path issues no WM request,
+        # so there is nothing that needs the subtask text.
+        if not self._subtasks:
             raise ValueError(
-                "[gt] prompts.json must provide at least one non-empty subtask"
+                "[gt] prompts.json must provide at least one subtask stage"
             )
 
         goal_dir = os.path.join(self._episode_dir, "color_subgoal")
@@ -2853,6 +2913,15 @@ class RTCWebSocketClient:
                         f"WM goal must be RGB uint8 HxWx3, got "
                         f"{subgoal_frame.dtype} {subgoal_frame.shape}"
                     )
+
+                # Pin the goal to the VLA's trained input size HERE, before the
+                # condition is minted: the array that gets hashed into the
+                # condition is then the exact array the VLA consumes, and the
+                # wire contract stops depending on the WM server's output recipe
+                # (or on which provider produced the goal — the episode/GT source
+                # serves 640x480). A correctly sized goal short-circuits, so the
+                # steady state costs one tuple compare per tick.
+                subgoal_frame = resize_goal_for_vla(subgoal_frame)
 
                 if wm["goal_generation"] != self._dbg_last_generation:
                     self._dbg_last_generation = wm["goal_generation"]

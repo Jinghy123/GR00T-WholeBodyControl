@@ -757,12 +757,12 @@ if __name__ == "__main__":
     parser.add_argument("--camera-address", type=str, default="tcp://192.168.123.164:5558",
                         help="Camera ZMQ address")
     parser.add_argument("--episode-dir", type=str,
-                        default="/mnt/data/weiduo/heng/GR00T-WholeBodyControl/data/real_pick_place/pick_place_eggplant_plastic_box/episode_1",
+                        default="/mnt/data/weiduo/heng/GR00T-WholeBodyControl/data/real_clean_up_table/cleanup_table_1_episode_13",
                         help="Episode folder containing color/ and color_subgoal/ for subgoal images")
     parser.add_argument("--prompts-json", type=str,
-                        default="/mnt/data/weiduo/heng/GR00T-WholeBodyControl/data/real_pick_place/prompts.json",
+                        default="/mnt/data/weiduo/heng/GR00T-WholeBodyControl/data/real_clean_up_table/prompts.json",
                         help="JSON mapping task-key -> {task_description, subtasks[]}")
-    parser.add_argument("--task-key", type=str, default="pick_place_eggplant_plastic_box",
+    parser.add_argument("--task-key", type=str, default="cleanup_table_1_episode_13",
                         help="Key into prompts.json (e.g. pick_place_1); selects the "
                              "task_description and the per-stage subtask prompts.")
     parser.add_argument("--instruction", type=str, default=None,

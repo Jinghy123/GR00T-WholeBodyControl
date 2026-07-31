@@ -21,8 +21,9 @@ the HLP-driven stack. Design contract (plan §0/§3.4/§5/§6/§7):
     operator's :ack only returns to HOLD, release needs a fresh handshake.
 
 Modes (--hlp-mode):
-  off      no HLP requests; stages driven manually (Enter) through the scene
-           trajectory. This is Phase D level-1 (manual stage + WM).
+  off      no HLP requests; stage 0 is loaded from --episode-dir immediately,
+           Enter advances to the next episode prompt, and an ordinary text
+           line takes over the current prompt. This is manual stage + WM.
   shadow   DEFAULT. HLP is polled with a lease and full logging, but its
            committed switches only produce would_* log events; stages remain
            manual. This is the G9 shadow stage.
@@ -31,7 +32,7 @@ Modes (--hlp-mode):
 
 Wire peers (all contracts from Phase 0):
   HLP  http://…:8015  /reset/acquire /hlp /prev /reset /override /resume
-  WM   http://…:8016  /wm /ready     (BAGEL local or Cosmos tunnel — same core)
+  WM   http://192.168.123.240:8016 /wm /ready (direct G1 wired; BAGEL or Cosmos)
   VLA  ws://…:8014/ws                (condition provenance + action acks)
 
 Run headless smoke (no robot, no GPU) against the psi mock stack:
@@ -60,6 +61,16 @@ import numpy as np
 _GROOT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if _GROOT_ROOT not in sys.path:
     sys.path.insert(0, _GROOT_ROOT)
+
+# Keep the default dataset selection in lockstep with
+# psix_rtc_sonic_wm_client.py.  --episode-dir is retained as a compatibility
+# option even though live subgoal images come from WM in this client.
+DEFAULT_CLEANUP_DATA_DIR = os.path.join(
+    _GROOT_ROOT, "data", "real_clean_up_table")
+DEFAULT_EPISODE_DIR = os.path.join(
+    DEFAULT_CLEANUP_DATA_DIR, "cleanup_table_1_episode_11")
+DEFAULT_PROMPTS_JSON = os.path.join(DEFAULT_CLEANUP_DATA_DIR, "prompts.json")
+DEFAULT_TASK_KEY = "cleanup_table_1_episode_11"
 
 from psix_wire_contracts import (
     GateState,
@@ -124,14 +135,129 @@ class EventLog:
         with self._lock:
             if self._fh is not None:
                 self._fh.write(line + "\n")
+        # Keep bulk trace payloads in JSONL without flooding the live console.
         print(f"[{ev}] " + " ".join(f"{k}={v}" for k, v in fields.items()
-                                    if k not in ("mono",)), flush=True)
+                                    if k not in ("mono", "raw_action",
+                                                 "wire_action")), flush=True)
 
     def close(self):
         with self._lock:
             if self._fh is not None:
                 self._fh.close()
                 self._fh = None
+
+
+class SubgoalSnapshotLog:
+    """Timestamped client-side subgoal snapshots for HLP/WM event debugging.
+
+    Each client run gets one ``YYYYMMDD-HHMMSS`` directory. Every event writes
+    a JPEG (when a subgoal exists), a same-stem JSON sidecar, and one entry in
+    ``events.jsonl``. The microsecond timestamp + sequence number makes files
+    unique even when the HLP and WM threads land at nearly the same instant.
+    """
+
+    def __init__(self, root: Optional[str], run_stamp: str):
+        self._lock = threading.Lock()
+        self._seq = 0
+        self.run_dir: Optional[str] = None
+        self._events_fh = None
+        if root:
+            self.run_dir = os.path.join(os.path.abspath(root), run_stamp)
+            os.makedirs(self.run_dir, exist_ok=True)
+            self._events_fh = open(
+                os.path.join(self.run_dir, "events.jsonl"), "a", buffering=1)
+            print(f"[subgoal-log] snapshots -> {self.run_dir}", flush=True)
+
+    @staticmethod
+    def _filename_token(value: Any) -> str:
+        text = str(value).strip().replace(" ", "-")
+        return "".join(c for c in text if c.isalnum() or c in ("-", "."))[:48]
+
+    @staticmethod
+    def _number_token(prefix: str, value: Any, width: int) -> Optional[str]:
+        if value is None:
+            return None
+        try:
+            return f"{prefix}{int(value):0{width}d}"
+        except (TypeError, ValueError):
+            token = SubgoalSnapshotLog._filename_token(value)
+            return f"{prefix}{token}" if token else None
+
+    def save(self, event: str, image: Optional[np.ndarray], **fields) -> Optional[str]:
+        if self.run_dir is None:
+            return None
+        try:
+            with self._lock:
+                self._seq += 1
+                now = time.time()
+                micros = int((now - int(now)) * 1_000_000)
+                stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(now)) \
+                    + f"-{micros:06d}"
+                parts = [stamp, event]
+                for key, prefix, width in (
+                    ("stage", "stage", 2),
+                    ("revision", "rev", 6),
+                    ("prompt_gen", "prompt", 4),
+                    ("goal_gen", "goal", 4),
+                    ("req_id", "req", 6),
+                    ("gen_id", "gen", 6),
+                ):
+                    token = self._number_token(prefix, fields.get(key), width)
+                    if token:
+                        parts.append(token)
+                status = self._filename_token(fields.get("status", ""))
+                if status:
+                    parts.append(status)
+                parts.append(f"seq{self._seq:06d}")
+                stem = "_".join(parts)
+
+                image_name = None
+                if image is not None:
+                    import cv2
+                    rgb = np.ascontiguousarray(image)
+                    if rgb.dtype != np.uint8 or rgb.ndim != 3 or rgb.shape[2] != 3:
+                        raise ValueError(
+                            f"snapshot image must be RGB uint8 HxWx3, got "
+                            f"{rgb.dtype} {rgb.shape}")
+                    image_name = stem + ".jpg"
+                    image_path = os.path.join(self.run_dir, image_name)
+                    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+                    if not cv2.imwrite(
+                            image_path, bgr,
+                            [int(cv2.IMWRITE_JPEG_QUALITY), 95]):
+                        raise IOError(f"cv2.imwrite failed: {image_path}")
+
+                rec = {
+                    "t": now,
+                    "timestamp": time.strftime(
+                        "%Y-%m-%dT%H:%M:%S", time.localtime(now))
+                        + f".{micros:06d}",
+                    "event": event,
+                    "image_file": image_name,
+                    "image_available": image is not None,
+                    "sequence": self._seq,
+                    **fields,
+                }
+                meta_path = os.path.join(self.run_dir, stem + ".json")
+                with open(meta_path, "w") as fh:
+                    json.dump(rec, fh, indent=2, default=str)
+                    fh.write("\n")
+                if self._events_fh is not None:
+                    self._events_fh.write(json.dumps(rec, default=str) + "\n")
+                saved = os.path.join(self.run_dir, image_name) \
+                    if image_name else meta_path
+            print(f"[subgoal-log] {event} -> {saved}", flush=True)
+            return saved
+        except Exception as e:
+            # Debug logging must never take down the robot client.
+            print(f"[subgoal-log] save failed event={event}: {e}", flush=True)
+            return None
+
+    def close(self) -> None:
+        with self._lock:
+            if self._events_fh is not None:
+                self._events_fh.close()
+                self._events_fh = None
 
 
 class EgoCache:
@@ -411,6 +537,36 @@ class ConditionOrchestrator:
                 self._mint_candidate_locked()
             return "accepted"
 
+    def subgoal_snapshot(self) -> Optional[Dict[str, Any]]:
+        """Copy the subgoal the client is currently pursuing for event logging.
+
+        Prefer ACTIVE (the image whose acknowledged actions can execute), then
+        CANDIDATE, then the latest accepted WM goal. This is deliberately a
+        single locked snapshot so image and lineage metadata cannot disagree.
+        """
+        with self._lock:
+            for role, cond in (("active", self.active),
+                               ("candidate", self.candidate)):
+                if cond is not None:
+                    return {
+                        "image": np.array(cond.image, copy=True),
+                        "snapshot_role": role,
+                        "snapshot_label": cond.label,
+                        "prompt_gen": cond.prompt_gen,
+                        "goal_gen": cond.goal_gen,
+                        "condition_id": cond.cid,
+                    }
+            if self.goal is not None:
+                label = None if self.desired is None else self.desired.label
+                return {
+                    "image": np.array(self.goal.image, copy=True),
+                    "snapshot_role": "accepted-goal",
+                    "snapshot_label": label,
+                    "prompt_gen": self.goal.prompt_gen,
+                    "goal_gen": self.goal.goal_gen,
+                }
+            return None
+
     def wm_failed(self, prompt_gen: int, req_id: int, why: str) -> None:
         with self._lock:
             if self.pending is not None and self.pending.req_id == req_id:
@@ -673,13 +829,15 @@ class StageDirector:
 
     def __init__(self, profile: SemanticProfile, scene: Optional[List[str]],
                  orch: ConditionOrchestrator, mode: str, log: EventLog,
-                 allow_unsafe_override: bool = False):
+                 allow_unsafe_override: bool = False,
+                 snapshots: Optional[SubgoalSnapshotLog] = None):
         assert mode in ("off", "shadow", "active")
         self.profile = profile
         self.scene = list(scene) if scene else None
         self.orch = orch
         self.mode = mode
         self.log = log
+        self.snapshots = snapshots
         self.allow_unsafe_override = allow_unsafe_override
         self.tracker = TrajectoryTracker(profile)
         self.shadow_tracker = TrajectoryTracker(profile)
@@ -687,6 +845,10 @@ class StageDirector:
         self._hlp_current_raw: Optional[str] = None
         self._hlp_done = False
         self._lineage_trusted = True   # False after an unsafe override
+        # Manual/off mode owns an explicit episode cursor. An operator
+        # takeover may jump to another prompt, so tracker length alone is not
+        # a reliable cursor.
+        self._manual_scene_index = -1
 
     # ---------------------------------------------------------- helpers
 
@@ -754,6 +916,31 @@ class StageDirector:
                       match=m.kind, canonical=m.canonical,
                       stage=reply.get("stage"),
                       revision=reply.get("state_revision"))
+        # Only a committed switch is an HLP-switch snapshot. In particular,
+        # the server also reports decision="switch" for first establishment;
+        # committed_event.kind keeps that initial event out of this log.
+        committed = reply.get("committed_event")
+        committed_kind = committed.get("kind") \
+            if isinstance(committed, dict) else None
+        is_switch = committed_kind == "switch" or (
+            committed_kind is None and prev_raw is not None)
+        if is_switch and self.snapshots is not None:
+            snapshot = self.orch.subgoal_snapshot() or {}
+            image = snapshot.pop("image", None)
+            self.snapshots.save(
+                "hlp-switch", image,
+                status="captured" if image is not None else "missing",
+                stage=reply.get("stage"),
+                revision=reply.get("state_revision"),
+                previous_subtask=prev_raw,
+                next_subtask=cur,
+                canonical=m.canonical,
+                match=m.kind,
+                mode=self.mode,
+                server_decision=reply.get("decision"),
+                committed_event=committed,
+                **snapshot,
+            )
         if self.mode != "active":
             # shadow: log the full verdict chain, mutate nothing
             if m.ok:
@@ -844,6 +1031,33 @@ class StageDirector:
 
     # ---------------------------------------------------------- manual mode
 
+    def _rebuild_manual_prefix(self, index: int) -> None:
+        """Align the grammar tracker to scene[0:index+1]. Lock is held."""
+        tracker = TrajectoryTracker(self.profile)
+        if self.scene:
+            for label in self.scene[:index + 1]:
+                if not tracker.admissible(label):
+                    raise RuntimeError(
+                        f"episode scene is internally invalid at {label!r}")
+                tracker.commit(label)
+        self.tracker = tracker
+        self._manual_scene_index = index
+
+    def manual_start(self) -> bool:
+        """HLP-off startup selects stage 0 immediately, like the standalone
+        WM client. Return False when no episode sequence was loaded."""
+        with self._lock:
+            if not self.scene:
+                self.log.emit("manual_start_failed", why="no episode scene")
+                return False
+            if self._manual_scene_index >= 0:
+                return True
+            self._rebuild_manual_prefix(0)
+            label = self.scene[0]
+            self.log.emit("manual_started", stage=0, label=label)
+            self._drive(label, source="manual-start")
+            return True
+
     def manual_advance(self) -> None:
         """off/shadow: drive the scene trajectory by hand (Phase D level 1)."""
         with self._lock:
@@ -851,9 +1065,9 @@ class StageDirector:
                 print("[director] Enter 无效：active 模式由 HLP 驱动 (:prev/:ov 可用)")
                 return
             if not self.scene:
-                print("[director] 没有 --scene/--task-key 序列，无法手动推进")
+                print("[director] 没有 episode/scene 指令序列，无法手动推进")
                 return
-            i = len(self.tracker.committed)
+            i = self._manual_scene_index + 1
             if i >= len(self.scene):
                 self.log.emit("manual_done")
                 self.orch.set_done(source="manual")
@@ -863,26 +1077,53 @@ class StageDirector:
                 self.log.emit("grammar_violation", label=label, source="manual")
                 return
             self.tracker.commit(label)
+            self._manual_scene_index = i
+            self.log.emit("manual_advanced", stage=i, label=label)
             self._drive(label, source="manual")
+
+    def manual_takeover(self, label: str) -> None:
+        """Make a canonical operator-entered prompt current.
+
+        A prompt found in the episode aligns the cursor, so the next Enter
+        selects the following episode prompt. A prompt outside the episode is
+        a one-off and the next Enter resumes from the previous cursor.
+        """
+        with self._lock:
+            aligned = None
+            if self.scene and label in self.scene:
+                aligned = self.scene.index(label)
+                self._rebuild_manual_prefix(aligned)
+            self.log.emit("manual_takeover", label=label,
+                          aligned_stage=aligned)
+            self._drive(label, source="manual-takeover")
 
     def manual_prev(self) -> None:
         with self._lock:
             if self.mode == "active":
                 return  # active-mode prev goes through the HLP endpoint
-            self.tracker.retreat()
-            cur = self.tracker.current
-            if cur is None:
+            i = self._manual_scene_index - 1
+            if i < 0:
+                self.tracker = TrajectoryTracker(self.profile)
+                self._manual_scene_index = -1
                 self.orch.clear_desired(source="manual-prev")
             else:
-                self._drive(cur, source="manual-prev")
+                self._rebuild_manual_prefix(i)
+                self._drive(self.scene[i], source="manual-prev")
 
     def manual_restart(self) -> None:
         with self._lock:
             self.tracker = TrajectoryTracker(self.profile)
             self.shadow_tracker = TrajectoryTracker(self.profile)
+            self._manual_scene_index = -1
             self._lineage_trusted = True
             if self.mode != "active":
                 self.orch.clear_desired(source="manual-restart")
+            if self.mode == "off" and self.scene:
+                self._rebuild_manual_prefix(0)
+                label = self.scene[0]
+                self.log.emit("manual_started", stage=0, label=label,
+                              source="restart")
+                self._drive(label, source="manual-restart")
 
     def status(self) -> Dict[str, Any]:
         with self._lock:
@@ -890,6 +1131,10 @@ class StageDirector:
                     "hlp_current": self._hlp_current_raw,
                     "hlp_done": self._hlp_done,
                     "committed": list(self.tracker.committed),
+                    "manual_scene_index": self._manual_scene_index,
+                    "manual_scene_current": (
+                        self.scene[self._manual_scene_index]
+                        if self.scene and self._manual_scene_index >= 0 else None),
                     "scene_next": self._scene_expected(self.tracker),
                     "lineage_trusted": self._lineage_trusted}
 
@@ -1160,6 +1405,7 @@ class WmWorker:
                  task_text: str, episode_session_fn: Callable[[], Optional[str]],
                  connect_timeout: float = 3.0, read_timeout: float = 10.0,
                  jpeg_quality: int = 90, max_capture_age_s: float = 1.0,
+                 snapshots: Optional[SubgoalSnapshotLog] = None,
                  post_fn: Optional[Callable] = None,
                  ready_fn: Optional[Callable] = None,
                  clock: Callable[[], float] = time.monotonic):
@@ -1167,6 +1413,7 @@ class WmWorker:
         self._orch = orch
         self._ego = ego_cache
         self._log = log
+        self._snapshots = snapshots
         self._task = task_text
         self._episode_session_fn = episode_session_fn
         self._timeout = (float(connect_timeout), float(read_timeout))
@@ -1262,6 +1509,10 @@ class WmWorker:
         self._req_seq += 1
         req_id = self._req_seq
         body = {
+            # Cosmos requires an explicit codec selector.  Keep ``jpeg`` too
+            # for compatibility with the legacy BAGEL server, which chooses
+            # its response codec from that boolean.
+            "transport": "jpeg",
             "jpeg": True,
             "ego_jpeg": self._encode_jpeg(frame, self._jpeg_quality),
             "subtask": plan["label"],
@@ -1317,7 +1568,22 @@ class WmWorker:
         meta = {"gen_id": reply.get("gen_id"), "backend": reply.get("backend"),
                 "inference_time_ms": reply.get("inference_time_ms"),
                 "wm_total_ms": round(wm_ms, 1)}
-        self._orch.wm_result(plan["prompt_gen"], req_id, goal, meta)
+        outcome = self._orch.wm_result(plan["prompt_gen"], req_id, goal, meta)
+        if self._snapshots is not None:
+            self._snapshots.save(
+                "wm-new-image", goal,
+                status="accepted" if outcome == "accepted" else "dropped",
+                prompt_gen=plan["prompt_gen"],
+                req_id=req_id,
+                gen_id=reply.get("gen_id"),
+                subtask=plan["label"],
+                capture_id=frame_id,
+                capture_age_s=round(float(age), 3),
+                outcome=outcome,
+                backend=reply.get("backend"),
+                inference_time_ms=reply.get("inference_time_ms"),
+                wm_total_ms=round(wm_ms, 1),
+            )
 
 
 # =========================================================================
@@ -1330,11 +1596,14 @@ _ACK_KEYS = ("action_vla_session_id", "action_condition_id",
 
 class VlaLink:
     def __init__(self, ws_url: str, orch: ConditionOrchestrator, log: EventLog,
-                 *, reconnect_max_backoff: float = 10.0):
+                 *, reconnect_max_backoff: float = 10.0,
+                 action_trace_period_s: float = 0.0):
         self._url = ws_url
         self._orch = orch
         self._log = log
         self._reconnect_max = float(reconnect_max_backoff)
+        self._action_trace_period_s = max(0.0, float(action_trace_period_s))
+        self._last_action_trace_at = -float("inf")
         self._ws = None
         self._ws_lock = threading.Lock()
         self._connected = threading.Event()
@@ -1430,7 +1699,53 @@ class VlaLink:
         ack = {k: data[k] for k in _ACK_KEYS if k in data}
         if "action_version" in ack:
             self.last_ack_version = ack["action_version"]
-        self._orch.on_action(action, ack if ack else None)
+        decision = self._orch.on_action(action, ack if ack else None)
+        self._trace_action(action, ack, decision)
+
+    def _trace_action(self, action: Any, ack: Dict[str, Any], decision: str) -> None:
+        """Rate-limited model/WBC action trace for off-robot validation.
+
+        Disabled by default. The mock launcher enables it so prompt/subgoal A/B
+        tests can inspect action changes without publishing to WBC.
+        """
+        if self._action_trace_period_s <= 0:
+            return
+        now = time.monotonic()
+        if decision != "promoted" and \
+                now - self._last_action_trace_at < self._action_trace_period_s:
+            return
+        try:
+            raw = np.asarray(action, dtype=np.float32).reshape(-1)
+            parts = self._orch._split_action(raw)
+            wire = np.concatenate((parts.body_token64,
+                                   parts.left_hand7,
+                                   parts.right_hand7)).astype(np.float32)
+            if raw.shape != (ACTION_DIM,) or wire.shape != (ACTION_DIM,):
+                return
+        except Exception:
+            return
+        self._last_action_trace_at = now
+        import hashlib
+        status = self._orch.status()
+        active = status.get("active") or {}
+        raw_sha = hashlib.sha256(raw.tobytes()).hexdigest()[:12]
+        wire_sha = hashlib.sha256(wire.tobytes()).hexdigest()[:12]
+        ack_hash = str(ack.get("action_condition_hash") or "")[:12] or None
+        self._log.emit(
+            "action_trace",
+            decision=decision,
+            action_version=ack.get("action_version"),
+            ack_cid=ack.get("action_condition_id"),
+            ack_hash=ack_hash,
+            active_cid=active.get("cid"),
+            active_label=active.get("label"),
+            raw_sha=raw_sha,
+            wire_sha=wire_sha,
+            raw_l2=round(float(np.linalg.norm(raw)), 6),
+            wire_l2=round(float(np.linalg.norm(wire)), 6),
+            raw_action=np.round(raw, 6).tolist(),
+            wire_action=np.round(wire, 6).tolist(),
+        )
 
 
 # =========================================================================
@@ -1445,6 +1760,8 @@ class HlpwmClient:
         if args.log_dir:
             log_path = os.path.join(args.log_dir, f"hlpwm_{run_stamp}.jsonl")
         self.log = EventLog(log_path)
+        self.snapshots = SubgoalSnapshotLog(
+            getattr(args, "subgoal_log_dir", None), run_stamp)
         self.clock = time.monotonic
 
         # --- semantic profile + scene trajectory ---------------------------
@@ -1457,7 +1774,9 @@ class HlpwmClient:
             import hashlib
             scene_hash = hashlib.sha256(
                 canonical_json(scene).encode("utf-8")).hexdigest()
-        self.task_text = self.profile.task_text
+        self.task_text = (getattr(args, "_resolved_task_text", None)
+                          or self.profile.task_text)
+        self.scene_source = getattr(args, "_resolved_scene_source", None)
 
         # --- robot I/O ------------------------------------------------------
         self.ego_cache = EgoCache(self.clock)
@@ -1521,7 +1840,8 @@ class HlpwmClient:
 
         self.director = StageDirector(self.profile, scene, self.orch,
                                       args.hlp_mode, self.log,
-                                      allow_unsafe_override=args.allow_raw_override)
+                                      allow_unsafe_override=args.allow_raw_override,
+                                      snapshots=self.snapshots)
 
         # --- service legs -----------------------------------------------------
         self.poller = HlpPoller(
@@ -1541,12 +1861,15 @@ class HlpwmClient:
             self.log, task_text=self.task_text,
             episode_session_fn=lambda: self.poller.session_id
             or self._client_session_id,
+            snapshots=self.snapshots,
             connect_timeout=args.wm_connect_timeout,
             read_timeout=args.wm_read_timeout,
             jpeg_quality=args.wm_jpeg_quality,
             max_capture_age_s=args.capture_max_age, clock=self.clock)
 
-        self.vla = VlaLink(f"ws://{args.host}:{args.port}/ws", self.orch, self.log)
+        self.vla = VlaLink(
+            f"ws://{args.host}:{args.port}/ws", self.orch, self.log,
+            action_trace_period_s=args.action_trace_period)
 
         self.running = threading.Event()
         self.running.set()
@@ -1657,8 +1980,14 @@ class HlpwmClient:
     # ---------------------------------------------------------------- stdin
 
     def _stdin_loop(self) -> None:
-        help_line = (":show 状态 | Enter 手动推进(off/shadow) | :prev | :restart | "
-                     ":ov <text> | :resume | :ack | :quit")
+        if self.args.hlp_mode == "off":
+            help_line = ("Enter 下一条episode指令 | 直接输入subtask文字接管当前 | "
+                         ":show | :prev | :restart/:clear | :ov <text> | "
+                         ":ack | :quit")
+        else:
+            help_line = (":show 状态 | Enter 手动推进(off/shadow) | :prev | "
+                         ":restart/:clear 清HLP历史 | :ov <text> | :resume | "
+                         ":ack | :quit")
         print(f"[MAIN] {help_line}")
         try:
             for line in sys.stdin:
@@ -1674,6 +2003,32 @@ class HlpwmClient:
         except (OSError, ValueError):
             pass   # no interactive stdin (tests / detached run)
 
+    def _takeover_subtask(self, text: str) -> None:
+        text = text.strip()
+        if not text:
+            print("[cmd] empty takeover prompt rejected")
+            return
+        m = self.profile.match(text)
+        if not m.ok and not self.args.allow_raw_override:
+            print(f"[cmd] 非 canonical 文本，拒绝 takeover"
+                  f"（--allow-raw-override 可放行）。可用标签:\n  "
+                  + "\n  ".join(self.profile.labels))
+            return
+        self.orch.enter_hold("manual takeover")
+        send_text = m.canonical if m.ok else text
+        if self.args.hlp_mode == "active":
+            self.poller.post_control("/override", {"subtask": send_text},
+                                     source="override")
+        elif m.ok:
+            self.director.manual_takeover(m.canonical)
+        else:
+            self.log.emit("canonical_bypass", raw=text,
+                          mode=self.args.hlp_mode)
+            self.orch.set_desired(
+                text,
+                f"Task: {self.task_text.strip().lower()}. Subtask: {text}",
+                source="manual-takeover-raw")
+
     def _handle_cmd(self, cmd: str) -> None:
         if cmd == "":
             self.director.manual_advance()
@@ -1688,32 +2043,22 @@ class HlpwmClient:
                 self.poller.post_control("/prev", source="prev")
             else:
                 self.director.manual_prev()
-        elif cmd == ":restart":
-            self.orch.enter_hold("manual :restart")
+        elif cmd in (":restart", ":clear", ":clear-history"):
+            self.orch.enter_hold(f"manual {cmd}")
             if self.args.hlp_mode != "off":
-                self.poller.post_control("/reset", source="reset")
+                reply = self.poller.post_control(
+                    "/reset",
+                    source="clear-history" if cmd != ":restart" else "reset")
+                if reply is None:
+                    print("[cmd] HLP history clear failed; client remains in HOLD")
+                    return
             self.director.manual_restart()
-        elif cmd.startswith(":ov "):
-            text = cmd[4:].strip()
-            m = self.profile.match(text)
-            if not m.ok and not self.args.allow_raw_override:
-                print(f"[cmd] 非 canonical 文本，拒绝 override（--allow-raw-override 可放行）。可用标签:\n  "
-                      + "\n  ".join(self.profile.labels))
-                return
-            self.orch.enter_hold("manual override")
-            send_text = m.canonical if m.ok else text
-            if self.args.hlp_mode == "active":
-                self.poller.post_control("/override", {"subtask": send_text},
-                                         source="override")
-            elif m.ok:
-                if self.director.tracker.admissible(m.canonical):
-                    self.director.tracker.commit(m.canonical)
-                self.director._drive(m.canonical, source="manual-override")
+            if self.args.hlp_mode == "off":
+                print("[cmd] manual episode restarted at stage 0")
             else:
-                self.log.emit("canonical_bypass", raw=text, mode=self.args.hlp_mode)
-                self.orch.set_desired(
-                    text, f"Task: {self.profile.task_text.strip().lower()}. Subtask: {text}",
-                    source="manual-override-raw")
+                print("[cmd] HLP history cleared; waiting for fresh live-scene establishment")
+        elif cmd.startswith(":ov "):
+            self._takeover_subtask(cmd[4:])
         elif cmd == ":resume":
             if self.args.hlp_mode == "active":
                 self.poller.post_control("/resume", source="resume")
@@ -1725,6 +2070,10 @@ class HlpwmClient:
                 print("[cmd] 当前不在 ABORT_LATCHED")
         elif cmd == ":quit":
             self._terminal("operator :quit")
+        elif self.args.hlp_mode == "off" and not cmd.startswith(":"):
+            # In HLP-off, ordinary text is the operator-owned current prompt;
+            # no :ov prefix is required.
+            self._takeover_subtask(cmd)
         else:
             print(f"[cmd] unknown {cmd!r}")
 
@@ -1734,7 +2083,9 @@ class HlpwmClient:
         self.log.emit("client_started", mode=self.args.hlp_mode,
                       dry_run=self.args.dry_run, profile=self.profile.name,
                       profile_hash=self.profile.hash[:12],
-                      scene_len=len(self.scene or []))
+                      scene_len=len(self.scene or []),
+                      scene_source=self.scene_source,
+                      subgoal_log_dir=self.snapshots.run_dir)
         for target, name in ((self._capture_loop, "capture"),
                              (self._control_loop, "control"),
                              (self._stdin_loop, "stdin")):
@@ -1749,6 +2100,11 @@ class HlpwmClient:
                 self.running.clear()
                 return
             self.poller.start()
+        elif not self.director.manual_start():
+            print("[MAIN] FATAL: HLP off requires an episode subtask sequence")
+            self.running.clear()
+            self.shutdown()
+            return
 
         self.wm.start()
         self.vla.start()
@@ -1774,6 +2130,7 @@ class HlpwmClient:
         self.camera.stop()
         if self.token_publisher is not None:
             self.token_publisher.stop()
+        self.snapshots.close()
         self.log.close()
         print("[MAIN] shutdown complete")
 
@@ -1792,17 +2149,83 @@ def _build_state_43(state: Dict[str, Any]):
     return np.ascontiguousarray(states), lh, rh
 
 
+def _load_prompt_entry(path: str, key: str) -> Dict[str, Any]:
+    try:
+        with open(path) as f:
+            prompts = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"[MAIN] cannot load prompts {path!r}: {exc}")
+    if not isinstance(prompts, dict):
+        raise SystemExit(f"[MAIN] prompts top level must be an object: {path}")
+    entry = prompts.get(key)
+    if not isinstance(entry, dict):
+        raise KeyError(key)
+    return entry
+
+
+def _episode_prompt_entry(args) -> tuple[str, str, Dict[str, Any]]:
+    """Resolve --episode-dir to the matching nearby prompts.json entry.
+
+    The normal dataset layout uses folder-name == prompts key. The older
+    shared-sequence layout nests episode_N below a task folder, so the parent
+    folder key and a prompts.json one level higher are supported too.
+    """
+    episode_dir = os.path.abspath(os.path.expanduser(args.episode_dir))
+    if not os.path.isdir(episode_dir):
+        raise SystemExit(f"[MAIN] --episode-dir does not exist: {episode_dir}")
+    parent = os.path.dirname(episode_dir)
+    grandparent = os.path.dirname(parent)
+    paths: List[str] = []
+    for path in (os.path.join(episode_dir, "prompts.json"),
+                 os.path.join(parent, "prompts.json"),
+                 os.path.join(grandparent, "prompts.json"),
+                 args.prompts_json):
+        if path and path not in paths and os.path.isfile(path):
+            paths.append(path)
+    keys: List[str] = []
+    for key in (os.path.basename(episode_dir), os.path.basename(parent)):
+        if key and key not in keys:
+            keys.append(key)
+    tried = []
+    for path in paths:
+        for key in keys:
+            tried.append(f"{path}[{key}]")
+            try:
+                return path, key, _load_prompt_entry(path, key)
+            except KeyError:
+                pass
+    raise SystemExit(
+        "[MAIN] cannot resolve episode instructions from --episode-dir; tried:\n  "
+        + "\n  ".join(tried or [episode_dir]))
+
+
 def _resolve_scene(args, profile: SemanticProfile) -> Optional[List[str]]:
-    """--scene 'a;;b' or --prompts-json/--task-key; every entry must
-    canonicalize against the profile (fail at startup, not on the robot)."""
+    """Resolve and canonicalize the ordered subtask sequence.
+
+    HLP-off treats --episode-dir as authoritative. Active/shadow preserve the
+    explicit --prompts-json/--task-key scene gate used by the HLP stack.
+    """
     raw: List[str] = []
+    source = None
+    task_text = None
     if args.scene:
         raw = [s.strip() for s in args.scene.split(";") if s.strip()]
-    elif args.prompts_json and args.task_key:
-        with open(args.prompts_json) as f:
-            prompts = json.load(f)
-        entry = prompts[args.task_key]
+        source = "--scene"
+    elif args.hlp_mode == "off" and args.episode_dir:
+        path, key, entry = _episode_prompt_entry(args)
         raw = [str(s).strip() for s in entry.get("subtasks", [])]
+        task_text = entry.get("task_description")
+        source = f"{path}[{key}]"
+    elif args.prompts_json and args.task_key:
+        try:
+            entry = _load_prompt_entry(args.prompts_json, args.task_key)
+        except KeyError:
+            raise SystemExit(
+                f"[MAIN] task-key {args.task_key!r} not found in "
+                f"{args.prompts_json}")
+        raw = [str(s).strip() for s in entry.get("subtasks", [])]
+        task_text = entry.get("task_description")
+        source = f"{args.prompts_json}[{args.task_key}]"
     if not raw:
         return None
     out = []
@@ -1816,6 +2239,9 @@ def _resolve_scene(args, profile: SemanticProfile) -> Optional[List[str]]:
     if misses:
         raise SystemExit("[MAIN] scene 序列含非 canonical 条目（先修 prompts/scene）：\n  "
                          + "\n  ".join(misses))
+    args._resolved_scene_source = source
+    args._resolved_task_text = str(task_text).strip() if task_text else None
+    print(f"[MAIN] loaded {len(out)} episode subtasks from {source}")
     return out
 
 
@@ -1845,7 +2271,8 @@ def parse_args(argv=None):
     p.add_argument("--force-lease", action="store_true",
                    help="admin takeover of a held HLP lease")
     # WM
-    p.add_argument("--wm-host", default="localhost")
+    p.add_argument("--wm-host", default="192.168.123.240",
+                   help="WM server on the direct G1-wired subnet")
     p.add_argument("--wm-port", type=int, default=8016)
     p.add_argument("--wm-connect-timeout", type=float, default=3.0)
     p.add_argument("--wm-read-timeout", type=float, default=10.0)
@@ -1861,8 +2288,17 @@ def parse_args(argv=None):
                    help="pin the exact profile hash (recommended for active)")
     p.add_argument("--scene", default=None,
                    help="';'-separated ordered canonical stage list")
-    p.add_argument("--prompts-json", default=None)
-    p.add_argument("--task-key", default=None)
+    p.add_argument(
+        "--episode-dir", default=DEFAULT_EPISODE_DIR,
+        help="Episode folder; in --hlp-mode off its nearby prompts.json "
+             "provides the authoritative manual subtask sequence")
+    p.add_argument(
+        "--prompts-json", default=DEFAULT_PROMPTS_JSON,
+        help="JSON mapping task-key -> {task_description, subtasks[]}")
+    p.add_argument(
+        "--task-key", default=DEFAULT_TASK_KEY,
+        help="Key into prompts.json; defaults to the same novel-object "
+             "episode as psix_rtc_sonic_wm_client.py")
     # watchdogs
     p.add_argument("--observation-stale-timeout", type=float, default=0.5)
     p.add_argument("--action-stale-timeout", type=float, default=0.5)
@@ -1878,6 +2314,14 @@ def parse_args(argv=None):
                         "drives WM+VLA verbatim (wHLP real-robot semantics; bypasses "
                         "the vocabulary safety layer — operator owns the risk)")
     p.add_argument("--log-dir", default=os.path.join(_GROOT_ROOT, "hlpwm_logs"))
+    p.add_argument(
+        "--subgoal-log-dir",
+        default="/home/weiduoyuan/Desktop/psi/.logs/HLP_WM_logs",
+        help="root for timestamped HLP-switch and WM-new-image subgoal snapshots")
+    p.add_argument(
+        "--action-trace-period", type=float, default=0.0,
+        help="seconds between full model/WBC action traces in the JSONL log; "
+             "0 disables (mock/off-robot debugging)")
     p.add_argument("--dry-run", action="store_true")
     return p.parse_args(argv)
 
