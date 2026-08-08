@@ -58,6 +58,14 @@ def quat_to_rotation_matrix(q):
     return Rotation.from_quat(xyzw).as_matrix()
 
 
+def calc_heading_quat(q_wxyz):
+    """Yaw-only quaternion of q, wxyz. Mirrors C++ calc_heading_quat_d:
+    heading = atan2 of the rotated x-axis, then rotate about z by heading."""
+    R = quat_to_rotation_matrix(q_wxyz)
+    h = np.arctan2(R[1, 0], R[0, 0])  # rotated x-axis = first column of R
+    return np.array([np.cos(h / 2), 0.0, 0.0, np.sin(h / 2)], dtype=np.float64)
+
+
 def anchor_orientation_6d(ref_quat_wxyz, robot_quat_wxyz):
     """
     Compute 6D rotation representation of the relative rotation
@@ -82,6 +90,28 @@ def anchor_orientation_6d(ref_quat_wxyz, robot_quat_wxyz):
     ], dtype=np.float32)
 
 
+def anchor_orientation_heading_6d(ref_quat_wxyz, robot_quat_wxyz):
+    """
+    Heading-normalized variant used by sonic v1.1
+    (motion_anchor_orientation_heading_*). Mirrors C++
+    GatherMotionAnchorOrientationMutiFrame with orientation_mode=1:
+        diff = inv(heading_quat(robot_quat)) * ref_quat
+    i.e. the left side is the robot's yaw-only heading, not its full quat.
+    """
+    q_ref   = np.asarray(ref_quat_wxyz,   dtype=np.float64)
+    q_robot = np.asarray(robot_quat_wxyz, dtype=np.float64)
+
+    diff = quat_mul(quat_conjugate(calc_heading_quat(q_robot)), q_ref)
+    R    = quat_to_rotation_matrix(diff)
+
+    # First 2 columns, row-wise → 6 values
+    return np.array([
+        R[0, 0], R[0, 1],
+        R[1, 0], R[1, 1],
+        R[2, 0], R[2, 1],
+    ], dtype=np.float32)
+
+
 # ── Encoder client ────────────────────────────────────────────────────────────
 
 class EncoderClient:
@@ -91,6 +121,8 @@ class EncoderClient:
     Args:
         model_path: path to model_encoder.onnx
         mode: encoder mode id — 0=g1(wholebody), 1=teleop(vr3pt), 2=smpl
+        version: "v1" (release, 1762-dim obs, full-quat anchor) or
+                 "v1_1" (sonic v1.1, 1751-dim obs, heading-normalized anchor)
     """
 
     NUM_JOINTS   = 29
@@ -98,11 +130,27 @@ class EncoderClient:
     TOKEN_DIM    = 64
     MODE_VEC_DIM = 4   # encoder_mode_4: 4-dim one-hot
 
-    def __init__(self, model_path: str, mode: int = 0):
+    # Per-version encoder input layout. Offsets are for g1 mode (mode=0);
+    # segments not listed are zeros. v1_1 drops the 11 root_z dims
+    # (motion_root_z_position_10frame_step5 + motion_root_z_position) and
+    # switches the anchor to the heading-normalized variant.
+    OBS_LAYOUTS = {
+        "v1":   {"obs_dim": 1762, "anchor_offset": 601, "heading": False},
+        "v1_1": {"obs_dim": 1751, "anchor_offset": 584, "heading": True},
+    }
+
+    def __init__(self, model_path: str, mode: int = 0, version: str = "v1"):
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Encoder model not found: {model_path}")
+        if version not in self.OBS_LAYOUTS:
+            raise ValueError(f"Unknown encoder version: {version!r} (expected one of {list(self.OBS_LAYOUTS)})")
 
         self._mode = mode
+        self._version = version
+        layout = self.OBS_LAYOUTS[version]
+        self._obs_dim = layout["obs_dim"]
+        self._anchor_offset = layout["anchor_offset"]
+        self._anchor_fn = anchor_orientation_heading_6d if layout["heading"] else anchor_orientation_6d
 
         sess_opts = ort.SessionOptions()
         sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
@@ -113,11 +161,22 @@ class EncoderClient:
         self._output_name = self._session.get_outputs()[0].name
         input_shape       = self._session.get_inputs()[0].shape
 
-        print(f"[EncoderClient] Loaded: {model_path}")
+        print(f"[EncoderClient] Loaded: {model_path} (version={version})")
         print(f"[EncoderClient] Input : '{self._input_name}' shape={input_shape}")
         print(f"[EncoderClient] Output: '{self._output_name}'")
 
-    # Full encoder input layout (1762 dims), ordered by encoder_observations in yaml:
+        # Sanity check: model input dim must match the selected layout,
+        # otherwise the version flag and the checkpoint disagree.
+        model_dim = input_shape[-1]
+        if isinstance(model_dim, int) and model_dim != self._obs_dim:
+            raise ValueError(
+                f"Encoder input dim mismatch: model expects {model_dim}, "
+                f"layout '{version}' builds {self._obs_dim}. "
+                f"Wrong --v1.1 flag / model path combination?")
+
+    # Full encoder input layout, ordered by encoder_observations in yaml.
+    #
+    # v1 (release, 1762 dims):
     #   [0:4]      encoder_mode_4                          4
     #   [4:294]    motion_joint_positions_10frame_step5  290
     #   [294:584]  motion_joint_velocities_10frame_step5 290
@@ -132,7 +191,15 @@ class EncoderClient:
     #   [922:1642] smpl_joints_10frame_step1             720  (zeros for g1)
     #   [1642:1702] smpl_anchor_orientation_10frame_step1 60  (zeros for g1)
     #   [1702:1762] motion_joint_positions_wrists_10frame_step1 60 (zeros for g1)
-    OBS_DIM = 1762
+    #
+    # v1_1 (sonic v1.1, 1751 dims): same order minus the 11 root_z dims, and
+    # anchor orientations are heading-normalized:
+    #   [0:4]      encoder_mode_4                          4
+    #   [4:294]    motion_joint_positions_10frame_step5  290
+    #   [294:584]  motion_joint_velocities_10frame_step5 290
+    #   [584:644]  motion_anchor_orientation_heading_10frame_step5 60  ← body_quat→6D
+    #   [644:650]  motion_anchor_orientation_heading       6  (zeros for g1)
+    #   [650:1751] lowerbody / vr / smpl / wrists            (zeros for g1)
 
     def _build_obs(
         self,
@@ -140,7 +207,7 @@ class EncoderClient:
         joint_vel: np.ndarray,  # (10, 29)
         body_quat: np.ndarray,  # (10,  4) wxyz
     ) -> np.ndarray:
-        """Build full 1762-dim encoder observation vector."""
+        """Build the full encoder observation vector for the selected version."""
 
         joint_pos = np.asarray(joint_pos, dtype=np.float32).reshape(self.NUM_FRAMES, self.NUM_JOINTS)
         joint_vel = np.asarray(joint_vel, dtype=np.float32).reshape(self.NUM_FRAMES, self.NUM_JOINTS)
@@ -149,7 +216,7 @@ class EncoderClient:
         # robot_quat = body_quat[0]（第0帧是当前参考帧，anchor算相对它的旋转）
         robot_quat = body_quat[0]
 
-        obs = np.zeros(self.OBS_DIM, dtype=np.float32)
+        obs = np.zeros(self._obs_dim, dtype=np.float32)
 
         # [0:4] encoder_mode_4: first dim = mode_id as float, rest zero
         # g1=0, teleop=1, smpl=2 (NOT one-hot — matches C++ GatherEncoderMode)
@@ -161,15 +228,14 @@ class EncoderClient:
         # [294:584] joint velocities
         obs[294:584] = joint_vel.flatten()
 
-        # [584:594] motion_root_z_position_10frame_step5 → zeros
-        # [594:595] motion_root_z_position → zero
-        # [595:601] motion_anchor_orientation (1 frame) → zeros for g1
-
-        # [601:661] motion_anchor_orientation_10frame_step5 → 6D rotation × 10
+        # anchor orientation × 10 frames → 6D rotation each.
+        # v1: [601:661] relative to full robot quat; v1_1: [584:644] relative
+        # to the robot's yaw-only heading.
+        off = self._anchor_offset
         for i in range(self.NUM_FRAMES):
-            obs[601 + i * 6 : 601 + i * 6 + 6] = anchor_orientation_6d(body_quat[i], robot_quat)
+            obs[off + i * 6 : off + i * 6 + 6] = self._anchor_fn(body_quat[i], robot_quat)
 
-        # [661:1762] lowerbody / vr / smpl / wrists → zeros for g1 mode
+        # remaining segments (lowerbody / vr / smpl / wrists) → zeros for g1 mode
 
         return obs
 

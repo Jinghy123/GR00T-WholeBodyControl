@@ -26,7 +26,7 @@ import numpy as np
 
 # ── USER CONFIG ────────────────────────────────────────────────────────────────
 # EPISODE_DIR = "/home/xiawei/hongyi/Unitree_Robotics/Humanoid-Teleop/teleop/data/g1_1001/Basic/Pick_toys_into_box_and_lift_and_turn_and_put_on_the_chair_new/episode_40"
-EPISODE_DIR = "/home/hongyi/data/real/Rotate_to_pour_ham_into_plate_and_push_the_cart_forward/episode_15"
+EPISODE_DIR = "/home/hongyi/data/real_psi0_g1/Rotate_to_pour_ham_into_plate_and_push_the_cart_forward/episode_20"
 # EPISODE_DIR = "/home/xiawei/data/HE_RAW/Locomanip/walk_towards_a_desk_and_place_a_cube_on_a_tray/episode_4"
 # EPISODE_DIR = "/home/xiawei/hongyi/Unitree_Robotics/Humanoid-Teleop/teleop/data/g1_1001/Basic/Spray_the_bowl_and_wipe_it_and_stack_it_up/episode_10"
 
@@ -83,6 +83,13 @@ from walk_forward_token import (
     PlannerOnnx, Motion50HzBuffer, AsyncPlannerThread,
     WBCStateReader, TokenPublisher,
 )
+
+# sonic v1.1 checkpoint (pass --v1.1 to use it). Encoder input layout differs
+# from release (1751-dim, heading-normalized anchors) — EncoderClient handles
+# that via version="v1_1". Must match the checkpoint the WBC sim runs
+# (deploy.sh --cp policy/sonic_v1_1/model).
+ENCODER_MODEL_V1_1 = os.path.join(
+    _GROOT_ROOT, "gear_sonic_deploy/policy/sonic_v1_1/model_encoder.onnx")
 
 
 # ── Episode loader ────────────────────────────────────────────────────────────
@@ -241,6 +248,9 @@ def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     episode_dir = args[0] if args else EPISODE_DIR
     no_wbc = "--no-wbc" in sys.argv
+    # --v1.1 : encode with the sonic v1.1 checkpoint (sim side must run the
+    # matching decoder: deploy.sh --cp policy/sonic_v1_1/model).
+    use_v1_1 = "--v1.1" in sys.argv or "--v1_1" in sys.argv
 
     # --record-tokens [path] : write data_sonic.json after replay finishes.
     # Saves every published 50Hz token, then samples back to 30Hz to align with
@@ -311,7 +321,11 @@ def main():
     pub = TokenPublisher(host=ZMQ_HOST, port=ZMQ_PORT, topic=ZMQ_TOPIC)
     time.sleep(1.0)
     planner = PlannerOnnx(PLANNER_MODEL, default_height=HEIGHT)
-    encoder = EncoderClient(ENCODER_MODEL, mode=0)
+    if use_v1_1:
+        print("[main] using sonic v1.1 encoder")
+        encoder = EncoderClient(ENCODER_MODEL_V1_1, mode=0, version="v1_1")
+    else:
+        encoder = EncoderClient(ENCODER_MODEL, mode=0)
     wbc = None if no_wbc else WBCStateReader(WBC_HOST, WBC_PORT, WBC_TOPIC)
     if wbc is not None and not wbc.wait_until_ready(10.0):
         wbc.close(); wbc = None
@@ -447,9 +461,12 @@ def main():
                     mvmt_dir=mvmt, facing_dir=facing,
                 )
             else:  # phase C: turn in place toward target yaw
+                # Zero movement_dir: any non-zero mvmt_dir (even with speed=0)
+                # pulls SLOW_WALK into translating toward it -> arc instead of
+                # turning in place.
                 async_planner.set_planner_params(
                     mode=PLANNER_MODE, speed=0.0,
-                    mvmt_dir=facing, facing_dir=facing,
+                    mvmt_dir=np.zeros(3, dtype=np.float32), facing_dir=facing,
                 )
 
             if pub_frame - last_replan_local >= REPLAN_INTERVAL:

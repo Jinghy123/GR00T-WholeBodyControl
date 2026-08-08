@@ -48,7 +48,7 @@ from walk_forward_token import (  # noqa: E402
     fsq_quantize, resample_30hz_to_50hz,
 )
 from walk_then_replay import (  # noqa: E402
-    build_data_window, load_full_episode, write_sonic_json,
+    ENCODER_MODEL_V1_1, build_data_window, load_full_episode, write_sonic_json,
 )
 
 
@@ -257,9 +257,16 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("paths", nargs="+",
                     help="Category dir, task dir, or single episode dir (auto-detect)")
-    ap.add_argument("--out-name", type=str, default="data_sonic.json")
+    ap.add_argument("--out-name", type=str, default=None,
+                    help="Output filename inside each episode dir "
+                         "(default: data_sonic.json, or data_sonic_v1_1.json with --v1.1).")
+    ap.add_argument("--v1.1", "--v1_1", dest="v1_1", action="store_true",
+                    help="Encode with the sonic v1.1 checkpoint.")
     ap.add_argument("--status-name", type=str, default="conversion_status.txt")
     args = ap.parse_args()
+
+    if args.out_name is None:
+        args.out_name = "data_sonic_v1_1.json" if args.v1_1 else "data_sonic.json"
 
     paths = [Path(p).resolve() for p in args.paths]
     for p in paths:
@@ -267,8 +274,12 @@ def main() -> int:
             _log(f"not a directory: {p}")
             return 1
 
-    _log(f"loading encoder {ENCODER_MODEL}")
-    encoder = EncoderClient(ENCODER_MODEL, mode=0)
+    if args.v1_1:
+        _log(f"loading encoder {ENCODER_MODEL_V1_1} (v1.1)")
+        encoder = EncoderClient(ENCODER_MODEL_V1_1, mode=0, version="v1_1")
+    else:
+        _log(f"loading encoder {ENCODER_MODEL}")
+        encoder = EncoderClient(ENCODER_MODEL, mode=0)
 
     overall_ok = True
     for p in paths:

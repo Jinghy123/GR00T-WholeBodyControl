@@ -186,8 +186,13 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("paths", nargs="+",
                     help="Category dir, task dir, or single episode dir (auto-detect)")
-    ap.add_argument("--out-name", type=str, default="data_sonic.json",
-                    help="Output filename inside each episode dir.")
+    ap.add_argument("--out-name", type=str, default=None,
+                    help="Output filename inside each episode dir "
+                         "(default: data_sonic.json, or data_sonic_v1_1.json with --v1.1).")
+    ap.add_argument("--v1.1", "--v1_1", dest="v1_1", action="store_true",
+                    help="Use the sonic v1.1 checkpoint: deploy.sh runs with "
+                         "--cp/--obs-config for policy/sonic_v1_1 and "
+                         "walk_then_replay encodes with --v1.1.")
     ap.add_argument("--status-name", type=str, default="conversion_status.txt",
                     help="Status filename written inside each category dir.")
     ap.add_argument("--skip-existing", action="store_true",
@@ -211,6 +216,9 @@ def main() -> int:
     ap.add_argument("--sim-ready-timeout", type=float, default=120.0)
     ap.add_argument("--deploy-ready-timeout", type=float, default=120.0)
     args = ap.parse_args()
+
+    if args.out_name is None:
+        args.out_name = "data_sonic_v1_1.json" if args.v1_1 else "data_sonic.json"
 
     # Expand each path into a "group" = (root, kind, status_path, [(task_name, [eps])]).
     paths = [Path(p).resolve() for p in args.paths]
@@ -283,9 +291,16 @@ def main() -> int:
         _log("setup", "sim ready")
 
         # ---- start deploy ----
-        _log("setup", f"starting deploy.sh --input-type zmq {args.deploy_mode}")
+        deploy_cmd = ["bash", str(DEPLOY_SH)]
+        if args.v1_1:
+            # Paths are relative to DEPLOY_DIR (deploy.sh's cwd), same as
+            # running ./deploy.sh --cp policy/sonic_v1_1/model ... by hand.
+            deploy_cmd += ["--cp", "policy/sonic_v1_1/model",
+                           "--obs-config", "policy/sonic_v1_1/observation_config.yaml"]
+        deploy_cmd += ["--input-type", "zmq", args.deploy_mode]
+        _log("setup", "starting " + " ".join(deploy_cmd[1:]))
         deploy_proc = subprocess.Popen(
-            ["bash", str(DEPLOY_SH), "--input-type", "zmq", args.deploy_mode],
+            deploy_cmd,
             cwd=str(DEPLOY_DIR),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -351,9 +366,12 @@ def main() -> int:
                     out_path = ep / args.out_name
                     _log("episode", f"[{global_idx+1}/{total_eps}] "
                                     f"{task_name}/{ep.name} → {out_path}")
+                    walk_cmd = [sys.executable, "-u", str(WALK_THEN_REPLAY),
+                                str(ep), "--record-tokens", str(out_path)]
+                    if args.v1_1:
+                        walk_cmd.append("--v1.1")
                     walk_proc = subprocess.Popen(
-                        [sys.executable, "-u", str(WALK_THEN_REPLAY),
-                         str(ep), "--record-tokens", str(out_path)],
+                        walk_cmd,
                         cwd=str(REPO_ROOT),
                         preexec_fn=os.setsid,
                     )

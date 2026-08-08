@@ -20,7 +20,7 @@ Usage:
 # DEFAULT_EPISODE_DIR    = "/home/xiawei/hongyi/Unitree_Robotics/Humanoid-Teleop/teleop/data/g1_1001/Basic/Pick_bottle_and_turn_and_pour_into_cup/episode_16"
 # DEFAULT_EPISODE_DIR    = "/home/xiawei/hongyi/Unitree_Robotics/Humanoid-Teleop/teleop/data/g1_1001/Basic/Spray_the_bowl_and_wipe_it_and_stack_it_up/episode_1"
 # DEFAULT_EPISODE_DIR    = "/home/xiawei/data/unfold_a_tablet_cover_h1/episode_0"
-DEFAULT_EPISODE_DIR    = "/home/hongyi/data/real/pick_cloth/pick_cloth_1/episode_62"
+DEFAULT_EPISODE_DIR    = "/home/hongyi/data/HE_RAW/Basic/stack_two_cubes_h1/episode_0"
 DEFAULT_ZMQ_HOST        = "*"
 DEFAULT_ZMQ_PUB_PORT    = 5556
 DEFAULT_ZMQ_TOPIC      = "pose"
@@ -204,7 +204,7 @@ def _load_lerobot_frames(episode_dir):
 
 def load_episode(episode_dir):
     """Load episode from data.json (list of dict) or a LeRobot parquet dir."""
-    json_path = os.path.join(episode_dir, "data.json")
+    json_path = os.path.join(episode_dir, "data_sonic_v1_1.json")
     if not os.path.exists(json_path):
         lerobot = _load_lerobot_frames(episode_dir)
         if lerobot is not None:
