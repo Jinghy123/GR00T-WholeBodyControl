@@ -262,6 +262,8 @@ def main() -> int:
                          "(default: data_sonic.json, or data_sonic_v1_1.json with --v1.1).")
     ap.add_argument("--v1.1", "--v1_1", dest="v1_1", action="store_true",
                     help="Encode with the sonic v1.1 checkpoint.")
+    ap.add_argument("--skip-existing", action="store_true",
+                    help="Skip episodes whose out-name file already exists (resume mode).")
     ap.add_argument("--status-name", type=str, default="conversion_status.txt")
     args = ap.parse_args()
 
@@ -287,20 +289,29 @@ def main() -> int:
         _log(f"input {p} → kind={kind}")
 
         if kind == "episode":
-            status = StatusWriter(None)
             tasks = [(p.parent.name, [p])]
         elif kind == "task":
-            status = StatusWriter(None)
             tasks = [(p.name, _list_episodes(p))]
         else:  # category
+            tasks = [(t.name, _list_episodes(t)) for t in _list_tasks(p)]
+
+        if args.skip_existing:
+            n_before = sum(len(eps) for _, eps in tasks)
+            tasks = [(t, [ep for ep in eps if not (ep / args.out_name).exists()])
+                     for t, eps in tasks]
+            n_skipped = n_before - sum(len(eps) for _, eps in tasks)
+            if n_skipped:
+                _log(f"{p.name}: skipping {n_skipped} already-done episodes")
+
+        if kind == "category":
             status_path = p / args.status_name
             status = StatusWriter(status_path)
-            tlist = _list_tasks(p)
-            tasks = [(t.name, _list_episodes(t)) for t in tlist]
             n_total_eps = sum(len(eps) for _, eps in tasks)
             status.write(f"STARTED — {p.name} ({len(tasks)} tasks, {n_total_eps} episodes)")
             _log(f"category {p.name}: {len(tasks)} tasks, {n_total_eps} episodes; "
                  f"status → {status_path}")
+        else:
+            status = StatusWriter(None)
 
         stopped = False
         for task_name, eps in tasks:
