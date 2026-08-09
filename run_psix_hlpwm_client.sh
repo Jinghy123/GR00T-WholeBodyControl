@@ -19,7 +19,11 @@ EMBODIMENT_TAG="${EMBODIMENT_TAG:-}"
 HLP_HOST="${HLP_HOST:-127.0.0.1}"
 HLP_PORT="${HLP_PORT:-8015}"
 HLP_MODE="${HLP_MODE:-off}"
-GOAL_SOURCE="${GOAL_SOURCE:-wm}"
+# Default is the fixed GT goals under DATA_ROOT/<TASK_KEY>/color_subgoal, paired
+# 1:1 with the prompts.json subtasks. The pnp wmgoal checkpoint trains on both
+# goal kinds, and the GT arm is the reproducible one: no WM server in the loop,
+# no generation jitter. Pass --goal-source wm for the WM future-frame arm.
+GOAL_SOURCE="${GOAL_SOURCE:-episode}"
 
 WM_HOST="${WM_HOST:-${WM_LOCAL_HOST:-192.168.123.240}}"
 WM_PORT="${WM_PORT:-${WM_LOCAL_PORT:-8016}}"
@@ -36,20 +40,47 @@ _DATA_ROOT_PINNED="${DATA_ROOT+1}"
 _PROMPTS_JSON_PINNED="${PROMPTS_JSON+1}"
 _EPISODE_DIR_PINNED="${EPISODE_DIR+1}"
 # Auto-resolution applies only to a key the operator actually chose (TASK_KEY in
-# the environment, or --task). The built-in default key exists in several
-# prompts.json files and has always been disambiguated by the DATA_ROOT default
-# below, so resolving it would turn a working bare invocation into an ambiguity
-# error. --task sets this too, in the argument loop.
+# the environment, or --task); the built-in default is left to pair with the
+# DATA_ROOT default below instead. That kept a bare invocation working back when
+# the default key existed in several prompts.json files and resolving it raised
+# an ambiguity error; the current pnp_psix default is unique, so the two paths
+# now agree, and pinning is simply one less lookup. --task sets this too, in the
+# argument loop.
 _TASK_KEY_CHOSEN="${TASK_KEY+1}"
+# Same idea for WM_DUMP_DIR: recorded before its timestamped default is
+# computed, so the METHOD_NAME auto-routing below (after TASK_KEY has its
+# final, resolved value) can tell "operator pinned it" from "still default".
+_WM_DUMP_DIR_CHOSEN="${WM_DUMP_DIR+1}"
 
-DATA_ROOT="${DATA_ROOT:-$ROOT/data/real_pick_place_0709_psix_train_val_general_prompt}"
+# The pick_place goal set the current pnp wmgoal checkpoint is served against is
+# TWO-level, unlike every older root under $ROOT/data:
+#
+#   <DATA_ROOT>/prompts.json                       4 task keys x 3 subtasks
+#   <DATA_ROOT>/<TASK_KEY>/<EPISODE_KEY>/color_subgoal/frame_*.jpg
+#
+# TASK_KEY selects the prompt entry, EPISODE_KEY selects which recorded episode's
+# goal frames to replay (~20 per task). An empty EPISODE_KEY means "the first
+# episode", resolved numerically by resolve_episode_dir. Flat roots (goal frames
+# directly under <DATA_ROOT>/<TASK_KEY>) still work -- resolve_episode_dir detects
+# the layout instead of requiring a mode flag.
+_DATA_ROOT_DEFAULT="/home/weiduoyuan/data/pick_place"
+DATA_ROOT="${DATA_ROOT:-$_DATA_ROOT_DEFAULT}"
 PROMPTS_JSON="${PROMPTS_JSON:-$DATA_ROOT/prompts.json}"
-TASK_KEY="${TASK_KEY-real_pick_place_0709_psix_val_episode_0}"
-EPISODE_DIR="${EPISODE_DIR:-$DATA_ROOT/${TASK_KEY:-real_pick_place_0709_psix_val_episode_0}}"
+TASK_KEY="${TASK_KEY-pick_place_1}"
+EPISODE_KEY="${EPISODE_KEY:-}"
+# Left empty on purpose: resolve_episode_dir fills it once TASK_KEY/EPISODE_KEY
+# are final. An exported EPISODE_DIR still wins (_EPISODE_DIR_PINNED).
+EPISODE_DIR="${EPISODE_DIR:-}"
 # Replaces prompts.json[TASK_KEY].task_description for this run. TASK_KEY still
 # selects the entry, because the per-stage subtasks always come from the file —
 # only the task text is overridden. Empty means "use the file's text".
 INPUT_PROMPT="${INPUT_PROMPT:-}"
+# Label for the VLA checkpoint/ablation arm under test (e.g. statehist_80k,
+# goaldrop_80k, generalist_40k). Purely a label: embedded in run_manifest.json
+# and the init-frame sidecar, and (when set) routes WM_DUMP_DIR under
+# .logs/main_comparisons/<task_key>/<method_name>/ instead of the flat
+# .logs/bagel_gen_images/ default -- see the WM_DUMP_DIR auto-routing below.
+METHOD_NAME="${METHOD_NAME:-}"
 CAMERA_ADDRESS="${CAMERA_ADDRESS:-tcp://192.168.123.164:5558}"
 SUBGOAL_LOG_DIR="${SUBGOAL_LOG_DIR:-/home/weiduoyuan/Desktop/psi/.logs/HLP_WM_logs}"
 WM_DUMP_DIR="${WM_DUMP_DIR:-/home/weiduoyuan/Desktop/psi/.logs/bagel_gen_images/$(date +%Y%m%d-%H%M%S)}"
@@ -63,6 +94,11 @@ MODE="dry-run"
 CHECK_ONLY=0
 LIST_TASKS=0
 EXTRA_ARGS=()
+# Client flags an operator actually types, accepted directly so nobody has to know
+# where the "--" goes. Forwarded before EXTRA_ARGS, so an explicit `-- --wm-seconds X`
+# still wins. Only flags psix_rtc_sonic_wm_client.py defines belong here -- the
+# HLP client does not define them, which is why they are gated on HLP_MODE=off below.
+WM_CLIENT_ARGS=()
 
 # Every prompts.json under data/, as "<task key>\t<file>" lines. This is the one
 # place that knows the layout; --task, --list-tasks and the error messages all
@@ -96,7 +132,11 @@ resolve_task_paths() {
     # earlier task is the common case, and letting it beat an explicit --task
     # just produced a confusing client-side "task-key not found" much later.
     # So: honour the pin when it contains the key, otherwise resolve and say so.
-    if [[ -n "$_DATA_ROOT_PINNED" || -n "$_PROMPTS_JSON_PINNED" ]]; then
+    # The effective PROMPTS_JSON -- pinned or default -- gets first refusal. That
+    # keeps a pin authoritative while it can serve the key, and it also stops the
+    # default root from losing to a same-named key elsewhere under $ROOT/data
+    # (e.g. pick_place_1 also exists in data/zedmini10_pick_place).
+    if [[ -f "$PROMPTS_JSON" ]]; then
         local pinned_key="${TASK_KEY##*:}"
         if python3 - "$PROMPTS_JSON" "$pinned_key" <<'PY' 2>/dev/null
 import json, sys
@@ -111,13 +151,15 @@ PY
             # Same staleness trap one level down: an EPISODE_DIR exported for the
             # previous key would still point at that key's directory. Keep it only
             # when it already matches the key being run.
-            if [[ -n "$_EPISODE_DIR_PINNED" && "${EPISODE_DIR##*/}" != "$TASK_KEY" ]]; then
-                EPISODE_DIR="$DATA_ROOT/$TASK_KEY"
+            if [[ -n "$_EPISODE_DIR_PINNED" && "$EPISODE_DIR" != "$DATA_ROOT/$TASK_KEY"* ]]; then
+                _EPISODE_DIR_PINNED=""   # stale pin; let resolve_episode_dir recompute
             fi
             return 0
         fi
-        echo "[launcher] NOTE: task '$TASK_KEY' is not in the pinned $PROMPTS_JSON;" >&2
-        echo "[launcher] ignoring the exported DATA_ROOT/PROMPTS_JSON and resolving by key" >&2
+        if [[ -n "$_DATA_ROOT_PINNED" || -n "$_PROMPTS_JSON_PINNED" ]]; then
+            echo "[launcher] NOTE: task '$TASK_KEY' is not in the pinned $PROMPTS_JSON;" >&2
+            echo "[launcher] ignoring the exported DATA_ROOT/PROMPTS_JSON and resolving by key" >&2
+        fi
         _EPISODE_DIR_PINNED=""
     fi
 
@@ -168,7 +210,58 @@ PY
     PROMPTS_JSON="$hits"
     DATA_ROOT="$(dirname "$PROMPTS_JSON")"
     TASK_KEY="$key"
-    [[ -n "$_EPISODE_DIR_PINNED" ]] || EPISODE_DIR="$DATA_ROOT/$TASK_KEY"
+}
+
+# Episode directory names under a task, ordered numerically so episode_2 comes
+# before episode_10 (plain sort would not).
+list_episodes() {
+    find "$1" -maxdepth 1 -mindepth 1 -type d -printf '%f\n' 2>/dev/null \
+        | sort -t_ -k2 -n
+}
+
+# Fill EPISODE_DIR from TASK_KEY + EPISODE_KEY, detecting the root layout rather
+# than requiring a mode flag:
+#   nested  <DATA_ROOT>/<TASK_KEY>/<EPISODE_KEY>/color_subgoal   (pick_place)
+#   flat    <DATA_ROOT>/<TASK_KEY>/color_subgoal                 (older roots)
+# Only the GT goal path reads EPISODE_DIR, so a --goal-source wm run is unaffected.
+resolve_episode_dir() {
+    [[ -z "$_EPISODE_DIR_PINNED" ]] || return 0
+    local task_dir="$DATA_ROOT/$TASK_KEY"
+
+    if [[ -d "$task_dir/color_subgoal" ]]; then
+        if [[ -n "$EPISODE_KEY" ]]; then
+            echo "[launcher] ERROR: --episode '$EPISODE_KEY' given, but $task_dir is a" >&2
+            echo "[launcher] flat root (goal frames sit directly in color_subgoal/)" >&2
+            exit 2
+        fi
+        EPISODE_DIR="$task_dir"
+        return 0
+    fi
+
+    # Missing task dir: leave the path as-is so the caller's own -d check reports
+    # it with the usual message instead of a second, competing error here.
+    [[ -d "$task_dir" ]] || { EPISODE_DIR="$task_dir"; return 0; }
+
+    if [[ -n "$EPISODE_KEY" ]]; then
+        # Accept both "episode_7" and a bare "7".
+        local cand="$task_dir/$EPISODE_KEY"
+        [[ -d "$cand" ]] || cand="$task_dir/episode_$EPISODE_KEY"
+        if [[ ! -d "$cand" ]]; then
+            echo "[launcher] ERROR: episode '$EPISODE_KEY' not found under $task_dir" >&2
+            echo "[launcher] available: $(list_episodes "$task_dir" | tr '\n' ' ')" >&2
+            exit 2
+        fi
+        EPISODE_DIR="$cand"
+    else
+        local first
+        first="$(list_episodes "$task_dir" | head -n 1)"
+        if [[ -z "$first" ]]; then
+            echo "[launcher] ERROR: no episode directories under $task_dir" >&2
+            exit 2
+        fi
+        EPISODE_DIR="$task_dir/$first"
+        echo "[launcher] no --episode given; using the first one: $first"
+    fi
 }
 
 list_tasks() {
@@ -210,8 +303,13 @@ Usage: $(basename "$0") [--dry-run|--real|--check-only] [client options...]
   --real        Enable real robot command publication.
   --check-only  Verify G1 wired routing and required services, then exit.
   --goal-source wm|episode
-                Use remote WM goals (default), or fixed GT images from
-                EPISODE_DIR/color_subgoal without contacting a WM server.
+                Fixed GT images from EPISODE_DIR/color_subgoal, no WM server
+                contacted (default), or remote WM goals.
+  --episode KEY Which recorded episode's GT goal frames to replay, for two-level
+                roots like the default (<DATA_ROOT>/<task>/<episode>/color_subgoal).
+                Accepts "episode_7" or a bare "7". Omit for the first episode.
+                Rejected on flat roots, where the task dir holds color_subgoal
+                directly. Only used by --goal-source episode.
   --task KEY    Select the prompt by task key alone. DATA_ROOT, PROMPTS_JSON and
                 EPISODE_DIR are resolved by finding KEY in data/*/prompts.json,
                 so none of them need to be exported. Setting DATA_ROOT or
@@ -224,6 +322,15 @@ Usage: $(basename "$0") [--dry-run|--real|--check-only] [client options...]
   --prompt TEXT Run TEXT as the task instruction instead of the task_description
                 in prompts.json. TASK_KEY still selects the entry, because the
                 per-stage subtasks always come from the file. Env: INPUT_PROMPT.
+  --method-name NAME
+                Label for the VLA checkpoint/ablation arm under test (e.g.
+                statehist_80k, goaldrop_80k, generalist_40k). Purely a label,
+                embedded in run_manifest.json and the init-frame sidecar. When
+                set and WM_DUMP_DIR is not pinned, also routes rollout
+                telemetry to .logs/main_comparisons/<task_key>/<method_name>/
+                instead of the flat .logs/bagel_gen_images/ default -- use
+                this for quantitative cross-method comparison runs. Env:
+                METHOD_NAME.
   --list-tasks  Print every task key found in data/*/prompts.json, then exit.
 
 With --hlp-mode off, prompts come from PROMPTS_JSON/TASK_KEY. Enter advances to
@@ -240,24 +347,45 @@ and runtime cannot diverge. Examples:
   $(basename "$0") --real    --task pour_water_2
   $(basename "$0") --real    --task water_flower_1 -- --wm-seconds 3.2
   $(basename "$0") --check-only
-  $(basename "$0") --dry-run --goal-source episode        # fixed GT goals, no WM
+  $(basename "$0") --dry-run --goal-source wm             # WM future frames instead
   $(basename "$0") --embodiment-tag psix_g1_sonic_neck --dry-run
 
 Useful environment overrides:
   WM_HOST=$WM_HOST
   WM_PORT=$WM_PORT
   HLP_MODE=$HLP_MODE (default: off; active, shadow, or off)
-  GOAL_SOURCE=$GOAL_SOURCE (default: wm; episode requires HLP_MODE=off)
-  TASK_KEY=$TASK_KEY (default: real_pick_place_0709_psix_val_episode_0)
-  EPISODE_DIR=$EPISODE_DIR
+  GOAL_SOURCE=$GOAL_SOURCE (default: episode; episode requires HLP_MODE=off)
+  TASK_KEY=$TASK_KEY (default: pick_place_1, from $DATA_ROOT)
+  EPISODE_KEY=${EPISODE_KEY:-<first episode>} (see --episode)
+  DATA_ROOT=$DATA_ROOT
+  EPISODE_DIR=${EPISODE_DIR:-<resolved from TASK_KEY/EPISODE_KEY>}
   EMBODIMENT_TAG=${EMBODIMENT_TAG:-<required>} (checked against VLA /info)
   NECK_STATE_ZMQ=$NECK_STATE_ZMQ
   NECK_PUB_PORT=$NECK_PUB_PORT
   SUBGOAL_LOG_DIR=$SUBGOAL_LOG_DIR
+  METHOD_NAME=${METHOD_NAME:-<unset>} (label; auto-routes WM_DUMP_DIR under
+                main_comparisons/<task_key>/<method_name>/ unless pinned)
   WM_DUMP_DIR=$WM_DUMP_DIR (rollout manifest/events; also WM pairs in WM mode)
   WM_GOAL_HARD_AGE=$WM_GOAL_HARD_AGE (0 disables; default: 30s)
   CLIENT_LOCK_FILE=$CLIENT_LOCK_FILE
 EOF
+}
+
+# A flag on the command line invalidates every environment pin it derives from.
+# Without this, a leftover `export DATA_ROOT=...` from the previous task silently
+# beat an explicit --task, and a stale EPISODE_DIR survived an --episode switch
+# within the same task -- which is the only reason every command in the notes was
+# prefixed with `env -u DATA_ROOT -u PROMPTS_JSON -u EPISODE_DIR ...`.
+_drop_root_pins() {
+    if [[ -n "$_DATA_ROOT_PINNED$_PROMPTS_JSON_PINNED$_EPISODE_DIR_PINNED" ]]; then
+        echo "[launcher] NOTE: --task given; ignoring exported DATA_ROOT/PROMPTS_JSON/EPISODE_DIR"
+    fi
+    _DATA_ROOT_PINNED=""
+    _PROMPTS_JSON_PINNED=""
+    _EPISODE_DIR_PINNED=""
+    DATA_ROOT="${_DATA_ROOT_DEFAULT}"
+    PROMPTS_JSON="${DATA_ROOT}/prompts.json"
+    EPISODE_DIR=""
 }
 
 while (($#)); do
@@ -299,9 +427,29 @@ while (($#)); do
             fi
             TASK_KEY="$2"
             _TASK_KEY_CHOSEN=1
+            _drop_root_pins
             shift
             ;;
-        --task=*) TASK_KEY="${1#*=}"; _TASK_KEY_CHOSEN=1 ;;
+        --task=*) TASK_KEY="${1#*=}"; _TASK_KEY_CHOSEN=1; _drop_root_pins ;;
+        --episode)
+            if (($# < 2)); then
+                echo "[launcher] ERROR: --episode needs an episode key" >&2
+                exit 2
+            fi
+            EPISODE_KEY="$2"
+            _EPISODE_DIR_PINNED=""
+            shift
+            ;;
+        --episode=*) EPISODE_KEY="${1#*=}"; _EPISODE_DIR_PINNED="" ;;
+        --method-name)
+            if (($# < 2)); then
+                echo "[launcher] ERROR: --method-name needs a value" >&2
+                exit 2
+            fi
+            METHOD_NAME="$2"
+            shift
+            ;;
+        --method-name=*) METHOD_NAME="${1#*=}" ;;
         --prompt)
             if (($# < 2)); then
                 echo "[launcher] ERROR: --prompt needs an instruction string" >&2
@@ -312,13 +460,40 @@ while (($#)); do
             ;;
         --prompt=*) INPUT_PROMPT="${1#*=}" ;;
         --list-tasks) LIST_TASKS=1 ;;
+        # Common psix_rtc_sonic_wm_client.py flags, accepted directly.
+        --wm-seconds|--wm-period|--wm-mode)
+            if (($# < 2)); then
+                echo "[launcher] ERROR: $1 needs a value" >&2
+                exit 2
+            fi
+            WM_CLIENT_ARGS+=("$1" "$2")
+            shift
+            ;;
+        --wm-seconds=*|--wm-period=*|--wm-mode=*) WM_CLIENT_ARGS+=("$1") ;;
+        --show-goal|--subtask-prompt|--no-subtask-prompt|--neck-reset|--no-neck-reset)
+            WM_CLIENT_ARGS+=("$1") ;;
+        --neck-reset-yaw|--neck-reset-pitch|--neck-reset-hold|--neck-reset-tol|--neck-reset-on-fail)
+            if (($# < 2)); then
+                echo "[launcher] ERROR: $1 needs a value" >&2
+                exit 2
+            fi
+            WM_CLIENT_ARGS+=("$1" "$2")
+            shift
+            ;;
         -h|--help) usage; exit 0 ;;
         --)
             shift
             EXTRA_ARGS+=("$@")
             break
             ;;
-        *) EXTRA_ARGS+=("$1") ;;
+        # A bare word here is almost always a value that lost its flag ("--task X 3"
+        # meaning "--episode 3"). Passing it through only surfaced as an argparse
+        # error after preflight and after the client lock was taken.
+        --*) EXTRA_ARGS+=("$1") ;;
+        *)
+            echo "[launcher] ERROR: stray argument '$1' (did you mean --episode $1?)" >&2
+            exit 2
+            ;;
     esac
     shift
 done
@@ -338,6 +513,12 @@ case "$GOAL_SOURCE" in
     wm|episode) ;;
     *) echo "[launcher] ERROR: invalid GOAL_SOURCE=$GOAL_SOURCE" >&2; exit 2 ;;
 esac
+if ((${#WM_CLIENT_ARGS[@]})) && [[ "$HLP_MODE" != "off" ]]; then
+    echo "[launcher] ERROR: ${WM_CLIENT_ARGS[0]} is only available with --hlp-mode off;" >&2
+    echo "[launcher] psix_rtc_sonic_hlpwm_client.py does not define it" >&2
+    exit 2
+fi
+
 if [[ "$GOAL_SOURCE" == "episode" && "$HLP_MODE" != "off" ]]; then
     echo "[launcher] ERROR: episode GT goals require HLP_MODE=off" >&2
     exit 2
@@ -360,10 +541,20 @@ if [[ "$HLP_MODE" == "off" ]]; then
     # Under --goal-source wm the goals come from the WM server and the directory
     # is never opened, so requiring it there only forced empty placeholder dirs.
     if [[ "$GOAL_SOURCE" == "episode" ]]; then
+        resolve_episode_dir
         [[ -d "$EPISODE_DIR" ]] || {
             echo "[launcher] ERROR: episode directory not found: $EPISODE_DIR" >&2
             exit 2
         }
+    fi
+    # Quantitative comparison runs: route telemetry to
+    # .logs/main_comparisons/<task_key>/<method_name>/<timestamp> instead of
+    # the flat .logs/bagel_gen_images/<timestamp> default, so rollouts group
+    # by task and by the method/checkpoint under test. Only when the operator
+    # set METHOD_NAME and did not pin WM_DUMP_DIR themselves -- an explicit
+    # WM_DUMP_DIR always wins.
+    if [[ -z "$_WM_DUMP_DIR_CHOSEN" && -n "$METHOD_NAME" ]]; then
+        WM_DUMP_DIR="/home/weiduoyuan/Desktop/psi/.logs/main_comparisons/$TASK_KEY/$METHOD_NAME/$(date +%Y%m%d-%H%M%S)"
     fi
 fi
 
@@ -482,8 +673,11 @@ HLP_HEALTH_URL="http://${HLP_HOST}:${HLP_PORT}/health"
 WM_READY_URL="http://${WM_HOST}:${WM_PORT}/ready"
 
 if [[ "$GOAL_SOURCE" == "episode" ]]; then
-    "$ROOT/g1_teleop_network.sh" check
-    echo "[launcher] GT goal source: skipping WM endpoint contract/health"
+    # Goals come off local disk, so the WM machine is not part of this run at all:
+    # skip its route leg too, not just the /ready probe. The robot leg is still
+    # checked -- camera and neck come over the same wire.
+    "$ROOT/g1_teleop_network.sh" check --no-wm
+    echo "[launcher] GT goal source: skipping WM route, endpoint contract and health"
 elif [[ "$WM_HOST" == "192.168.123.240" ]]; then
     "$ROOT/g1_teleop_network.sh" check
 elif [[ "$MODE" == "dry-run" && "$PSIX_ALLOW_NON_G1_WM" == "1" ]]; then
@@ -577,6 +771,10 @@ if [[ "$HLP_MODE" == "off" ]]; then
         echo "[launcher] prompt override: $INPUT_PROMPT"
         echo "[launcher] (subtask stages still come from $TASK_KEY)"
     fi
+    if [[ -n "$METHOD_NAME" ]]; then
+        CLIENT_ARGS+=(--method-name "$METHOD_NAME")
+        echo "[launcher] method under test: $METHOD_NAME"
+    fi
     if [[ "$GOAL_SOURCE" == "episode" ]]; then
         echo "[launcher] scene mode: HLP OFF; fixed episode GT images; WM disabled"
     else
@@ -630,4 +828,4 @@ echo "[launcher] client/HLP logs: $SUBGOAL_LOG_DIR"
 # the interactive Enter/:ov prompt commands keep working.
 CLIENT_LOG="$SUBGOAL_LOG_DIR/$(date +%Y%m%d-%H%M%S)_client.log"
 echo "[launcher] client console log: $CLIENT_LOG"
-python -u "$CLIENT_PROGRAM" "${CLIENT_ARGS[@]}" "${EXTRA_ARGS[@]}" 2>&1 | tee "$CLIENT_LOG"
+python -u "$CLIENT_PROGRAM" "${CLIENT_ARGS[@]}" "${WM_CLIENT_ARGS[@]}" "${EXTRA_ARGS[@]}" 2>&1 | tee "$CLIENT_LOG"

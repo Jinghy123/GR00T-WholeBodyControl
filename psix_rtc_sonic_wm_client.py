@@ -76,16 +76,106 @@ TOKEN_DIM = 64
 ACTION_DIM_DEFAULT = 78
 ACTION_DIM_NECK = 80
 
-# VLA goal-image input size as (H, W). Training pinned BOTH the ego and the goal
-# to `--data.transform.model.resize.size 240 320` (H,W ordering, see psi
+# VLA goal-image input size as (H, W). Training pins BOTH the ego and the goal to
+# `--data.transform.model.resize.size H W` (H,W ordering, see psi
 # config/augmentation.py: `size: ... # H,W`), and PsixModelTransform runs the one
 # `t1 = Compose([resize, center_crop, ...])` over observations and subgoal alike.
 # Deployment reads that same transform back out of the checkpoint
-# (serve_psix.py `_img_transform`), so 320x240 is the model's native input --
-# confirmed live by the served /info: transforms resize [240,320] + center_crop
-# [240,320]. The paired center_crop is a no-op at that size, so the effective
-# operation is a plain resize; see resize_goal_for_vla.
-VLA_GOAL_HW = (240, 320)
+# (serve_psix.py `_img_transform`), so this is the model's native input size.
+#
+# The value below is only a FALLBACK. adopt_vla_goal_hw() overwrites it at startup
+# from the served /info, which reports the checkpoint's own resize -- so switching
+# checkpoints (240x320 -> 270x480 -> ...) needs no edit here. Hardcoding it is how
+# a stale constant silently pre-resizes goals to a size the model never trained on.
+VLA_GOAL_HW = (270, 480)
+
+# Set from argv in main(). Module-level for the same reason as VLA_GOAL_HW: both
+# are read deep inside the send loop, and threading them through the provider
+# constructors would touch code that has nothing to do with either.
+#
+# USE_SUBTASK_PROMPT False sends "Task: X" alone, dropping the ". Subtask: Y"
+# clause. The per-stage subtask still drives stage advance and the WM request --
+# only the VLA-facing instruction changes. Default off: --subtask-prompt opts in.
+USE_SUBTASK_PROMPT = False
+# SHOW_GOAL_WINDOW opens a live cv2 window on the goal actually sent to the VLA
+# (post-resize, i.e. exactly the pixels the model sees).
+SHOW_GOAL_WINDOW = False
+_GOAL_WINDOW_NAME = "VLA goal (as sent)"
+_goal_window_ready = False
+
+# Neck home-on-start, latched the same way. On by default: every rollout should
+# begin from the same head pose, and leaving it to a separate manual step meant it
+# was sometimes skipped and the neck started wherever the previous run ended.
+NECK_RESET = True
+NECK_RESET_YAW = 0.0
+NECK_RESET_PITCH = 0.0
+NECK_RESET_HOLD = 3.0
+NECK_RESET_TOL = 0.02
+NECK_RESET_ON_FAIL = "warn"
+
+
+def display_available():
+    """True when cv2's GUI can safely be used.
+
+    Checked BEFORE any highgui call, not after: with no DISPLAY the Qt plugin
+    calls abort() from C++, which is a SIGABRT the interpreter never sees, so
+    wrapping imshow in try/except does not save the process. Over plain ssh
+    (the normal way this client is launched) that killed the whole rollout.
+    """
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def apply_runtime_flags(args):
+    """Latch the argv-driven prompt / display / neck-home switches into module state."""
+    global USE_SUBTASK_PROMPT, SHOW_GOAL_WINDOW
+    global NECK_RESET, NECK_RESET_YAW, NECK_RESET_PITCH
+    global NECK_RESET_HOLD, NECK_RESET_TOL, NECK_RESET_ON_FAIL
+    USE_SUBTASK_PROMPT = bool(args.subtask_prompt)
+    SHOW_GOAL_WINDOW = bool(args.show_goal)
+    NECK_RESET = bool(args.neck_reset)
+    NECK_RESET_YAW = float(args.neck_reset_yaw)
+    NECK_RESET_PITCH = float(args.neck_reset_pitch)
+    NECK_RESET_HOLD = float(args.neck_reset_hold)
+    NECK_RESET_TOL = float(args.neck_reset_tol)
+    NECK_RESET_ON_FAIL = str(args.neck_reset_on_fail)
+    if SHOW_GOAL_WINDOW and not display_available():
+        SHOW_GOAL_WINDOW = False
+        print("[goal-window] --show-goal ignored: no DISPLAY/WAYLAND_DISPLAY. Run from a "
+              "desktop session, or `ssh -X`, or watch the frames the WM worker already "
+              "writes to the rollout dump dir.", flush=True)
+    print("[prompt] instruction = "
+          + ("'Task: <task>. Subtask: <stage>'" if USE_SUBTASK_PROMPT
+             else "'Task: <task>' (subtask clause off, the default)"), flush=True)
+    if SHOW_GOAL_WINDOW:
+        print("[goal-window] enabled", flush=True)
+
+
+def show_goal_window(rgb, caption=""):
+    """Display the goal frame that is about to be sent. Never fatal.
+
+    Called from the single send-loop thread, which is what cv2's GUI wants. A
+    headless box (no DISPLAY, cv2 built without highgui) raises on the first
+    imshow; that disables the window for the rest of the run instead of taking
+    the rollout down with it.
+    """
+    global SHOW_GOAL_WINDOW, _goal_window_ready
+    if not display_available():
+        SHOW_GOAL_WINDOW = False
+        return
+    try:
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        if caption:
+            cv2.putText(bgr, caption[:60], (6, 18), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, (0, 255, 0), 1, cv2.LINE_AA)
+        if not _goal_window_ready:
+            cv2.namedWindow(_GOAL_WINDOW_NAME, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(_GOAL_WINDOW_NAME, rgb.shape[1] * 2, rgb.shape[0] * 2)
+            _goal_window_ready = True
+        cv2.imshow(_GOAL_WINDOW_NAME, bgr)
+        cv2.waitKey(1)
+    except Exception as exc:
+        SHOW_GOAL_WINDOW = False
+        print(f"[goal-window] disabled: {type(exc).__name__}: {exc}", flush=True)
 
 ACTION_ACK_KEYS = (
     "action_vla_session_id",
@@ -161,6 +251,9 @@ def resolve_vla_embodiment(host, port, requested_tag=None,
             f"client layout override {requested_layout} conflicts with "
             f"VLA action_dim={action_dim}"
         )
+    # The same authoritative read also pins the goal pre-resize, before any goal
+    # provider or publisher exists -- see adopt_vla_goal_hw.
+    adopt_vla_goal_hw(info)
     return served_tag, state_dim, action_dim, include_neck
 
 
@@ -184,12 +277,44 @@ def _mujoco29_to_isaaclab29(qpos):
     return np.asarray(qpos, dtype=np.float32).reshape(29)[_MUJOCO_TO_ISAACLAB_DOF].copy()
 
 
+def adopt_vla_goal_hw(vla_info):
+    """Pin ``VLA_GOAL_HW`` to the resize the served checkpoint actually uses.
+
+    /info reports ``transforms: [{"name": "resize", "size": [H, W]}, ...]``, read
+    straight off ``model_transform.resize.size`` in serve_psix. Taking it from
+    there means the goal pre-resize tracks whatever checkpoint is being served
+    instead of a constant someone has to remember to update.
+
+    Returns the (H, W) in force. A malformed or missing entry leaves the fallback
+    alone and says so, rather than guessing.
+    """
+    global VLA_GOAL_HW
+    entry = next(
+        (t for t in (vla_info or {}).get("transforms", [])
+         if isinstance(t, dict) and t.get("name") == "resize"),
+        None,
+    )
+    size = (entry or {}).get("size")
+    if not (isinstance(size, (list, tuple)) and len(size) == 2
+            and all(isinstance(v, int) and v > 0 for v in size)):
+        print(f"[vla] /info has no usable resize transform ({size!r}); "
+              f"keeping goal size {VLA_GOAL_HW} (H,W)", flush=True)
+        return VLA_GOAL_HW
+    served = (int(size[0]), int(size[1]))
+    if served != VLA_GOAL_HW:
+        print(f"[vla] goal input size {VLA_GOAL_HW} -> {served} (H,W) from /info", flush=True)
+        VLA_GOAL_HW = served
+    else:
+        print(f"[vla] goal input size {served} (H,W), confirmed by /info", flush=True)
+    return VLA_GOAL_HW
+
+
 def resize_goal_for_vla(rgb):
     """Resize a goal image to the VLA's trained ``VLA_GOAL_HW`` input.
 
-    A plain resize, no crop: psi pairs ``v2.Resize((240, 320))`` with
-    ``v2.CenterCrop((240, 320))``, and cropping a 240x320 image to 240x320 does
-    nothing, so the effective transform is the resize alone.
+    A plain resize, no crop: psi pairs ``v2.Resize((H, W))`` with
+    ``v2.CenterCrop((H, W))`` at the same size, so the crop is a no-op and the
+    effective transform is the resize alone.
 
     Two details are copied from that resize rather than chosen here:
 
@@ -375,6 +500,60 @@ def write_run_manifest(run_dir, config, vla_info, wm_state, episode_session_id):
         json.dump(manifest, f, indent=2, ensure_ascii=False, default=str)
         f.write("\n")
     return path
+
+
+def _fs_slug(value, fallback):
+    """Filesystem-safe slug for embedding free-text labels in a filename."""
+    text = str(value) if value else fallback
+    slug = "".join(c if c.isalnum() or c in "-_" else "_" for c in text)
+    return slug[:60] or fallback
+
+
+def save_init_frame(run_dir, camera, task_instruction, task_key, method_name,
+                     camera_address, include_neck, episode_session_id):
+    """Grab and persist the very first camera frame of this rollout.
+
+    Called once, before any other component starts polling the camera, so the
+    saved frame is the true scene state at rollout start -- not the frame that
+    happened to be current whenever the first WM request went out. The point
+    is cross-method comparison: two rollouts of different checkpoints on the
+    same task should start from a comparable physical scene, and this is the
+    artifact operators diff/eyeball to confirm that after the fact.
+
+    Best-effort like the rest of the flight recorder: a failed capture must
+    never block startup, it only means this run has no init-frame record.
+    """
+    try:
+        frame = camera.get_frame()  # BGR uint8, ready for cv2.imwrite
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        task_slug = _fs_slug(task_key, "task")
+        method_slug = _fs_slug(method_name, "nolabel")
+        filename = f"init_ego_{task_slug}_{method_slug}_{stamp}.jpg"
+        path = os.path.join(run_dir, filename)
+        os.makedirs(run_dir, exist_ok=True)
+        if not cv2.imwrite(path, frame):
+            raise RuntimeError(f"cv2.imwrite failed for {path}")
+        meta = {
+            "schema_version": "wm-init-frame/1",
+            "saved_at": datetime.now().isoformat(timespec="milliseconds"),
+            "task": task_instruction,
+            "task_key": task_key,
+            "method_name": method_name,
+            "robot_episode_session_id": episode_session_id,
+            "image_file": filename,
+            "camera_address": camera_address,
+            "include_neck": bool(include_neck),
+        }
+        meta_path = os.path.join(run_dir, "init_frame.json")
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        print(f"[MAIN] Saved init frame: {path}", flush=True)
+        return path
+    except Exception as exc:
+        # Same policy as _save_bagel_goal: telemetry must never interrupt startup.
+        print(f"[MAIN] WARNING: failed to save init frame ({exc})", flush=True)
+        return None
 
 
 class IncidentRecorder:
@@ -1413,10 +1592,36 @@ class EpisodeSubgoalProvider:
         )
         if not self.paths:
             raise ValueError(f"[gt] no goal images found in {goal_dir}")
-        if len(self.paths) != len(self._subtasks):
+        # A task description normally ends with a wrap-up step ("Release and
+        # retract") that annotators gave no subgoal frame to, so color_subgoal/
+        # holds exactly one image fewer than prompts.json has subtasks. The goal
+        # for that last stage is simply where the episode ended, so borrow the
+        # final recorded ego frame instead of dropping the stage.
+        missing = len(self._subtasks) - len(self.paths)
+        if missing < 0:
             raise ValueError(
                 f"[gt] goal/subtask count mismatch: {len(self.paths)} images in "
-                f"{goal_dir}, {len(self._subtasks)} subtasks"
+                f"{goal_dir}, only {len(self._subtasks)} subtasks to pair them with"
+            )
+        if missing == 1:
+            color_dir = os.path.join(self._episode_dir, "color")
+            frames = sorted(
+                os.path.join(color_dir, name)
+                for name in os.listdir(color_dir)
+                if name.lower().endswith(self._IMG_EXTS)
+            ) if os.path.isdir(color_dir) else []
+            if not frames:
+                raise ValueError(
+                    f"[gt] {len(self.paths)} goal images for {len(self._subtasks)} "
+                    f"subtasks, and no ego frames in {color_dir} to close the gap"
+                )
+            self.paths.append(frames[-1])
+            print(f"[gt] final stage {self._subtasks[-1]!r} has no subgoal frame; "
+                  f"using the last ego frame {os.path.basename(frames[-1])}", flush=True)
+        elif missing > 1:
+            raise ValueError(
+                f"[gt] {len(self.paths)} goal images for {len(self._subtasks)} subtasks "
+                f"in {goal_dir}: only a single trailing stage can be filled from color/"
             )
 
         self._images = []
@@ -1828,6 +2033,51 @@ class NeckPublisher:
     def stop(self):
         self._sock.close(linger=0)
         self._ctx.term()
+
+
+def reset_neck_to_home(pub, reader, yaw=0.0, pitch=0.0, hold_s=3.0, tol=0.02,
+                       stable_s=0.4):
+    """Drive the neck to (yaw, pitch) before the rollout starts. Closed loop.
+
+    Why this lives in the client: the on-robot NeckMotor is a SUB that connects to
+    the host's :5570, and the client already BINDS that port. The standalone
+    reset_neck.py binds it too, so it can only run while the client is down -- which
+    is exactly why resetting used to be a separate manual step.
+
+    Convergence is read back from the :5560 present-position stream rather than
+    slept through. Two reasons: NeckMotor applies its own EMA on the board, so any
+    fixed settle time here is a guess; and the failure actually seen in the field is
+    a neck whose state stream is alive while the motor is dead, republishing one
+    frozen value. An open-loop publish-and-sleep reports success on that neck. This
+    does not: a frozen reading that is not already at the target never converges.
+
+    Targets are RADIANS -- the units NeckMotor clamps against (yaw +-60deg,
+    pitch +-45deg). Re-sends at 100 Hz to ride out PUB/SUB slow-joiner, the same
+    way reset_neck.py does.
+
+    Returns (converged, start_state, end_state, elapsed_s). start/end may be None
+    when nothing was ever received on :5560.
+    """
+    start = reader.get_latest() if reader is not None else None
+    t0 = time.monotonic()
+    in_band_since = None
+    latest = start
+    while time.monotonic() - t0 < hold_s:
+        pub.publish(yaw, pitch)
+        if reader is not None:
+            latest = reader.get_latest()
+            if latest is not None:
+                in_band = (abs(latest[0] - yaw) <= tol and abs(latest[1] - pitch) <= tol)
+                if not in_band:
+                    in_band_since = None
+                elif in_band_since is None:
+                    in_band_since = time.monotonic()
+                elif time.monotonic() - in_band_since >= stable_s:
+                    return True, start, latest, time.monotonic() - t0
+        time.sleep(0.01)
+    # No state stream at all: we published for the full hold and cannot say more
+    # than that. Report it as unconverged so the caller's policy decides.
+    return False, start, latest, time.monotonic() - t0
 
 
 # ---------------- Global state ----------------
@@ -2946,7 +3196,7 @@ class RTCWebSocketClient:
                 subtask = str(wm["subtask"]).strip().lower()
                 instruction = (
                     f"Task: {task}. Subtask: {subtask}"
-                    if subtask else f"Task: {task}"
+                    if subtask and USE_SUBTASK_PROMPT else f"Task: {task}"
                 )
                 send_condition = self._condition_for_send(
                     wm, instruction, subgoal_frame
@@ -2956,6 +3206,17 @@ class RTCWebSocketClient:
                     continue
                 subgoal_frame = send_condition["goal"]
                 instruction = send_condition["instruction"]
+
+                # Show the goal from the condition being sent, not the freshly
+                # generated candidate: a candidate only becomes the goal psix acts
+                # on once it is promoted, so the window would otherwise run ahead
+                # of the policy.
+                if SHOW_GOAL_WINDOW:
+                    show_goal_window(
+                        subgoal_frame,
+                        f"stage {wm['prompt_stage']} gen {wm['goal_generation']} "
+                        f"{wm.get('goal_source', '')}".strip(),
+                    )
 
                 # Build observation payload. Image keys MUST match the server's repack:
                 #   ego image  -> repack.image_keys[0]  == "video.egocentric"
@@ -3105,7 +3366,8 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
          dry_run=False,
          include_neck=False, neck_pub_host=DEFAULT_NECK_PUB_HOST,
          neck_pub_port=DEFAULT_NECK_PUB_PORT,
-         neck_state_zmq=DEFAULT_NECK_STATE_ZMQ):
+         neck_state_zmq=DEFAULT_NECK_STATE_ZMQ,
+         task_key=None, method_name=None):
     running.set()
     print("[MAIN] Initializing components...")
 
@@ -3188,6 +3450,33 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
     os.makedirs(run_dir, exist_ok=True)
     event_log = EventLog(os.path.join(run_dir, "events.jsonl"))
     set_event_log(event_log)
+
+    # Home the neck before anything can command it. Placed after the PUB is bound
+    # (the board's SUB has had the manifest/info work to reconnect) and before the
+    # VLA session exists, so no policy neck command can race the reset.
+    if NECK_RESET and include_neck:
+        if neck_publisher is None:
+            print("[neck-reset] skipped: dry-run does not bind the neck publisher", flush=True)
+        else:
+            ok, before, after, dt = reset_neck_to_home(
+                neck_publisher, neck_state_reader,
+                yaw=NECK_RESET_YAW, pitch=NECK_RESET_PITCH,
+                hold_s=NECK_RESET_HOLD, tol=NECK_RESET_TOL)
+            print(f"[neck-reset] {'converged' if ok else 'NOT converged'} in {dt:.2f}s | "
+                  f"start={before} end={after} "
+                  f"target=({NECK_RESET_YAW:+.3f},{NECK_RESET_PITCH:+.3f}) rad "
+                  f"tol={NECK_RESET_TOL}", flush=True)
+            log_event("neck_reset", converged=bool(ok), start=before, end=after,
+                      elapsed_s=round(dt, 3), target=[NECK_RESET_YAW, NECK_RESET_PITCH])
+            if not ok:
+                msg = ("[neck-reset] neck did not reach home. A live-but-frozen state "
+                       "stream looks exactly like this: check that realsense_server.py "
+                       "started with --enable-neck-motor and that its serial port opened "
+                       "(tail ~/realsense_server.log on the robot).")
+                if NECK_RESET_ON_FAIL == "abort":
+                    raise SystemExit(msg + " Aborting (--neck-reset-on-fail=abort).")
+                print(msg, flush=True)
+
     incident_recorder = IncidentRecorder(run_dir)
     vla_info = _fetch_json(
         server_url.replace("ws://", "http://").replace("/ws", "/info"))
@@ -3203,6 +3492,8 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
             "goal_source": goal_source,
             "episode_dir": episode_dir if goal_source == "episode" else None,
             "wm_base_url": wm_base_url if goal_source == "wm" else None,
+            "task_key": task_key,
+            "method_name": method_name,
             "task_instruction": task_instruction,
             "subtasks": subtasks,
             "wm_period": wm_period,
@@ -3234,6 +3525,15 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
     )
     print(f"[MAIN] Run manifest: {manifest_path}")
     log_event("run_start", manifest=manifest_path, dry_run=bool(dry_run))
+
+    # Grab the rollout's init frame now, before wm_provider.start() or the
+    # client's own camera polling begin -- this REQ/REP camera has no other
+    # outstanding request yet, so this is the only safe window for a one-off
+    # synchronous get_frame() (plan: main_comparisons cross-method alignment).
+    save_init_frame(
+        run_dir, camera, task_instruction, task_key, method_name,
+        camera_address, include_neck, wm_provider._episode_session_id,
+    )
 
     # Let the live PUB subscription settle, but send no start command yet. The
     # receive callback starts WBC only after a fresh observation + valid action.
@@ -3377,7 +3677,15 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="RTC VLA client with remote-WM or fixed episode GT goals"
+        description="RTC VLA client with remote-WM or fixed episode GT goals",
+        # No abbreviations. With them on, a launcher flag that leaked through the
+        # "--" passthrough binds to a longer option and wins, because EXTRA_ARGS is
+        # appended last: --prompt -> --prompts-json (seen in the field: the task
+        # text was opened as a filename), --task -> --task-key, --episode ->
+        # --episode-dir, --goal -> --goal-source. Every documented command spells
+        # options in full and -h is the only short option, so nothing legitimate
+        # depends on prefix matching.
+        allow_abbrev=False,
     )
     parser.add_argument("--host", type=str, default="localhost",
                         help="VLA policy server host")
@@ -3414,6 +3722,12 @@ if __name__ == "__main__":
                              "task_description and the per-stage subtask prompts.")
     parser.add_argument("--instruction", type=str, default=None,
                         help="Override task instruction (else taken from prompts.json[task-key])")
+    parser.add_argument("--method-name", type=str, default=None,
+                        help="Label for the VLA checkpoint/ablation arm under test (e.g. "
+                             "statehist_80k, goaldrop_80k, generalist_40k). Embedded in "
+                             "run_manifest.json and the init-frame sidecar for later "
+                             "cross-method comparison; purely a label, does not affect "
+                             "serving or control.")
     parser.add_argument(
         "--goal-source", choices=("wm", "episode"), default="wm",
         help="Goal image source: remote WM (default), or fixed "
@@ -3423,8 +3737,10 @@ if __name__ == "__main__":
                         help="WM server address on the direct G1-wired subnet")
     parser.add_argument("--wm-port", type=int, default=8016,
                         help="WM HTTP port")
-    parser.add_argument("--wm-period", type=float, default=3.0,
-                        help="Serialized WM refresh period in seconds")
+    parser.add_argument("--wm-period", type=float, default=1.6,
+                        help="Serialized WM refresh period in seconds (default: 1.6, matched to "
+                             "--wm-seconds so a goal is replaced about when it comes due rather "
+                             "than being held past its horizon)")
     parser.add_argument("--wm-timeout", type=float, default=15.0,
                         help="Timeout for one POST /wm request; a hung WM blocks the "
                              "serialized refresh worker this long, so keep it short")
@@ -3435,12 +3751,13 @@ if __name__ == "__main__":
                              "checkpoints are trained future-only (default: future). In future "
                              "mode no subtask is sent: the caption is built from the task alone, "
                              "matching training.")
-    parser.add_argument("--wm-seconds", type=float, default=3.2,
-                        help="future-mode prediction horizon in seconds (default: 3.2, the "
-                             "longest trained bin). Always sent explicitly so the horizon does "
-                             "not silently depend on how the server was launched; the server "
-                             "still clamps to its trained window (0.8-4.0) and quantizes to "
-                             "0.1 s. Pass 0 to fall back to the server's own default.")
+    parser.add_argument("--wm-seconds", type=float, default=1.6,
+                        help="future-mode prediction horizon in seconds (default: 1.6, matching "
+                             "the pnp wmgoal checkpoint's wm_goal_horizon=48 frames @30fps, so "
+                             "the served goal sits where the trained one did). Always sent "
+                             "explicitly so the horizon does not silently depend on how the "
+                             "server was launched; the server still clamps to its trained window "
+                             "(0.8-4.0) and quantizes to 0.1 s. Pass 0 for the server default.")
     parser.add_argument("--wm-stale-warn", type=float, default=5.0,
                         help="Deprecated compatibility option; mismatched prompt/goal now gates immediately")
     parser.add_argument(
@@ -3477,7 +3794,42 @@ if __name__ == "__main__":
     parser.add_argument("--neck-state-zmq", type=str, default=DEFAULT_NECK_STATE_ZMQ,
                         help=f"Neck-state SUB address (default: {DEFAULT_NECK_STATE_ZMQ})")
 
+    parser.add_argument("--show-goal", action="store_true",
+                        help="Open a live window on the goal image currently driving the "
+                             "policy -- the promoted condition's frame, post-resize, i.e. "
+                             "exactly the pixels sent to the VLA. Needs a display; falls "
+                             "back to a warning and keeps running if cv2 cannot open one.")
+    # Default OFF: the served instruction is "Task: X" alone. Stage advance and the
+    # WM request keep using the per-stage subtask either way -- this switch only
+    # decides whether the clause reaches the VLA.
+    parser.add_argument("--subtask-prompt", dest="subtask_prompt", action="store_true",
+                        default=False,
+                        help="Append '. Subtask: <stage>' to the served instruction. "
+                             "Off by default, so the VLA gets 'Task: <task>' alone.")
+    parser.add_argument("--no-subtask-prompt", dest="subtask_prompt", action="store_false",
+                        help="Explicitly keep the subtask clause off (already the default).")
+    # Neck home-on-start. Replaces the separate 'press r in the camera terminal'
+    # step: that used reset_neck.py, which binds the same :5570 this client binds,
+    # so it could only ever run while the client was down.
+    parser.add_argument("--neck-reset", dest="neck_reset", action="store_true", default=True,
+                        help="Drive the neck to home before connecting (default: on).")
+    parser.add_argument("--no-neck-reset", dest="neck_reset", action="store_false",
+                        help="Start from wherever the neck currently is.")
+    parser.add_argument("--neck-reset-yaw", type=float, default=0.0,
+                        help="Home yaw in RADIANS (default: 0.0)")
+    parser.add_argument("--neck-reset-pitch", type=float, default=0.0,
+                        help="Home pitch in RADIANS (default: 0.0)")
+    parser.add_argument("--neck-reset-hold", type=float, default=3.0,
+                        help="Max seconds to publish the home target (default: 3.0)")
+    parser.add_argument("--neck-reset-tol", type=float, default=0.02,
+                        help="Convergence band in rad on both axes (default: 0.02)")
+    parser.add_argument("--neck-reset-on-fail", choices=("warn", "abort"), default="warn",
+                        help="If the neck never reaches home: warn and continue, or abort. "
+                             "'abort' is the safe choice for scripted comparison runs, where "
+                             "a rollout that starts from the wrong head pose is wasted.")
     args = parser.parse_args()
+
+    apply_runtime_flags(args)
 
     if args.camera_timeout_ms <= 0:
         parser.error("--camera-timeout-ms must be positive")
@@ -3578,4 +3930,6 @@ if __name__ == "__main__":
         neck_pub_host=args.neck_pub_host,
         neck_pub_port=args.neck_pub_port,
         neck_state_zmq=args.neck_state_zmq,
+        task_key=args.task_key,
+        method_name=args.method_name,
     )
