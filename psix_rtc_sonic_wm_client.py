@@ -254,6 +254,27 @@ def resolve_vla_embodiment(host, port, requested_tag=None,
     # The same authoritative read also pins the goal pre-resize, before any goal
     # provider or publisher exists -- see adopt_vla_goal_hw.
     adopt_vla_goal_hw(info)
+    # Goal-conditioning preflight (serve_psix.py exposes these since 2026-08-10).
+    # This client always ships a goal under "subgoal.egocentric" and hashes it into
+    # the condition provenance. Against a goal_key=None checkpoint the server does
+    # NOT pop the goal, recomputes the condition hash over the empty sentinel, and
+    # the mismatch tears the connection down mid-run with no diagnosis -- fail at
+    # startup with a readable message instead. Older servers omit the fields
+    # (both .get() -> None), which skips the check rather than false-failing.
+    goal_key = info.get("goal_key")
+    if info.get("goal_conditioned") is False:
+        raise RuntimeError(
+            "served checkpoint is not goal-conditioned (subgoal_key=null, trained "
+            "with subgoal_prob<=0): the WM subgoal this client sends would be "
+            "ignored and the condition hash would mismatch. Serve a goal-image "
+            "checkpoint, or use the plain psix_rtc_sonic_client.py."
+        )
+    if goal_key is not None and goal_key != "subgoal.egocentric":
+        raise RuntimeError(
+            f"served checkpoint reads its goal under {goal_key!r}, but this client "
+            "sends it under 'subgoal.egocentric'; align the client key before "
+            "deploying."
+        )
     return served_tag, state_dim, action_dim, include_neck
 
 
@@ -1338,7 +1359,17 @@ class WmSubgoalProvider:
             response = self._session.post(
                 f"{self._base_url}/wm", json=body, timeout=self._timeout
             )
-            response.raise_for_status()
+            if response.status_code != 200:
+                # Surface the server's own error body: a contract 400 ("missing
+                # required field 'subtask'" — e.g. future mode against the psi-repo
+                # Cosmos/BAGEL servers, which both REQUIRE a non-empty subtask)
+                # must read differently from a transient 429/timeout, or a
+                # permanent misconfiguration looks like an outage and gates forever.
+                try:
+                    detail = response.json().get("error", response.text[:200])
+                except Exception:
+                    detail = response.text[:200]
+                raise ValueError(f"http {response.status_code}: {detail}")
             payload = response.json()
             if not isinstance(payload, dict) or "subgoal_jpeg" not in payload:
                 raise ValueError("response missing JPEG field 'subgoal_jpeg'")
@@ -3750,7 +3781,12 @@ if __name__ == "__main__":
                         help="WM prediction mode the server is serving. The zedmini deployment "
                              "checkpoints are trained future-only (default: future). In future "
                              "mode no subtask is sent: the caption is built from the task alone, "
-                             "matching training.")
+                             "matching training. NOTE: future mode targets the out-of-repo "
+                             "future WM server ONLY — the psi-repo servers "
+                             "(serve_psix_wm_cosmos.py / serve_psix_wm.py) both REQUIRE a "
+                             "non-empty subtask and answer 400 to every future-mode poll, so "
+                             "against those pass --wm-mode subgoal (with per-stage subtasks in "
+                             "prompts.json). The 400 body names the missing field.")
     parser.add_argument("--wm-seconds", type=float, default=1.6,
                         help="future-mode prediction horizon in seconds (default: 1.6, matching "
                              "the pnp wmgoal checkpoint's wm_goal_horizon=48 frames @30fps, so "

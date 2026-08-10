@@ -830,9 +830,15 @@ class StageDirector:
     def __init__(self, profile: SemanticProfile, scene: Optional[List[str]],
                  orch: ConditionOrchestrator, mode: str, log: EventLog,
                  allow_unsafe_override: bool = False,
-                 snapshots: Optional[SubgoalSnapshotLog] = None):
+                 snapshots: Optional[SubgoalSnapshotLog] = None,
+                 task_text: Optional[str] = None):
         assert mode in ("off", "shadow", "active")
         self.profile = profile
+        # The RESOLVED task text (scene override may replace profile.task_text).
+        # Falling back to the profile keeps old constructors working, but the
+        # main client passes the resolved value so the raw-bypass instruction
+        # uses the SAME task string as the WM/HLP request bodies.
+        self.task_text = task_text if task_text is not None else profile.task_text
         self.scene = list(scene) if scene else None
         self.orch = orch
         self.mode = mode
@@ -1008,7 +1014,10 @@ class StageDirector:
                     # owns the consequences (plan P1-2 deviation, user-approved).
                     self._lineage_trusted = False
                     self.log.emit("canonical_bypass", raw=cur)
-                    instr = instruction or f"Task: {self.profile.task_text.strip().lower()}. Subtask: {cur}"
+                    # Training lowercases BOTH halves (see the wm client's note); keep parity.
+                    instr = instruction or (
+                        f"Task: {self.task_text.strip().lower()}. "
+                        f"Subtask: {cur.strip().lower()}")
                     self.orch.set_desired(cur, instr, source="override-raw")
                     return
                 if not self.tracker.admissible(m.canonical):
@@ -1249,6 +1258,18 @@ class HlpPoller:
                 status, reply = -1, None
             if status == 200 and isinstance(reply, dict) \
                     and reply.get("robot_episode_session_id"):
+                # Same gate every poll/control path runs BEFORE adopting HLP
+                # state: an HTTP-200 {"error": ...} or malformed acquire reply
+                # must not seed the StageDirector (the lease itself is fine).
+                kind, why = validate_hlp_reply(reply)
+                if kind != "ok":
+                    self._log.emit("hlp_acquire_invalid", kind=kind,
+                                   why=(why or "")[:200])
+                    attempt += 1
+                    if attempt > retries:
+                        return False
+                    time.sleep(2.0)
+                    continue
                 with self._lock:
                     self.session_id = reply["robot_episode_session_id"]
                     self.task_fingerprint = reply.get("task_fingerprint")
@@ -1547,6 +1568,14 @@ class WmWorker:
                 raise ValueError("response req_id mismatch")
             if str(reply.get("subtask", "")) != plan["label"]:
                 raise ValueError("response subtask mismatch")
+            # Guarded echoes, same as the newer wm client: Cosmos echoes both,
+            # BAGEL omits them -- "in reply" keeps BAGEL compatibility.
+            if ("prompt_gen" in reply and
+                    int(reply["prompt_gen"]) != plan["prompt_gen"]):
+                raise ValueError("response prompt_gen mismatch")
+            if ("robot_episode_session_id" in reply and
+                    str(reply["robot_episode_session_id"]) != self._episode_session_fn()):
+                raise ValueError("response episode session mismatch")
             if "subgoal_jpeg" in reply:
                 goal = self._decode_jpeg(reply["subgoal_jpeg"])
             elif "subgoal_image" in reply:
@@ -1841,7 +1870,8 @@ class HlpwmClient:
         self.director = StageDirector(self.profile, scene, self.orch,
                                       args.hlp_mode, self.log,
                                       allow_unsafe_override=args.allow_raw_override,
-                                      snapshots=self.snapshots)
+                                      snapshots=self.snapshots,
+                                      task_text=self.task_text)
 
         # --- service legs -----------------------------------------------------
         self.poller = HlpPoller(
@@ -2026,7 +2056,8 @@ class HlpwmClient:
                           mode=self.args.hlp_mode)
             self.orch.set_desired(
                 text,
-                f"Task: {self.task_text.strip().lower()}. Subtask: {text}",
+                # Training lowercases BOTH halves; keep parity with the wm client.
+                f"Task: {self.task_text.strip().lower()}. Subtask: {text.strip().lower()}",
                 source="manual-takeover-raw")
 
     def _handle_cmd(self, cmd: str) -> None:
@@ -2275,7 +2306,11 @@ def parse_args(argv=None):
                    help="WM server on the direct G1-wired subnet")
     p.add_argument("--wm-port", type=int, default=8016)
     p.add_argument("--wm-connect-timeout", type=float, default=3.0)
-    p.add_argument("--wm-read-timeout", type=float, default=10.0)
+    # 15 s matches the newer wm client. 10 s sat below a slow Cosmos generation
+    # (20-step mode; the deployed fast mode is 8 steps) — a too-short read
+    # timeout livelocks the WM leg: timeout -> backoff -> timeout, and no goal
+    # is ever adopted while the server keeps finishing just after we hang up.
+    p.add_argument("--wm-read-timeout", type=float, default=15.0)
     p.add_argument("--wm-jpeg-quality", type=int, default=90)
     p.add_argument("--wm-refresh-period", type=float, default=0.0,
                    help="periodic same-stage goal refresh period; needs "
@@ -2326,8 +2361,52 @@ def parse_args(argv=None):
     return p.parse_args(argv)
 
 
+def _preflight_vla_info(host, port, timeout=3.0):
+    """Fail fast when the served VLA does not match this client's FIXED wire layout.
+
+    This client is pinned to the 43-D state / 78-D action no-neck layout
+    (_build_state_43) and ships its goal under "subgoal.egocentric". Against a
+    45/80 neck checkpoint, or a goal_key=null one, the mismatch otherwise only
+    surfaces mid-run as a server-side shape error or a condition-hash teardown
+    with no diagnosis. Older servers that omit a field skip that check rather
+    than false-failing; an unreachable /info is also non-fatal (the WS connect
+    will report it properly).
+    """
+    try:
+        import requests
+        s = requests.Session(); s.trust_env = False
+        info = s.get(f"http://{host}:{int(port)}/info", timeout=timeout).json()
+        s.close()
+    except Exception as exc:
+        print(f"[preflight] /info unavailable ({exc}); proceeding to WS connect", flush=True)
+        return
+    if not isinstance(info, dict):
+        return
+    wire = info.get("wire") or {}
+    sd, ad = wire.get("state_dim"), wire.get("action_dim")
+    if sd is not None and ad is not None and (int(sd), int(ad)) != (43, 78):
+        raise RuntimeError(
+            f"served VLA wire layout is {sd}/{ad} but this client is fixed at 43/78 "
+            "(no-neck). Use psix_rtc_sonic_wm_client.py for neck checkpoints, or "
+            "serve a no-neck checkpoint."
+        )
+    if info.get("goal_conditioned") is False:
+        raise RuntimeError(
+            "served checkpoint is not goal-conditioned (subgoal_key=null); the WM "
+            "subgoal this client sends would be ignored and the condition hash "
+            "would mismatch. Serve a goal-image checkpoint."
+        )
+    gk = info.get("goal_key")
+    if gk is not None and gk != "subgoal.egocentric":
+        raise RuntimeError(
+            f"served checkpoint reads its goal under {gk!r}; this client sends "
+            "'subgoal.egocentric'."
+        )
+
+
 def main():
     args = parse_args()
+    _preflight_vla_info(args.host, args.port)
     client = HlpwmClient(args)
 
     import signal
