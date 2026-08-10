@@ -26,7 +26,7 @@ import numpy as np
 
 # ── USER CONFIG ────────────────────────────────────────────────────────────────
 # EPISODE_DIR = "/home/xiawei/hongyi/Unitree_Robotics/Humanoid-Teleop/teleop/data/g1_1001/Basic/Pick_toys_into_box_and_lift_and_turn_and_put_on_the_chair_new/episode_40"
-EPISODE_DIR = "/home/hongyi/data/real_psi0_g1/Rotate_to_pour_ham_into_plate_and_push_the_cart_forward/episode_20"
+EPISODE_DIR = "/home/hongyi/data/real_psi0_g1/Rotate_to_pour_ham_into_plate_and_push_the_cart_forward/episode_15"
 # EPISODE_DIR = "/home/xiawei/data/HE_RAW/Locomanip/walk_towards_a_desk_and_place_a_cube_on_a_tray/episode_4"
 # EPISODE_DIR = "/home/xiawei/hongyi/Unitree_Robotics/Humanoid-Teleop/teleop/data/g1_1001/Basic/Spray_the_bowl_and_wipe_it_and_stack_it_up/episode_10"
 
@@ -36,9 +36,9 @@ ENTER_THR = 0.10
 EXIT_THR  = 0.05
 
 # Fixed walking speed sent to planner (chosen at load time by sol_q dim:
-# 14 → 0.3, 29 → 0.2, else 0.3). Dominant local-vel axis → ±WALK_SPEED, the
+# 14 → 0.3, 29 → 0.3, else 0.3). Dominant local-vel axis → ±WALK_SPEED, the
 # other axis scales proportionally (e.g. (0.5,0.1) → planner gets (0.3,0.06)).
-WALK_SPEED_BY_SOL_DIM = {14: 0.3, 29: 0.2}
+WALK_SPEED_BY_SOL_DIM = {14: 0.3, 29: 0.3}
 WALK_SPEED_DEFAULT    = 0.3
 
 # Yaw-rate (deg/s) thresholds for the turn-in-place phase: planner gets
@@ -265,6 +265,7 @@ def main():
 
     print(f"[main] loading {episode_dir}")
     qpos_30, hands_30, imu_q_30, body_vel_30, sol_dim, cmd_30 = load_full_episode(episode_dir)
+    # cmd_30 = None
     n_30 = len(qpos_30)
     walk_speed = WALK_SPEED_BY_SOL_DIM.get(sol_dim, WALK_SPEED_DEFAULT)
     print(f"[main] WALK_SPEED={walk_speed} (sol_q dim={sol_dim})")
