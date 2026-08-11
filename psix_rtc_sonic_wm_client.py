@@ -76,6 +76,31 @@ TOKEN_DIM = 64
 ACTION_DIM_DEFAULT = 78
 ACTION_DIM_NECK = 80
 
+# ---- Frozen action (no-RTC starvation fallback) ----------------------------
+# When the server runs out of chunk before the next inference lands it keeps
+# streaming the LAST action and flags it with `rtc_repeat_last`. Replaying a
+# stale body token drives the robot toward a pose the plan has already left --
+# tolerable at RTC's rare starvation, but rtc_mode=off has no continuity
+# mechanism at all, so it starves on every chunk boundary.
+#
+# The fallback used by psix_sonic_client.py instead re-encodes the CURRENT
+# measured pose into a body token ("stay where you are") and keeps the hand and
+# neck values from the last action. Same idea here, on the repeat-last flag the
+# server already sends. Falls back to the plain repeat when the encoder or robot
+# state is unavailable -- never worse than the old behaviour.
+ENCODER_MODEL = os.path.join(
+    _GROOT_ROOT, "gear_sonic_deploy/policy/release/model_encoder.onnx")
+# MuJoCo joint order -> IsaacLab order the encoder was trained in.
+_MUJOCO_TO_ISAACLAB_DOF = np.array(
+    [0, 6, 12, 1, 7, 13, 2, 8, 14, 3, 9, 15, 22, 4, 10, 16, 23, 5, 11, 17, 24,
+     18, 25, 19, 26, 20, 27, 21, 28],
+    dtype=np.int32,
+)
+
+
+def _mujoco29_to_isaaclab29(qpos):
+    return np.asarray(qpos, dtype=np.float32).reshape(29)[_MUJOCO_TO_ISAACLAB_DOF].copy()
+
 # VLA goal-image input size as (H, W). Training pins BOTH the ego and the goal to
 # `--data.transform.model.resize.size H W` (H,W ordering, see psi
 # config/augmentation.py: `size: ... # H,W`), and PsixModelTransform runs the one
@@ -112,6 +137,18 @@ NECK_RESET_PITCH = 0.0
 NECK_RESET_HOLD = 3.0
 NECK_RESET_TOL = 0.02
 NECK_RESET_ON_FAIL = "warn"
+# Settle pause after homing, before the rollout is allowed to start. The readback
+# on :5560 says the encoder reached the target, which is not the same as the head
+# having stopped moving: NeckMotor runs its own EMA on the board, so the last
+# command is still being smoothed out when the reading first lands in the band.
+# Starting the policy during that tail means the first observations are taken from
+# a head that is still drifting.
+NECK_RESET_SETTLE = 5.0
+# Frozen-action fallback on starved (repeat-last) ticks; see _freeze_action.
+# Default on: it only engages when the server flags rtc_repeat_last, which an
+# RTC rollout should essentially never do, and it is strictly better than
+# replaying a stale body token when it does.
+FROZEN_ACTION = True
 
 
 def display_available():
@@ -129,7 +166,8 @@ def apply_runtime_flags(args):
     """Latch the argv-driven prompt / display / neck-home switches into module state."""
     global USE_SUBTASK_PROMPT, SHOW_GOAL_WINDOW
     global NECK_RESET, NECK_RESET_YAW, NECK_RESET_PITCH
-    global NECK_RESET_HOLD, NECK_RESET_TOL, NECK_RESET_ON_FAIL
+    global NECK_RESET_HOLD, NECK_RESET_TOL, NECK_RESET_ON_FAIL, NECK_RESET_SETTLE
+    global FROZEN_ACTION
     USE_SUBTASK_PROMPT = bool(args.subtask_prompt)
     SHOW_GOAL_WINDOW = bool(args.show_goal)
     NECK_RESET = bool(args.neck_reset)
@@ -138,6 +176,8 @@ def apply_runtime_flags(args):
     NECK_RESET_HOLD = float(args.neck_reset_hold)
     NECK_RESET_TOL = float(args.neck_reset_tol)
     NECK_RESET_ON_FAIL = str(args.neck_reset_on_fail)
+    NECK_RESET_SETTLE = float(args.neck_reset_settle)
+    FROZEN_ACTION = bool(args.frozen_action)
     if SHOW_GOAL_WINDOW and not display_available():
         SHOW_GOAL_WINDOW = False
         print("[goal-window] --show-goal ignored: no DISPLAY/WAYLAND_DISPLAY. Run from a "
@@ -2133,6 +2173,13 @@ class RTCWebSocketClient:
         if (self._include_neck and not self._dry_run and
                 self._neck_publisher is None):
             raise ValueError("live --include-neck requires a NeckPublisher")
+        # Frozen-action fallback. Loaded lazily on the first starved tick so an
+        # RTC rollout (which should never starve) pays nothing, and a missing
+        # onnxruntime/model degrades to the plain repeat instead of failing the run.
+        self._frozen_action_enabled = FROZEN_ACTION
+        self._encoder = None
+        self._encoder_failed = False
+        self._frozen_ticks = 0
         self._wbc_started = False
         self._last_observation_at = None
         self._last_observation_lock = threading.Lock()
@@ -2588,6 +2635,55 @@ class RTCWebSocketClient:
             raise ValueError("action contains NaN or Inf")
         return np.asarray(action, dtype=np.float32)
 
+    def _freeze_action(self, action):
+        """Replace a starved repeat-last action's body token with a hold-in-place one.
+
+        `action` is the server layout [hand(14) | body_token(64) | neck(2)]. Only the
+        body token is recomputed -- from the CURRENT measured pose, so the WBC is told
+        "stay here" instead of re-driving a token from a plan that has already moved on.
+        Hand and neck keep their last commanded values, matching psix_sonic_client.
+
+        Returns the substituted action, or the input unchanged when anything needed is
+        missing (no encoder, no robot state) -- degrading to the previous repeat-last.
+        """
+        if self._encoder_failed:
+            return action
+        if self._encoder is None:
+            try:
+                from encoder_client import EncoderClient
+                self._encoder = EncoderClient(ENCODER_MODEL, mode=0)
+                print(f"[frozen] encoder loaded from {ENCODER_MODEL}", flush=True)
+            except Exception as exc:
+                self._encoder_failed = True
+                print(f"[frozen] WARNING: encoder unavailable ({type(exc).__name__}: {exc}); "
+                      f"falling back to plain repeat-last", flush=True)
+                return action
+        try:
+            state = self._state_sub.get_state()
+            if state is None:
+                return action
+            qpos = _mujoco29_to_isaaclab29(state["body_q_measured"])          # (29,)
+            base_quat = np.asarray(state["base_quat_measured"], dtype=np.float32)  # (4,) wxyz
+            joint_pos = np.tile(qpos, (10, 1)).astype(np.float32)             # (10,29)
+            joint_vel = np.zeros((10, 29), dtype=np.float32)
+            body_quat = np.tile(base_quat, (10, 1)).astype(np.float32)        # (10,4)
+            enc_token = np.asarray(
+                self._encoder.encode(joint_pos, joint_vel, body_quat), dtype=np.float32
+            ).reshape(-1)
+            if enc_token.shape != (TOKEN_DIM,) or not np.isfinite(enc_token).all():
+                return action
+            frozen = np.array(action, dtype=np.float32, copy=True)
+            frozen[HAND_DIM:HAND_DIM + TOKEN_DIM] = enc_token
+            self._frozen_ticks += 1
+            if self._frozen_ticks == 1 or self._frozen_ticks % 30 == 0:
+                print(f"[frozen] holding pose via encoder token "
+                      f"({self._frozen_ticks} starved ticks so far)", flush=True)
+            return frozen
+        except Exception as exc:
+            print(f"[frozen] WARNING: freeze failed ({type(exc).__name__}: {exc}); "
+                  f"using repeat-last", flush=True)
+            return action
+
     def execute_action(self, action):
         """
         Map the server action -> robot command and publish via Protocol v4.
@@ -2985,6 +3081,13 @@ class RTCWebSocketClient:
                         return
                     if not self._dry_run:
                         self._ensure_wbc_started()
+                    # Starved tick: the server is replaying the last action because
+                    # its chunk ran dry. Substitute a hold-in-place body token rather
+                    # than re-driving a stale one (matters most under rtc_mode=off,
+                    # which starves at every chunk boundary).
+                    if (self._frozen_action_enabled
+                            and data.get("rtc_repeat_last") is True):
+                        action = self._freeze_action(action[0])[None, :]
                     self.execute_action(action)
                     self._record_action_accepted(now)
 
@@ -3477,6 +3580,15 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
                     raise SystemExit(msg + " Aborting (--neck-reset-on-fail=abort).")
                 print(msg, flush=True)
 
+            # Let the head come to rest before the rollout starts. Converged only
+            # means the encoder entered the tolerance band; the board's EMA is
+            # still settling the last command out, so the policy would otherwise
+            # take its first observations from a head that is still drifting.
+            if NECK_RESET_SETTLE > 0:
+                print(f"[neck-reset] settling {NECK_RESET_SETTLE:.1f}s before start",
+                      flush=True)
+                time.sleep(NECK_RESET_SETTLE)
+
     incident_recorder = IncidentRecorder(run_dir)
     vla_info = _fetch_json(
         server_url.replace("ws://", "http://").replace("/ws", "/info"))
@@ -3824,9 +3936,23 @@ if __name__ == "__main__":
     parser.add_argument("--neck-reset-tol", type=float, default=0.02,
                         help="Convergence band in rad on both axes (default: 0.02)")
     parser.add_argument("--neck-reset-on-fail", choices=("warn", "abort"), default="warn",
-                        help="If the neck never reaches home: warn and continue, or abort. "
-                             "'abort' is the safe choice for scripted comparison runs, where "
-                             "a rollout that starts from the wrong head pose is wasted.")
+                        help="If the neck never reaches home: warn and continue (default), "
+                             "or abort.")
+    parser.add_argument("--frozen-action", dest="frozen_action", action="store_true",
+                        default=True,
+                        help="On a starved tick (server flags rtc_repeat_last), publish a "
+                             "body token re-encoded from the CURRENT measured pose instead "
+                             "of replaying the stale one; hand/neck keep their last values. "
+                             "Default on. Matters most under rtc_mode=off, which has no "
+                             "continuity mechanism and starves at every chunk boundary.")
+    parser.add_argument("--no-frozen-action", dest="frozen_action", action="store_false",
+                        help="Replay the last action verbatim on starved ticks (legacy).")
+    parser.add_argument("--neck-reset-settle", type=float, default=5.0,
+                        help="Seconds to wait after homing before the rollout starts "
+                             "(default: 5.0). Convergence is read off the encoder, but "
+                             "NeckMotor's on-board EMA is still smoothing the last command "
+                             "out, so without this the first observations come from a head "
+                             "that is still drifting. 0 disables the wait.")
     args = parser.parse_args()
 
     apply_runtime_flags(args)
