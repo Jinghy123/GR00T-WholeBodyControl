@@ -8,7 +8,7 @@ to the WBC controller via ZMQ at the original recording frequency (30 Hz).
 The message format mirrors WBCBridge.publish_joints() in psi-inference_rtc.py:
   - joint_pos  (1, 29) float32  ← qpos from recording
   - joint_vel  (1, 29) float32  ← zeros
-  - body_quat  (1,  4) float32  ← q_robot_init * q_rel  (sign-continuity corrected)
+  - body_quat  (1,  4) float32  ← recorded quat, sent as-is (sign-continuity corrected)
   - frame_index (1,)   int64
 
 Usage:
@@ -17,7 +17,8 @@ Usage:
 """
 
 # ── Hard-coded defaults (edit these instead of passing CLI args) ───────────────
-DEFAULT_EPISODE_DIR    = "/home/xiawei/data/demonstration_2026-04-06_15-56-18/episode_1"
+DEFAULT_EPISODE_DIR    = "/home/hongyi/data/real/pick_place/pick_place_1/episode_45"
+# DEFAULT_EPISODE_DIR = "/home/hongyi/data/real/pick_cloth/pick_cloth_4/episode_69"
 DEFAULT_WBC_STATE_HOST  = "localhost"   # host where g1_deploy_onnx_ref runs
 DEFAULT_WBC_STATE_PORT  = 5557          # WBC state publisher port
 DEFAULT_WBC_STATE_TOPIC = "g1_debug"    # WBC state topic
@@ -45,6 +46,12 @@ def _quat_mul(q1, q2):
         w1*y2 - x1*z2 + y1*w2 + z1*x2,
         w1*z2 + x1*y2 - y1*x2 + z1*w2,
     ], dtype=np.float32)
+
+
+def _quat_conj(q):
+    """Conjugate (= inverse for unit quat), [w, x, y, z]."""
+    w, x, y, z = q
+    return np.array([w, -x, -y, -z], dtype=np.float32)
 
 
 def read_robot_quat_from_wbc(host, port, topic):
@@ -91,14 +98,31 @@ def read_robot_quat_from_wbc(host, port, topic):
 
 
 # ── Import pack_pose_message / build_command_message from GR00T repo ──────────
-_GROOT_ROOT = os.path.expanduser(
-    "~/hongyi/Unitree_Robotics/GR00T-WholeBodyControl"
-)
+# Repo root is two levels up from this file (orchestration/<name>/replay.py).
+_GROOT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, _GROOT_ROOT)
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
     build_command_message,
     pack_pose_message,
 )
+
+# ── Dex3 hands ────────────────────────────────────────────────────────────────
+# The recording already stores native Dex3 joints: hand_joints (14,) =
+# left(7) + right(7), recorded by g1_data_server. No conversion needed.
+
+def extract_hand_joints(frame, source="action"):
+    """Return (left7, right7) Dex3 joint arrays, or None if no hand data."""
+    entry = frame.get("actions" if source == "action" else "states")
+    if entry is None:
+        return None
+    hand14 = entry.get("hand_joints")
+    if hand14 is None:
+        return None
+    hand14 = np.asarray(hand14, dtype=np.float32)
+    if hand14.shape[0] != 14:
+        return None
+    return hand14[:7], hand14[7:]
+
 
 _MUJOCO_TO_ISAACLAB_DOF = np.array(
     [0, 6, 12, 1, 7, 13, 2, 8, 14, 3, 9, 15, 22, 4, 10, 16, 23, 5, 11, 17, 24, 18, 25, 19, 26, 20, 27, 21, 28],
@@ -124,13 +148,17 @@ class WBCBridge:
         self._socket.send(msg)
         print(f"[WBCBridge] Command: start={start} stop={stop} planner={planner}")
 
-    def publish_joints(self, joint_pos, body_quat):
+    def publish_joints(self, joint_pos, body_quat, left_hand=None, right_hand=None):
         pose_data = {
             "joint_pos":   joint_pos.astype(np.float32).reshape(1, 29),
             "joint_vel":   np.zeros((1, 29), dtype=np.float32),
             "body_quat":   body_quat.astype(np.float32).reshape(1, 4),
             "frame_index": np.array([self._frame_index], dtype=np.int64),
         }
+        if left_hand is not None:
+            pose_data["left_hand_joints"] = np.asarray(left_hand, dtype=np.float32).reshape(1, 7)
+        if right_hand is not None:
+            pose_data["right_hand_joints"] = np.asarray(right_hand, dtype=np.float32).reshape(1, 7)
         msg = pack_pose_message(pose_data, topic=self._topic, version=1)
         self._socket.send(msg)
         self._frame_index += 1
@@ -142,24 +170,28 @@ class WBCBridge:
 
 # ── Replay logic ──────────────────────────────────────────────────────────────
 
-def load_episode(episode_dir):
-    """Load episode from data.json (supports both old and new formats)."""
-    json_path = os.path.join(episode_dir, "data.json")
+def load_episode(episode_path):
+    """Load episode frames.
+
+    `episode_path` can be either a directory containing data.json, or a direct
+    path to a json file (e.g. episode_000_data.json in the Unifolm format).
+    """
+    if os.path.isdir(episode_path):
+        json_path = os.path.join(episode_path, "data.json")
+    else:
+        json_path = episode_path
     if not os.path.exists(json_path):
-        raise FileNotFoundError(f"data.json not found in {episode_dir}")
+        raise FileNotFoundError(f"episode json not found: {json_path}")
 
     with open(json_path, "r") as f:
         data = json.load(f)
 
-    # Support both old and new formats
     if isinstance(data, list):
-        # New format: direct list of dict
         frames = data
-        frequency = 30  # default frequency
+        frequency = 30
     elif isinstance(data, dict) and "frames" in data:
-        # Old format: nested in "frames" key
         frames = data["frames"]
-        frequency = data.get("frequency", 30)
+        frequency = data.get("fps", data.get("frequency", 30))
     else:
         raise ValueError(f"Unknown data format in {json_path}")
 
@@ -167,19 +199,41 @@ def load_episode(episode_dir):
     return frames, frequency
 
 
+def extract_qpos_quat(frame, source="action"):
+    """Extract (qpos29_mujoco, quat_wxyz) from a frame, or None if missing.
+
+    Format: frame["states"/"actions"]["qpos"] (29, MuJoCo order); quat (4) is
+    stored only in states (relative to recording start).
+
+    `source` selects "action" (target values) or "state" (measured values).
+    """
+    states = frame.get("states")
+    actions = frame.get("actions")
+    if source == "mixed":
+        # Legs from action (measured stride is attenuated by tracking loss →
+        # replaying it drags the feet); waist + arms from state (actions.qpos is
+        # the motor target incl. gravity compensation → replaying it overshoots).
+        if states is None or actions is None:
+            return None
+        qpos = np.asarray(states["qpos"], dtype=np.float32).copy()
+        qpos[:12] = np.asarray(actions["qpos"], dtype=np.float32)[:12]  # mujoco order: legs = 0-11
+    else:
+        entry = actions if source == "action" else states
+        if entry is None:
+            return None
+        qpos = np.asarray(entry["qpos"], dtype=np.float32)
+    quat_src = states if states is not None else actions
+    quat = np.asarray(quat_src["quat"], dtype=np.float32)
+    return qpos, quat
+
+
 def replay(episode_dir, zmq_host, zmq_pub_port, zmq_topic,
-           wbc_state_host, wbc_state_port, wbc_state_topic, dry_run=False):
+           wbc_state_host, wbc_state_port, wbc_state_topic,
+           source="action", send_hands=True, dry_run=False):
     frames, frequency = load_episode(episode_dir)
     dt = 1.0 / frequency
-
-    # Read q_robot_init from the WBC's own state publisher.
-    # This ensures the sign of q_robot_init matches the WBC's internal base_quat,
-    # avoiding the double-cover mismatch that happens with a separate hardware read.
-    if not dry_run:
-        q_robot_init = read_robot_quat_from_wbc(wbc_state_host, wbc_state_port, wbc_state_topic)
-    else:
-        q_robot_init = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-        print("[Replay] Dry-run: using identity as q_robot_init.")
+    print(f"[Replay] Using '{source}' joint targets; sending recorded quat as-is; "
+          f"hands {'on' if send_hands else 'off'}")
 
     bridge = WBCBridge(host="*", port=zmq_pub_port, topic=zmq_topic)
 
@@ -193,58 +247,55 @@ def replay(episode_dir, zmq_host, zmq_pub_port, zmq_topic,
 
     print(f"[Replay] Starting replay of {len(frames)} frames...")
 
-    prev_quat = q_robot_init.copy()  # for sign-continuity check
+    prev_quat = None  # for sign-continuity check
     last_qpos_isaac = None
     last_quat = None
+    last_left_hand = None
+    last_right_hand = None
 
     try:
         for i, frame in enumerate(frames):
             t0 = time.perf_counter()
 
-            states = frame.get("states")
-            actions = frame.get("actions")
-            if states is None:
-                print(f"[Replay] Frame {i} has no states, skipping")
+            extracted = extract_qpos_quat(frame, source=source)
+            if extracted is None:
+                print(f"[Replay] Frame {i}: missing {source} data, skipping")
                 continue
+            qpos, quat = extracted
 
-            if actions is None:
-                print(f"[Replay] Frame {i} has no actions, skipping")
-                continue
-
-            qpos = np.array(states["qpos"], dtype=np.float32)   # (29,)
-            q_rel = np.array(states["quat"], dtype=np.float32)  # (4,) relative to recording start
-
-            qpos_tgt = np.array(actions["qpos"], dtype=np.float32)
+            left_hand = right_hand = None
+            if send_hands:
+                # Hands always replay the commanded action: hand targets go straight
+                # to Dex3 (no tracking policy in between, so no double-compensation),
+                # and measured finger positions under-close when blocked by objects.
+                hands = extract_hand_joints(frame, source="action")
+                if hands is None:
+                    hands = extract_hand_joints(frame, source="state")
+                if hands is not None:
+                    left_hand, right_hand = hands
 
             qpos_isaac = _mujoco29_to_isaaclab29(qpos)
-            qpos_tgt_isaac = _mujoco29_to_isaaclab29(qpos_tgt)
 
             if qpos_isaac.shape[0] != 29:
                 print(f"[Replay] Frame {i}: unexpected qpos shape {qpos_isaac.shape}, skipping")
                 continue
 
-            # Compose: absolute_quat = q_robot_init * q_rel
-            # q_rel encodes the rotation delta relative to the recording's first frame.
+            # Send the recorded quat as-is (no re-referencing / composition).
+            quat = quat / np.linalg.norm(quat)
 
-            quat = _quat_mul(q_robot_init, q_rel)
-
-            # quat = _quat_mul(q_robot_init, q_rel_tgt) 
-
-            # Sign-continuity fix: q_rel can absorb a sign flip from the recording's
-            # IMU (both q and -q represent the same rotation).  Without this fix the
-            # composed quat can jump to -prev_quat, which the WBC interprets as a
-            # 180-degree error and tries to spin the robot to correct it.
-            if np.dot(quat, prev_quat) < 0:
+            # Sign-continuity fix: both q and -q represent the same rotation, but a
+            # sign flip between consecutive frames would look like a 180-degree jump.
+            if prev_quat is not None and np.dot(quat, prev_quat) < 0:
                 quat = -quat
             prev_quat = quat.copy()
 
             last_qpos_isaac = qpos_isaac
-            # last_qpos_isaac = qpos_tgt_isaac
             last_quat = quat
+            last_left_hand = left_hand
+            last_right_hand = right_hand
 
             if not dry_run:
-                bridge.publish_joints(qpos_isaac, quat)
-                # bridge.publish_joints(qpos_tgt_isaac, quat)
+                bridge.publish_joints(qpos_isaac, quat, left_hand, right_hand)
 
             elapsed = (i + 1) / frequency
             print(f"[Replay] Frame {i+1:5d}/{len(frames)}  t={elapsed:.2f}s", end="\r")
@@ -268,7 +319,8 @@ def replay(episode_dir, zmq_host, zmq_pub_port, zmq_topic,
         try:
             while True:
                 t0 = time.perf_counter()
-                bridge.publish_joints(last_qpos_isaac, last_quat)
+                bridge.publish_joints(last_qpos_isaac, last_quat,
+                                      last_left_hand, last_right_hand)
                 sleep_t = dt - (time.perf_counter() - t0)
                 if sleep_t > 0:
                     time.sleep(sleep_t)
@@ -288,7 +340,21 @@ def main():
         "--episode-dir",
         type=str,
         default=DEFAULT_EPISODE_DIR,
-        help=f"Path to episode directory containing data.json (default: {DEFAULT_EPISODE_DIR})",
+        help=f"Path to episode dir containing data.json, or direct json file (default: {DEFAULT_EPISODE_DIR})",
+    )
+    # Trade-off between sources (joint order is identical, verified):
+    #   state  = measured trajectory (default) — actions.qpos is the raw motor
+    #            target incl. gravity/impedance compensation and replays badly
+    #   action = motor targets (arms overshoot upward ~0.3 rad at shoulders)
+    #   mixed  = legs from action, waist+arms from state
+    parser.add_argument(
+        "--source", type=str, choices=["action", "state", "mixed"], default="state",
+        help="qpos source: state (measured, default), action (motor targets), "
+             "or mixed (legs from action, waist+arms from state)",
+    )
+    parser.add_argument(
+        "--no-hands", action="store_true",
+        help="Do not send the recorded Dex3 hand_joints",
     )
     parser.add_argument(
         "--zmq-host", type=str, default="*",
@@ -328,6 +394,8 @@ def main():
         wbc_state_host=args.wbc_state_host,
         wbc_state_port=args.wbc_state_port,
         wbc_state_topic=args.wbc_state_topic,
+        source=args.source,
+        send_hands=not args.no_hands,
         dry_run=args.dry_run,
     )
 
