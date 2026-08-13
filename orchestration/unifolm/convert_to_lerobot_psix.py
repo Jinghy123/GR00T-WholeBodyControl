@@ -88,6 +88,25 @@ BODY_TOKEN_DIM = 64
 EMBODIMENT_TAG = "psix_he_g1_sonic"  # body tokens present → sonic tag
 TASK_CATEGORY = "Unifolm"
 
+# Curated prompts: the Dex3 datasets' tasks.parquet strings are terse shorthands
+# ("stack three block", "pour water"); these come from each dataset README's
+# Task Objective. Datasets not listed here use their tasks.parquet string.
+TASK_DESCRIPTION_OVERRIDES = {
+    "G1_Dex3_BlockStacking_Dataset":
+        "Stack the three cubic blocks on the desktop from bottom to top in the "
+        "order of red, yellow, and blue on the black tape affixed to the desktop.",
+    "G1_Dex3_CameraPackaging_Dataset":
+        "Place the RealSense D-405 camera into the mounting case and secure the lid.",
+    "G1_Dex3_ObjectPlacement_Dataset":
+        "Pick up the toothpaste and trash bag on the desk, and place them into "
+        "the blue storage container.",
+    "G1_Dex3_Pouring_Dataset":
+        "Take the water bottle and simulate pouring water into a transparent glass cup.",
+    "G1_Dex3_ToastedBread_Dataset":
+        "Place the bread from the serving tray into the toaster. After the bread "
+        "is toasted, hand the toast to the human.",
+}
+
 # Source camera → egocentric, first present wins (per-dataset):
 #   head_stereo_left: WBT Brainco/Inspire; cam_left_high: Dex3; cam_0: MainCamOnly
 SRC_VIDEO_KEYS = [
@@ -581,7 +600,7 @@ def main() -> None:
         profile = detect_profile(ds_dir, info)
         family = "brainco" if profile == "wbt_brainco" else "inspire"
         src_video_key = pick_video_key(info)
-        task_description = read_task_string(ds_dir)
+        task_description = TASK_DESCRIPTION_OVERRIDES.get(ds_dir.name) or read_task_string(ds_dir)
         tasks_rows.append({
             "task_index": task_index, "task": ds_dir.name,
             "category": TASK_CATEGORY, "description": task_description,
