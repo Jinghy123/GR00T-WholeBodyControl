@@ -205,3 +205,4 @@ hlpwm_logs/
 eval-*
 .evals
 .data
+.rollout

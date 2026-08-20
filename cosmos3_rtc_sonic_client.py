@@ -29,9 +29,13 @@ Server (workstation, fastest path):
 Client (this file, robot-side host):
     python cosmos3_rtc_sonic_client.py --host <server-ip> --port 8000 \
         --instruction "Pick up the eggplant and place it in the basket."
+
+Add --record-lerobot to save the run as a LeRobot v2.0 eval episode (same recorder
+and dataset layout as psi_rtc_sonic_client.py; see lerobot_eval_recorder.py).
 """
 
 import os
+import re
 import sys
 import time
 import threading
@@ -44,13 +48,25 @@ import zmq
 import msgpack
 from websocket import WebSocketApp
 
+from lerobot_eval_recorder import (
+    DEFAULT_SRC_DATASET,
+    EvalDatasetRecorder,
+    dataset_action,
+    dataset_state,
+)
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
     pack_pose_message,
     build_command_message,
 )
 
 # ---------------- Configuration ----------------
-TASK_INSTRUCTION = "pick up the gray hippo toy and place it into the wooden box"
+# TASK_INSTRUCTION = "pick up the gray hippo toy and place it into the wooden box"
+
+# TASK_INSTRUCTION = "pick up the gray hippo toy and place it into the orange bowl"
+# TASK_INSTRUCTION = "pick up the banana and place it into the wooden box"
+# TASK_INSTRUCTION = "Pick up the eggplant and place it in the basket."
+TASK_INSTRUCTION = "pick up the green grapes and place it into the green bowl"
+
 
 # cosmos3 embodiment domain -> action head + (de)normalization stats on the server.
 #   g1_sonic_neck_zedmini / g1_sonic_neck_realsense: 80-D, neck active, 45-D state
@@ -81,12 +97,35 @@ DEFAULT_NECK_PUB_PORT = 5570
 # JSON `[yaw_rad, pitch_rad]` of the Dynamixel present-position read each tick.
 DEFAULT_NECK_STATE_ZMQ = "tcp://192.168.123.164:5560"
 
+PAD_IMAGE_MULTIPLE = 16
+_pad_logged = False
+
+def pad_to_train_height(frame):
+    """Pad the bottom with black rows so the height is a multiple of 16."""
+    global _pad_logged
+    if frame is None or not PAD_IMAGE_MULTIPLE:
+        return frame
+    h, w = frame.shape[:2]
+    pad = (-h) % PAD_IMAGE_MULTIPLE
+    if pad == 0:
+        return frame
+    if not _pad_logged:
+        print(f"[client] padding camera frames {w}x{h} -> {w}x{h + pad} "
+              f"({pad} black rows at the bottom, as in the training videos)")
+        _pad_logged = True
+    return cv2.copyMakeBorder(frame, 0, pad, 0, 0, cv2.BORDER_CONSTANT, value=0)
 
 def fsq_quantize(continuous_value, fsq_min=FSQ_MIN, fsq_max=FSQ_MAX, fsq_step=FSQ_STEP):
     clipped = np.clip(continuous_value, fsq_min, fsq_max)
     quantized = np.round(clipped / fsq_step) * fsq_step
     quantized = np.clip(quantized, fsq_min, fsq_max)
     return quantized
+
+def _task_slug(instruction, max_len=64):
+    """Filesystem-safe folder name derived from the task instruction."""
+    slug = re.sub(r"[^a-z0-9]+", "-", (instruction or "task").lower()).strip("-")
+    return (slug[:max_len].rstrip("-") or "task")
+
 
 # ---------------- Serialization utilities ----------------
 # Same "__numpy__" base64 wire format as cosmos_framework/rtc/helpers.py.
@@ -312,7 +351,8 @@ running.set()
 class RTCWebSocketClient:
     def __init__(self, server_url, state_subscriber, camera, token_publisher,
                  domain_name=DEFAULT_DOMAIN, target_hz=30.0,
-                 include_neck=False, neck_publisher=None, neck_state_reader=None):
+                 include_neck=False, neck_publisher=None, neck_state_reader=None,
+                 recorder=None):
         self.server_url = server_url
         self._running = True
         self._connected = threading.Event()
@@ -331,6 +371,12 @@ class RTCWebSocketClient:
         # First frame of a connection carries history={"reset": True}: the cosmos3
         # server (re)seeds its image/state history windows and starts the control loop.
         self._sent_first = False
+        # Newest observation the send thread built, consumed by execute_action so each
+        # recorded row is (what the policy saw, what it did) rather than two independently
+        # sampled streams. Held under a lock: written by the send thread, read by the ws one.
+        self._recorder = recorder
+        self._obs_lock = threading.Lock()
+        self._latest_obs = None
 
     def execute_action(self, action):
         """
@@ -350,9 +396,21 @@ class RTCWebSocketClient:
         action_out = np.concatenate([token_qtz, hand_joints])
         self._token_publisher.publish_token(action_out)
 
-        if self._include_neck and self._neck_publisher is not None:
-            neck = action[TOKEN_DIM + HAND_DIM:TOKEN_DIM + HAND_DIM + NECK_DIM]
+        neck = (action[TOKEN_DIM + HAND_DIM:TOKEN_DIM + HAND_DIM + NECK_DIM]
+                if self._include_neck else None)
+        if neck is not None and self._neck_publisher is not None:
             self._neck_publisher.publish(neck[0], neck[1])
+
+        # Record after publishing, so nothing sits between the action and the wire.
+        if self._recorder is not None:
+            with self._obs_lock:
+                obs = self._latest_obs
+            if obs is not None:
+                frame_bgr, state = obs
+                # Dataset layout, not the server's: hand + neck + token, with the
+                # QUANTIZED token, i.e. exactly what the robot executed.
+                self._recorder.add_frame(
+                    frame_bgr, state, dataset_action(hand_joints, token_qtz, neck))
 
     def _on_open(self, ws):
         print("[client] Connected!")
@@ -431,7 +489,8 @@ class RTCWebSocketClient:
                 leg_states = body_q[:15]    # base/leg
                 arm_states = body_q[15:29]  # arm
                 states = np.concatenate(
-                    (left_hand_states, right_hand_states, arm_states, leg_states), axis=0
+                    # (left_hand_states, right_hand_states, arm_states, leg_states), axis=0
+                    (leg_states, arm_states, left_hand_states, right_hand_states), axis=0
                 )  # (43,)
 
                 if self._include_neck:
@@ -445,10 +504,26 @@ class RTCWebSocketClient:
 
                 # Get camera frame
                 frame = self._camera.get_frame()
+                frame = pad_to_train_height(frame)      # what the policy was trained on
+                
                 if frame is None:
                     print("[client] No camera frame, retrying...")
                     time.sleep(0.05)
                     continue
+
+                if self._recorder is not None:
+                    # Keep the BGR frame (pre-cvtColor: that is what cv2.imwrite wants) and
+                    # rebuild the state in the DATASET's order from the same raw fields,
+                    # instead of un-permuting the model-order vector above.
+                    # It is the PADDED frame, so the recording is pixel-for-pixel what the
+                    # policy saw; the recorder derives info.json's shape from it.
+                    with self._obs_lock:
+                        self._latest_obs = (
+                            frame.copy(),
+                            dataset_state(body_q, left_hand_states, right_hand_states,
+                                          neck_state if self._include_neck else None),
+                        )
+
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 frame = np.ascontiguousarray(frame.astype(np.uint8))
 
@@ -513,7 +588,8 @@ class RTCWebSocketClient:
 def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_topic,
          camera_address, domain_name=DEFAULT_DOMAIN, target_hz=30.0, include_neck=False,
          neck_pub_host=DEFAULT_NECK_PUB_HOST, neck_pub_port=DEFAULT_NECK_PUB_PORT,
-         neck_state_zmq=DEFAULT_NECK_STATE_ZMQ):
+         neck_state_zmq=DEFAULT_NECK_STATE_ZMQ, record_lerobot=False,
+         lerobot_root=None, lerobot_src=DEFAULT_SRC_DATASET):
     print("[MAIN] Initializing components...")
 
     # 1. Initialize token publisher (ZMQ PUB, Protocol v4)
@@ -536,6 +612,13 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
         neck_state_reader = NeckStateReader(neck_state_zmq)
         print(f"[MAIN] Neck publisher bound on {neck_pub_host}:{neck_pub_port}, "
               f"state reader connected to {neck_state_zmq}")
+
+    # 3c. Eval dataset recorder (one LeRobot episode per client run).
+    recorder = None
+    if record_lerobot:
+        root = lerobot_root or os.path.join(
+            ".rollout", "cosmos3", f"{_task_slug(TASK_INSTRUCTION)}_{time.strftime('%y%m%d-%H%M%S')}")
+        recorder = EvalDatasetRecorder(root, task=TASK_INSTRUCTION, src_dataset=lerobot_src)
 
     # 4. Wait briefly for ZMQ PUB socket to establish connections
     time.sleep(1.0)
@@ -567,6 +650,7 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
         include_neck=include_neck,
         neck_publisher=neck_publisher,
         neck_state_reader=neck_state_reader,
+        recorder=recorder,
     )
 
     def websocket_thread():
@@ -602,6 +686,13 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
         token_publisher.send_command(start=False, stop=True, planner=True)
     except Exception as e:
         print(f"[MAIN] Error sending stop command: {e}")
+
+    # Encode + write the episode. Never let a recording failure mask the shutdown path.
+    if recorder is not None:
+        try:
+            recorder.close()
+        except Exception as e:
+            print(f"[MAIN] Error saving eval dataset: {e}")
 
     state_sub.stop()
     token_publisher.stop()
@@ -652,6 +743,15 @@ if __name__ == "__main__":
                         help=f"Neck PUB port (default: {DEFAULT_NECK_PUB_PORT})")
     parser.add_argument("--neck-state-zmq", type=str, default=DEFAULT_NECK_STATE_ZMQ,
                         help=f"Neck-state SUB address (default: {DEFAULT_NECK_STATE_ZMQ})")
+    parser.add_argument("--record-lerobot", action="store_true",
+                        help="Record this evaluation as a LeRobot v2.0 dataset laid out like "
+                             "g1_sonic_lerobot_0810_merged_val, with meta/stats*.json copied "
+                             "from --lerobot-src so normalization matches training.")
+    parser.add_argument("--lerobot-root", type=str, default=None,
+                        help="Dataset root (default: .eval_datasets/<task>_<timestamp>). Point "
+                             "several runs at the same root to collect them as episodes.")
+    parser.add_argument("--lerobot-src", type=str, default=DEFAULT_SRC_DATASET,
+                        help=f"Dataset to copy meta/stats*.json from (default: {DEFAULT_SRC_DATASET})")
 
     args = parser.parse_args()
 
@@ -685,4 +785,7 @@ if __name__ == "__main__":
         neck_pub_host=args.neck_pub_host,
         neck_pub_port=args.neck_pub_port,
         neck_state_zmq=args.neck_state_zmq,
+        record_lerobot=args.record_lerobot,
+        lerobot_root=args.lerobot_root,
+        lerobot_src=args.lerobot_src,
     )

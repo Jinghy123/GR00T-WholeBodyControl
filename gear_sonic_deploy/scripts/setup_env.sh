@@ -311,6 +311,16 @@ else
     fi
 fi
 
+# Re-prioritize TensorRT over any TensorRT shipped inside the CUDA toolkit.
+# The CUDA section above prepends $CUDAToolkit_ROOT/lib64, which on some installs
+# contains an older libnvinfer.so.10 that shadows $TensorRT_ROOT/lib. Loading a
+# different TensorRT than the one we linked against makes serialized .trt engines
+# fail with "Version tag does not match".
+if [ -n "$TensorRT_ROOT" ] && [ -d "$TensorRT_ROOT/lib" ]; then
+    export LD_LIBRARY_PATH="$TensorRT_ROOT/lib:$LD_LIBRARY_PATH"
+    echo "✅ TensorRT libraries prioritized: $TensorRT_ROOT/lib"
+fi
+
 # Add ONNX Runtime to library path if not already there
 if [ -d "/opt/onnxruntime/lib" ]; then
     export LD_LIBRARY_PATH="/opt/onnxruntime/lib:$LD_LIBRARY_PATH"
