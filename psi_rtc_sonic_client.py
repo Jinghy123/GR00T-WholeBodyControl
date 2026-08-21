@@ -1,3 +1,34 @@
+"""RTC client that drives Sonic from a served psi0 checkpoint.
+
+Uploading recorded rollouts
+---------------------------
+Episodes accumulate under `.rollout/psi0/<task-slug>_<stamp>/`. To publish them
+to the shared Hub dataset (arguments are positional -- `repo_id local_path
+path_in_repo`, not a URL):
+
+    hf upload Psi-X-share/data .rollout rollout --repo-type=dataset
+
+This is incremental. Before sending anything the client hashes every local file
+and asks the Hub which it already has (LFS blobs are deduped by sha256, small
+files by git blob hash); matches are skipped, so re-running after adding new
+episodes only uploads the new ones. Caveats:
+
+  - Every file is still walked and hashed each run, so start-up cost scales with
+    the whole tree, not with the delta.
+  - The whole upload lands in one commit at the end. A run killed midway commits
+    nothing, but the LFS blobs that did land are deduped on retry.
+  - Files deleted locally are not removed on the Hub unless `--delete "*"`.
+
+Once this tree grows past a few tens of GB, switch to the resumable variant,
+which records per-file upload state in `.cache/huggingface/` inside the folder
+and splits the work over many small commits:
+
+    hf upload-large-folder Psi-X-share/data .rollout --repo-type=dataset
+
+It always targets the repo root (no `path_in_repo`), so lay the local folder out
+to match the paths you want on the Hub.
+"""
+
 import os
 import re
 import sys
@@ -48,12 +79,31 @@ from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
 # TASK_INSTRUCTION = "pick up the banana and place it into the wooden box"
 # TASK_INSTRUCTION = "pick up the green grapes and place it into the green bowl"
 # TASK_INSTRUCTION = "gather up the yellow shirt and turn right and put it into the laundry basket"
-# TASK_INSTRUCTION = "grasp the backrest of the chair and push it straight under the table"
 
-TASK_INSTRUCTION = "kneel down, hook the beige shoes on the first tier of the shoe rack, turn around, kneel down again, and place them at the foot of the bed"
+# TASK_INSTRUCTION = "grasp the backrest of the chair and push it straight under the table"
+# TASK_INSTRUCTION = "grasp the backrest of the chair, turn left, and push it under the table"
+# TASK_INSTRUCTION = "grasp the backrest of the chair, turn right, and push it under the table"
+
+# TASK_INSTRUCTION = "pick up the foil bag and turn left and throw it into the trash can"
+# TASK_INSTRUCTION = "pick up the red snack box and turn left and throw it into the trash can"
+# TASK_INSTRUCTION = "pick up the snack bag and turn left and throw it into the trash can"
+# TASK_INSTRUCTION = "pick up the paper ball and turn left and throw it into the trash can"
+# TASK_INSTRUCTION = "pick up the snack bag and turn right and throw it into the trash can"
+# TASK_INSTRUCTION = "pick up the red snack box and turn right and throw it into the trash can"
+# TASK_INSTRUCTION = "pick up the foil bag and turn right and throw it into the trash can"
+# TASK_INSTRUCTION = "pick up the paper ball and turn right and throw it into the trash can"
+
+# TASK_INSTRUCTION = "kneel down, hook the beige shoes on the first tier of the shoe rack, turn around, kneel down again, and place them at the foot of the bed"
 
 # TASK_INSTRUCTION = "pick up the foil bag and turn left and throw it into the trash can"
 # TASK_INSTRUCTION = "pick up the snack bag and turn left and throw it into the trash can"
+
+# TASK_INSTRUCTION = "kneel down, hook the beige shoes on the first tier of the shoe rack, turn around, kneel down again, and place them at the foot of the bed"
+# TASK_INSTRUCTION = "kneel down, hook the purple shoes on the first tier of the shoe rack, turn around, kneel down again, and place them at the foot of the bed"
+TASK_INSTRUCTION = "kneel down, hook the white shoes on the first tier of the shoe rack, turn around, kneel down again, and place them at the foot of the bed"
+# TASK_INSTRUCTION = "kneel down, hook the blue shoes on the first tier of the shoe rack, turn around, kneel down again, and place them at the foot of the bed"
+
+
 
 # Must match the served checkpoint's data.transform.repack.image_keys
 IMAGE_KEY = "observation.images.head"
