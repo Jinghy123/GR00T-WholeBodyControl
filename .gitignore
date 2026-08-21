@@ -206,3 +206,4 @@ eval-*
 .evals
 .data
 .rollout
+.logs

@@ -60,13 +60,70 @@ from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
 )
 
 # ---------------- Configuration ----------------
-# TASK_INSTRUCTION = "pick up the gray hippo toy and place it into the wooden box"
 
 # TASK_INSTRUCTION = "pick up the gray hippo toy and place it into the orange bowl"
 # TASK_INSTRUCTION = "pick up the banana and place it into the wooden box"
 # TASK_INSTRUCTION = "Pick up the eggplant and place it in the basket."
-TASK_INSTRUCTION = "pick up the green grapes and place it into the green bowl"
+# TASK_INSTRUCTION = "pick up the green grapes and place it into the green bowl"
 
+# TASK_INSTRUCTION = "hold the dustpan and sweep the white paper scraps into it with the brush"
+# TASK_INSTRUCTION = "hold the dustpan and sweep the yellow and green bottle caps into it with the brush"
+# TASK_INSTRUCTION = "hold the dustpan and sweep the black plastic pieces into it with the brush"
+
+# TASK_INSTRUCTION = "grasp the backrest of the chair and push it straight under the table"
+# TASK_INSTRUCTION = "grasp the backrest of the chair, turn left, and push it under the table"
+# TASK_INSTRUCTION = "grasp the backrest of the chair, turn right, and push it under the table"
+
+# TASK_INSTRUCTION = "pick up the foil bag and turn left and throw it into the trash can"
+# TASK_INSTRUCTION = "pick up the red snack box and turn left and throw it into the trash can"
+# TASK_INSTRUCTION = "pick up the snack bag and turn left and throw it into the trash can"
+# TASK_INSTRUCTION = "pick up the paper ball and turn left and throw it into the trash can"
+# TASK_INSTRUCTION = "pick up the snack bag and turn right and throw it into the trash can"
+# TASK_INSTRUCTION = "pick up the red snack box and turn right and throw it into the trash can"
+# TASK_INSTRUCTION = "pick up the foil bag and turn right and throw it into the trash can"
+# TASK_INSTRUCTION = "pick up the paper ball and turn right and throw it into the trash can"
+
+# TASK_INSTRUCTION = "kneel down, hook the beige shoes on the first tier of the shoe rack, turn around, kneel down again, and place them at the foot of the bed"
+# TASK_INSTRUCTION = "kneel down, hook the purple shoes on the first tier of the shoe rack, turn around, kneel down again, and place them at the foot of the bed"
+# TASK_INSTRUCTION = "kneel down, hook the white shoes on the first tier of the shoe rack, turn around, kneel down again, and place them at the foot of the bed"
+# TASK_INSTRUCTION = "kneel down, hook the blue shoes on the first tier of the shoe rack, turn around, kneel down again, and place them at the foot of the bed"
+
+# TASK_INSTRUCTION = "gather up the yellow shirt and turn right and put it into the laundry basket"
+# TASK_INSTRUCTION = "gather up the gray shirt and turn right and put it into the laundry basket"
+# TASK_INSTRUCTION = "gather up the yellow shirt with right hand and turn right and put it into the laundry basket"
+# TASK_INSTRUCTION = "gather up the black trousers and turn right and put it into the laundry basket"
+# TASK_INSTRUCTION = "gather up the yellow shirt and gray shirt and turn right and put them into the laundry basket"
+# TASK_INSTRUCTION = "gather up the gray shirt with right hand and turn right and put it into the laundry basket"
+# TASK_INSTRUCTION = "gather up the gray shirt and turn right and put it into the laundry basket"
+# TASK_INSTRUCTION = "gather up the white shirt and turn right and put it into the laundry basket"
+# TASK_INSTRUCTION = "gather up the black trousers and yellow shirt and turn right and put them into the laundry basket"
+# TASK_INSTRUCTION = "gather up the yellow shirt and turn right and put it into the laundry basket"
+
+# TASK_INSTRUCTION = "kneel down and scoop up the white pillow near the bed and put it at the head of the bed"
+# TASK_INSTRUCTION = "kneel down and scoop up the beige pillow near the bed and put it at the head of the bed"
+# TASK_INSTRUCTION = "kneel down and scoop up the beige pillow near the kitchen island and turn left and put it at the head of the bed"
+# TASK_INSTRUCTION = "kneel down and scoop up the white pillow near the kitchen island and turn left and put it at the head of the bed"
+# TASK_INSTRUCTION = "kneel down and scoop up the white pillow near the shoe rack and turn around and put it at the head of the bed"
+# TASK_INSTRUCTION = "kneel down and scoop up the beige pillow near the shoe rack and turn around and put it at the head of the bed"
+# TASK_INSTRUCTION = "kneel down and scoop up the beige pillow near the shoe rack and turn around and put it at the head of the bed"
+# TASK_INSTRUCTION = "kneel down and scoop up the beige pillow near the laundry basket and turn around and put it at the head of the bed"
+# TASK_INSTRUCTION = "kneel down and scoop up the white pillow near the laundry basket and turn around and put it at the head of the bed"
+
+# TASK_INSTRUCTION = "open the top-right door of the cabinet, grab the purple flower, turn left, and place it at the top-right corner of the table"
+# TASK_INSTRUCTION = "open the top-right door of the cabinet, grab the orange flower, turn left, and place it at the top-right corner of the table"
+# TASK_INSTRUCTION = "open the top-right door of the cabinet, grab the white flower, turn left, and place it at the top-right corner of the table"
+# TASK_INSTRUCTION = "open the top-right door of the cabinet, grab the pink flower, turn left, and place it at the top-right corner of the table"
+# TASK_INSTRUCTION = "open the top-right door of the cabinet, grab the pink flower, turn left, and place it at the top-right corner of the table"
+# TASK_INSTRUCTION = "open the top-left door of the cabinet, grab the white flower, close the cabinet door, turn left, and place it at the top-right corner of the table"
+# TASK_INSTRUCTION = "open the top-left door of the cabinet, grab the pink flower, close the cabinet door, turn left, and place it at the top-right corner of the table"
+# TASK_INSTRUCTION = "open the top-left door of the cabinet, grab the purple flower, close the cabinet door, turn left, and place it at the top-right corner of the table"
+# TASK_INSTRUCTION = "open the top-left door of the cabinet, grab the orange flower, close the cabinet door, turn left, and place it at the top-right corner of the table"
+# TASK_INSTRUCTION = "open the top-left door of the cabinet, grab the orange flower, close the cabinet door, turn left, and place it at the top-right corner of the table"
+
+
+# TASK_INSTRUCTION = "grasp the yellow bottle, open the top drawer of the kitchen island, place the bottle inside, and close the drawer"
+# TASK_INSTRUCTION = "grasp the green drink bottle, open the top drawer of the kitchen island, place the bottle inside, and close the drawer"
+TASK_INSTRUCTION = "grasp the silver can, open the top drawer of the kitchen island, place the bottle inside, and close the drawer"
 
 # cosmos3 embodiment domain -> action head + (de)normalization stats on the server.
 #   g1_sonic_neck_zedmini / g1_sonic_neck_realsense: 80-D, neck active, 45-D state

@@ -44,11 +44,17 @@ from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
 # TASK_INSTRUCTION = "Walk towards the table, pick up the crumpled paper ball, and place it in the tray."
 
 # TASK_INSTRUCTION = "pick up the eggplant and place it into the transparent box"
-TASK_INSTRUCTION = "pick up the gray hippo toy and place it into the orange bowl"
+# TASK_INSTRUCTION = "pick up the gray hippo toy and place it into the orange bowl"
 # TASK_INSTRUCTION = "pick up the banana and place it into the wooden box"
 # TASK_INSTRUCTION = "pick up the green grapes and place it into the green bowl"
 # TASK_INSTRUCTION = "gather up the yellow shirt and turn right and put it into the laundry basket"
 # TASK_INSTRUCTION = "grasp the backrest of the chair and push it straight under the table"
+
+TASK_INSTRUCTION = "kneel down, hook the beige shoes on the first tier of the shoe rack, turn around, kneel down again, and place them at the foot of the bed"
+
+# TASK_INSTRUCTION = "pick up the foil bag and turn left and throw it into the trash can"
+# TASK_INSTRUCTION = "pick up the snack bag and turn left and throw it into the trash can"
+
 # Must match the served checkpoint's data.transform.repack.image_keys
 IMAGE_KEY = "observation.images.head"
 
@@ -130,7 +136,10 @@ DEFAULT_NECK_STATE_ZMQ = "tcp://192.168.123.164:5560"
 # sits directly beside the psix rollouts of the same task and both can be read
 # by one set of tools. psi0 has no WM and no prompts.json task key of its own,
 # so the key is recovered from the instruction text (see _resolve_task_key).
-DEFAULT_COMPARISON_ROOT = "/home/weiduoyuan/Desktop/psi/.logs/main_comparisons"
+DEFAULT_COMPARISON_ROOT = os.environ.get(
+    "PSI_COMPARISON_ROOT",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), ".logs", "main_comparisons"),
+)
 DEFAULT_METHOD_NAME = "psi0"
 DEFAULT_OBS_SAVE_EVERY_S = 1.0
 _GROOT_ROOT = os.path.dirname(os.path.abspath(__file__))
