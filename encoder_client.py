@@ -27,9 +27,12 @@ g1 mode (mode=0) 只填这几段，其余为零：
 
 import os
 import numpy as np
-import onnxruntime as ort
 from scipy.spatial.transform import Rotation
 import time
+
+# onnxruntime is imported lazily in EncoderClient.__init__ so that modules which
+# only need the ZMQ/wire helpers from g1_sonic_client (replay_sonic.py, for one)
+# can be imported on a machine without onnxruntime installed.
 
 
 # ── Quaternion helpers (wxyz convention) ──────────────────────────────────────
@@ -151,6 +154,8 @@ class EncoderClient:
         self._obs_dim = layout["obs_dim"]
         self._anchor_offset = layout["anchor_offset"]
         self._anchor_fn = anchor_orientation_heading_6d if layout["heading"] else anchor_orientation_6d
+
+        import onnxruntime as ort
 
         sess_opts = ort.SessionOptions()
         sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL

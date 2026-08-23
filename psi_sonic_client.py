@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import time
 import threading
@@ -24,7 +25,10 @@ from encoder_client import EncoderClient
 json_numpy.patch()
 
 # ---------------- Configuration ----------------
-TASK_INSTRUCTION = "default/pick_bottle_and_turn_and_pour_into_cup"
+# TASK_INSTRUCTION = "default/pick_bottle_and_turn_and_pour_into_cup"
+# TASK_INSTRUCTION = "grasp the backrest of the chair and push it straight under the table"
+TASK_INSTRUCTION = "pick up the banana and place it into the wooden box"
+# TASK_INSTRUCTION = "pick up the gray hippo toy and place it into the orange bowl"
 
 # FSQ configuration (must match g1_sonic_client / encoder)
 FSQ_MIN = -0.625
@@ -52,6 +56,7 @@ DEFAULT_NECK_STATE_ZMQ = "tcp://192.168.123.164:5560"
 
 # Encoder model path (for frozen token between chunks)
 ENCODER_MODEL = "gear_sonic_deploy/policy/release/model_encoder.onnx"
+IMAGE_KEY = "observation.images.head"
 
 # Joint order conversion: WBC publishes in Mujoco order, encoder expects IsaacLab order
 _MUJOCO_TO_ISAACLAB_DOF = np.array(
@@ -69,6 +74,39 @@ def fsq_quantize(continuous_value, fsq_min=FSQ_MIN, fsq_max=FSQ_MAX, fsq_step=FS
     quantized = np.round(clipped / fsq_step) * fsq_step
     quantized = np.clip(quantized, fsq_min, fsq_max)
     return quantized
+
+
+# ---------------- Initial-frame dumping ----------------
+def _task_slug(instruction, max_len=64):
+    """Filesystem-safe folder name derived from the task instruction."""
+    slug = re.sub(r"[^a-z0-9]+", "-", (instruction or "task").lower()).strip("-")
+    return (slug[:max_len].rstrip("-") or "task")
+
+
+def dump_frame_async(frame_bgr, instruction, root=".eval"):
+    """Write `frame_bgr` to .eval/<task>/<yyMMdd-hh:mm:ss>.png off the control thread.
+
+    A companion <same-name>.txt holds the full task instruction, since the folder
+    slug is lossy. Runs in a detached daemon thread and copies the frame first,
+    so the caller's real-time loop is never blocked by mkdir/PNG encoding/disk I/O.
+    """
+    frame = frame_bgr.copy()
+    out_dir = os.path.join(root, _task_slug(instruction))
+    stem = os.path.join(out_dir, time.strftime("%y%m%d-%H:%M:%S"))
+    path = stem + ".png"
+    txt_path = stem + ".txt"
+
+    def _write():
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+            cv2.imwrite(path, frame)
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write((instruction or "") + "\n")
+            print(f"[client] Dumped initial frame -> {path} (+ {os.path.basename(txt_path)})")
+        except Exception as e:
+            print(f"[client] Failed to dump initial frame: {e}")
+
+    threading.Thread(target=_write, daemon=True).start()
 
 
 # ---------------- Serialization utilities ----------------
@@ -273,7 +311,8 @@ class PsiSonicClient:
     """
 
     def __init__(self, server_url, state_subscriber, camera, token_publisher, instruction,
-                 http_timeout=30.0, include_neck=False, neck_publisher=None, neck_state_reader=None):
+                 http_timeout=30.0, include_neck=False, neck_publisher=None, neck_state_reader=None,
+                 dump_initial_frame=False):
         self._server_url = server_url
         self._state_sub = state_subscriber
         self._camera = camera
@@ -283,6 +322,8 @@ class PsiSonicClient:
         self._include_neck = include_neck
         self._neck_publisher = neck_publisher
         self._neck_state_reader = neck_state_reader
+        self._dump_initial_frame = dump_initial_frame
+        self._initial_frame_dumped = False
 
         # Encoder for frozen token
         self._encoder = EncoderClient(ENCODER_MODEL, mode=0)
@@ -325,11 +366,17 @@ class PsiSonicClient:
             states = np.concatenate((states, neck_state), axis=0)  # (45,)
 
         frame = self._camera.get_frame()
+
+        if self._dump_initial_frame and not self._initial_frame_dumped:
+            # Fire-and-forget: encoding/IO happens in a detached thread.
+            self._initial_frame_dumped = True
+            dump_frame_async(frame, self._instruction)
+
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         frame = frame.astype(np.uint8)
 
         payload = {
-            "image": {"observation.images.egocentric": frame},
+            "image": {IMAGE_KEY: frame},
             "state": {"states": states},
             "gt_action": None,
             "dataset_name": None,
@@ -557,7 +604,8 @@ class PsiSonicClient:
 # ---------------- Main ----------------
 def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_topic,
          camera_address, instruction, include_neck=False, neck_pub_host=DEFAULT_NECK_PUB_HOST,
-         neck_pub_port=DEFAULT_NECK_PUB_PORT, neck_state_zmq=DEFAULT_NECK_STATE_ZMQ):
+         neck_pub_port=DEFAULT_NECK_PUB_PORT, neck_state_zmq=DEFAULT_NECK_STATE_ZMQ,
+         dump_initial_frame=False):
     print("[MAIN] Initializing components...")
 
     # 1. Initialize token publisher (ZMQ PUB, Protocol v4)
@@ -605,6 +653,7 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
         include_neck=include_neck,
         neck_publisher=neck_publisher,
         neck_state_reader=neck_state_reader,
+        dump_initial_frame=dump_initial_frame,
     )
 
     if not client.start():
@@ -660,6 +709,10 @@ if __name__ == "__main__":
                              "(token64 + hand14 + neck2 appended). Also swaps RealSense for "
                              "the neck-mounted ZED camera. Default (off) keeps the legacy "
                              "43/78-dim path.")
+    parser.add_argument("--dump-initial-frame", action="store_true",
+                        help="Dump the first camera frame to .eval/<task>/<yyMMdd-hh:mm:ss>.png "
+                             "plus a companion .txt with the task instruction. Written "
+                             "asynchronously so the control loop is not blocked.")
     parser.add_argument("--neck-pub-host", type=str, default=DEFAULT_NECK_PUB_HOST,
                         help=f"Neck PUB bind host (default: {DEFAULT_NECK_PUB_HOST})")
     parser.add_argument("--neck-pub-port", type=int, default=DEFAULT_NECK_PUB_PORT,
@@ -685,4 +738,5 @@ if __name__ == "__main__":
         neck_pub_host=args.neck_pub_host,
         neck_pub_port=args.neck_pub_port,
         neck_state_zmq=args.neck_state_zmq,
+        dump_initial_frame=args.dump_initial_frame,
     )

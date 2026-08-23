@@ -16,6 +16,12 @@ then:
 
     python apply_initial_pose.py        # optional, same as the live run
     python replay_sonic.py --in recordings/run1.pkl
+
+The start command is sent with planner=0, which puts the deploy's ZMQManager in
+STREAMED_MOTION mode. That is the only mode in which streamed tokens reach the
+policy: with planner=1 the WBC receives the token messages and drops them, and
+the robot simply stands through the whole replay. Use --planner to restore the
+old planner=1 behaviour.
 """
 
 import argparse
@@ -26,7 +32,7 @@ import time
 
 import numpy as np
 
-_GROOT_ROOT = os.path.expanduser("/mnt/data/weiduo/heng/GR00T-WholeBodyControl")
+_GROOT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _GROOT_ROOT)
 
 from g1_sonic_client import (
@@ -56,6 +62,15 @@ def main():
     p.add_argument("--warmup", type=float, default=0.5,
                    help="Seconds to wait after bind for subscribers to join (default 0.5)")
     p.add_argument("--loop", action="store_true", help="Replay in a loop until Ctrl+C")
+    p.add_argument("--planner", action="store_true",
+                   help="Send the start command with planner=1 (WBC ZMQManager stays in "
+                        "PLANNER mode). Tokens are ignored in that mode, so the robot just "
+                        "stands; default is planner=0 (STREAMED_MOTION), which plays them.")
+    p.add_argument("--no-stop", dest="send_stop", action="store_false",
+                   help="Do not send the stop command when the replay ends. Stop terminates "
+                        "WBC control and the deploy exits, so in sim the robot goes limp and "
+                        "collapses the moment the episode finishes; with --no-stop the WBC "
+                        "keeps holding the final pose.")
     args = p.parse_args()
 
     with open(args.in_path, "rb") as f:
@@ -84,8 +99,9 @@ def main():
 
     try:
         while True:
-            token_pub.send_command(start=True, stop=False, planner=True)
-            print("[Replay] start sent, streaming ticks...")
+            token_pub.send_command(start=True, stop=False, planner=args.planner)
+            mode = "PLANNER (tokens ignored)" if args.planner else "STREAMED_MOTION"
+            print(f"[Replay] start sent ({mode}), streaming ticks...")
 
             t0 = t[0]
             wall0 = time.perf_counter()
@@ -111,7 +127,10 @@ def main():
     except KeyboardInterrupt:
         print("\n[Replay] Stopped by user.")
     finally:
-        token_pub.send_command(start=False, stop=True, planner=False)
+        if args.send_stop:
+            token_pub.send_command(start=False, stop=True, planner=False)
+        else:
+            print("[Replay] --no-stop: leaving WBC control running")
         time.sleep(0.2)
         token_pub.stop()
         if neck_pub is not None:
