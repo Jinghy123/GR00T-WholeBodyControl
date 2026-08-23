@@ -327,6 +327,7 @@ def fsq_quantize(continuous_value, fsq_min=FSQ_MIN, fsq_max=FSQ_MAX, fsq_step=FS
 # Encode the current robot pose into a 64-D sonic body token (same encoder the non-RTC
 # client uses to "freeze" the body token), to seed the server's first-chunk RTC prev-action.
 from encoder_client import EncoderClient
+from rollout_recorder import maybe_rollout_recorder
 ENCODER_MODEL = os.path.join(
     _GROOT_ROOT, "gear_sonic_deploy/policy/release/model_encoder.onnx"
 )
@@ -625,8 +626,12 @@ class IncidentRecorder:
     thread, so neither recording nor dumping blocks control.
     """
 
-    def __init__(self, out_dir, action_len=600, state_len=600, frame_len=100):
+    def __init__(self, out_dir, action_len=600, state_len=600, frame_len=100,
+                 rollout=None):
         self._out_dir = out_dir
+        # Optional continuous sink. The ring above only survives an incident dump;
+        # this keeps the whole episode so a stall can be located after the fact.
+        self._rollout = rollout
         self._actions = deque(maxlen=action_len)
         self._states = deque(maxlen=state_len)
         self._frames = deque(maxlen=frame_len)
@@ -636,9 +641,14 @@ class IncidentRecorder:
                       repeat_last, action):
         self._actions.append((mono, version, cid, chunk_id, chunk_tick,
                               repeat_last, action))
+        if self._rollout is not None:
+            self._rollout.record_action(mono, version, cid, chunk_id, chunk_tick,
+                                        repeat_last, action)
 
     def record_state(self, mono, states):
         self._states.append((mono, states))
+        if self._rollout is not None:
+            self._rollout.record_state(mono, states)
 
     def record_frame(self, mono, thumb_rgb):
         self._frames.append((mono, thumb_rgb))
@@ -3249,6 +3259,12 @@ class RTCWebSocketClient:
                     cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                 )
                 self._wm.update_latest_ego(frame)
+                if (self._incidents is not None
+                        and getattr(self._incidents, "_rollout", None) is not None):
+                    # Full-resolution ego frame; the recorder rate-limits internally,
+                    # so this costs one comparison per camera tick.
+                    self._incidents._rollout.record_video_frame(
+                        time.monotonic(), frame)
 
                 # ~3 Hz flight-recorder thumbnails and a ~1 Hz camera-motion
                 # sample for the shadow stall detector; small resizes only.
@@ -3620,7 +3636,10 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
                       flush=True)
                 time.sleep(NECK_RESET_SETTLE)
 
-    incident_recorder = IncidentRecorder(run_dir)
+    rollout_recorder = maybe_rollout_recorder(
+        os.path.join(run_dir, "rollout"), enabled=not args.no_rollout_record,
+        video_fps=args.rollout_video_fps, video_scale=args.rollout_video_scale)
+    incident_recorder = IncidentRecorder(run_dir, rollout=rollout_recorder)
     vla_info = _fetch_json(
         server_url.replace("ws://", "http://").replace("/ws", "/info"))
     wm_state = (
@@ -3811,6 +3830,11 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
         neck_publisher.stop()
     if neck_state_reader is not None:
         neck_state_reader.stop()
+    if rollout_recorder is not None:
+        # Flush the tail shard and close the mp4; without this the last ~100 s of
+        # states/actions and the video trailer are lost.
+        rollout_recorder.close()
+        print(f"[rollout-recorder] closed (dropped={rollout_recorder.dropped})", flush=True)
     log_event("shutdown")
     event_log.stop()
     print("[MAIN] Shutdown complete.")
@@ -3915,6 +3939,13 @@ if __name__ == "__main__":
     )
     parser.add_argument("--wm-dump-dir", type=str, default=DEFAULT_WM_DUMP_DIR,
                         help="Exact directory for all BAGEL response images; default has a run timestamp")
+    parser.add_argument("--no-rollout-record", action="store_true",
+                        help="Disable continuous states/actions/ego-video recording "
+                             "into <wm-dump-dir>/rollout (on by default)")
+    parser.add_argument("--rollout-video-fps", type=float, default=10.0,
+                        help="Ego video frame rate for the rollout recording")
+    parser.add_argument("--rollout-video-scale", type=float, default=1.0,
+                        help="Resize factor for the recorded ego video")
     parser.add_argument("--observation-stale-timeout", type=float, default=0.5,
                         help="Stop/hold WBC if state, camera, or last VLA observation is older")
     parser.add_argument("--action-stale-timeout", type=float, default=0.5,
