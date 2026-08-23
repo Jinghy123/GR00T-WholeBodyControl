@@ -70,9 +70,7 @@ VIDEO_PATH = "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_inde
 def dataset_state(body_q, left_hand_q, right_hand_q, neck=None):
     """Assemble observation.state in the DATASET's layout: qpos(29) + hands(14) [+ neck(2)].
 
-    Note this is NOT the order the clients feed the policy -- they send
-    [left_hand(7), right_hand(7), arm(14), leg(15)] (+neck). The dataset layout is the
-    one declared in meta/modality.json (qpos 0:29, hand_joints 29:43, neck 43:45), and
+    The dataset layout is the one declared in meta/modality.json (qpos 0:29, hand_joints 29:43, neck 43:45), and
     it is what meta/stats*.json is computed over, so a recorded eval must use it.
     """
     parts = [np.asarray(body_q, np.float32).reshape(-1),

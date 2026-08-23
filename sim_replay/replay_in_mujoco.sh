@@ -17,8 +17,10 @@
 # replay_sonic.py runs with --no-stop so WBC control survives the last tick;
 # without it the stop command ends control and the robot collapses on the spot.
 #
-# The viewer window is screen-recorded for the length of the episode into
-# $LOG_DIR/<episode>.mp4 (VIDEO=<path> to change it, NO_VIDEO=1 to skip).
+# The viewer window is screen-recorded into $LOG_DIR/<episode>.mp4 (VIDEO=<path>
+# to change it, NO_VIDEO=1 to skip). Recording starts at the first commanded
+# action, not at replay launch, so the pickle load and the ZMQ warmup do not show
+# up as dead frames at the head of the clip.
 #
 # When the episode ends the WBC and the sim (which owns the MuJoCo viewer window)
 # are both shut down. Set KEEP_SIM=1 to leave them running instead.
@@ -27,8 +29,8 @@ set -u
 REPO="$(cd "$(dirname "$(dirname "$(readlink -f "$0")")")" && pwd)"
 SR="$REPO/sim_replay"
 EPISODE="${1:-$REPO/recordings/run1.pkl}"
-LOG_DIR="${LOG_DIR:-/tmp/g1_sim_replay}"
-DROP_FLAG="${DROP_FLAG:-/tmp/g1_sim_drop}"
+LOG_DIR="${LOG_DIR:-$REPO/.data/g1_sim_replay}"
+DROP_FLAG="${DROP_FLAG:-$REPO/.data/g1_sim_drop}"
 export DROP_FLAG
 mkdir -p "$LOG_DIR"
 
@@ -104,7 +106,11 @@ trap _stop_recording EXIT INT TERM
 if ! pgrep -f "run_sim_loop_dropctl.py" >/dev/null; then
   rm -f "$DROP_FLAG"
   : > "$LOG_DIR/sim.log"        # so the readiness poll cannot match a stale run
-  (cd "$REPO" && nohup .venv_sim/bin/python "$SR/run_sim_loop_dropctl.py" \
+  # `exec` matters: `&` backgrounds the whole `cd && nohup ...` list, so without it
+  # bash leaves an intermediate shell waiting on the sim with stderr still on the
+  # terminal. That shell outlives this script, and the pkill in step 5 makes it
+  # print a stray "Terminated" over the prompt. exec replaces it with the sim.
+  (cd "$REPO" && exec nohup .venv_sim/bin/python "$SR/run_sim_loop_dropctl.py" \
       > "$LOG_DIR/sim.log" 2>&1 &)
   # the sim is up once its 1 Hz pelvis trace starts; keep a few seconds of margin
   _wait_bar "sim startup" 30 "grep -q '\[trace\]' '$LOG_DIR/sim.log' 2>/dev/null" || {
@@ -130,11 +136,28 @@ sleep 3; touch "$DROP_FLAG"
 _wait_bar "lowering robot onto the ground" 30 "! kill -0 $PRELUDE 2>/dev/null" || true
 wait $PRELUDE 2>/dev/null || true
 
-# 4) stream the episode, recording the viewer for exactly its duration
+# 4) stream the episode, recording the viewer for exactly its duration.
+#    replay_sonic.py spends a few seconds loading the pickle and warming up the
+#    ZMQ binds before it sends anything, and recording through that just buys a
+#    clip that opens on a motionless robot. So the replay is backgrounded and
+#    ffmpeg only starts once "[Replay] start sent" shows up in the log - that
+#    line is printed immediately before the first token goes out, so the video
+#    begins with the first commanded action instead of the idle prelude.
 echo "[replay_in_mujoco] streaming: $EPISODE"
-_start_recording
+: > "$LOG_DIR/replay.log"       # so the marker poll cannot match the previous run
 (cd "$REPO" && .venv_teleop/bin/python -u replay_sonic.py \
-    --in "$EPISODE" --warmup 2.0 --no-stop 2>&1 | tee "$LOG_DIR/replay.log")
+    --in "$EPISODE" --warmup 2.0 --no-stop 2>&1 | tee "$LOG_DIR/replay.log") &
+REPLAY=$!
+# polled tight rather than through _wait_bar: at that helper's 1 s granularity the
+# clip could still open on up to a second of stillness, which is a lot out of a
+# ~30 s episode.
+for _ in $(seq 1 1500); do
+  grep -q 'start sent' "$LOG_DIR/replay.log" 2>/dev/null && break
+  kill -0 $REPLAY 2>/dev/null || break      # replay died; stop waiting on a marker
+  sleep 0.02
+done
+_start_recording
+wait $REPLAY 2>/dev/null || true
 _stop_recording
 
 # 5) tear down: WBC first (so it stops writing to a sim that is going away), then

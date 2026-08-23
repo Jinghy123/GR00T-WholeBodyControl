@@ -6,13 +6,20 @@ the MuJoCo simulator, so a demonstration can be re-executed without hardware.
 ```sh
 sim_replay/replay_lerobot.sh .data/g1_sonic_lerobot_0810_merged_val 0   # LeRobot episode
 sim_replay/replay_in_mujoco.sh recordings/run1.pkl                      # record_sonic pickle
+
+# first 100 frames only (~3 s at 30 Hz), for a quick smoke test
+sim_replay/replay_lerobot.sh .data/g1_sonic_lerobot_0810_merged_val 0 --max-allowed-frames 100
 ```
+
+`--max-allowed-frames N` stops the parquet read once N rows are in hand, so a
+long episode is neither fully extracted nor fully replayed. The npz, pickle and
+video are suffixed `_f<N>`, so a truncated run never overwrites the full one.
 
 Both take ~90 s: ~40 s of WBC startup (TensorRT engine build on first run is
 slower), ~14 s to stand the robot up and settle, then the episode at its
 recorded rate. Each of the silent startup stages shows a progress bar on the
 terminal; the episode itself reports its own tick count. Logs go to
-`/tmp/g1_sim_replay/` (`sim.log`, `deploy.log`, `replay.log`, `start_control.log`);
+`.data/g1_sim_replay/` (`sim.log`, `deploy.log`, `replay.log`, `start_control.log`);
 override with `LOG_DIR`. When the episode ends the WBC and the
 sim are shut down, closing the MuJoCo viewer; pass `KEEP_SIM=1` to leave them
 running (stop them later with `pkill -f g1_deploy_onnx_ref`).
