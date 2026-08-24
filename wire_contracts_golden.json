@@ -1,0 +1,40 @@
+{
+  "hash_version": "wm-vla-condition-hash/1",
+  "schema_version": "wm-vla-condition/1",
+  "generator_seed": 20260810,
+  "vectors": [
+    {
+      "name": "empty_goal",
+      "instruction": "Task: clean the table",
+      "shape": [
+        0,
+        0,
+        3
+      ],
+      "goal_seed_note": "rng(20260810) integers drawn in listed order",
+      "digest": "51d8f0e600084e950cf846882e7dd35dfad13e669fe95fd15e75111169506438"
+    },
+    {
+      "name": "small_goal",
+      "instruction": "Task: pick up the banana. Subtask: reach for the banana",
+      "shape": [
+        4,
+        6,
+        3
+      ],
+      "goal_seed_note": "rng(20260810) integers drawn in listed order",
+      "digest": "0e5d9dd7293bfd17e2544e2b50090d86a95595d60b6c94393036c7e472ae39fe"
+    },
+    {
+      "name": "mid_goal",
+      "instruction": "Task: throw the rubbish",
+      "shape": [
+        24,
+        32,
+        3
+      ],
+      "goal_seed_note": "rng(20260810) integers drawn in listed order",
+      "digest": "6c6d04d78acd4822c7449622a3bb68cce98e61fe9eb6d8d8f6c20dbb984d340d"
+    }
+  ]
+}
