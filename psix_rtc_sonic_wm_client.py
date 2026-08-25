@@ -52,9 +52,13 @@ DEFAULT_TASK_KEY = "real_pick_place_0709_psix_val_episode_0"
 DEFAULT_EPISODE_DIR = os.path.join(DEFAULT_DATA_ROOT, DEFAULT_TASK_KEY)
 DEFAULT_PROMPTS_JSON = os.path.join(DEFAULT_DATA_ROOT, "prompts.json")
 TASK_INSTRUCTION = "Pick up the object and place it in the container."
-DEFAULT_BAGEL_IMAGE_ROOT = "/home/weiduoyuan/Desktop/psi/.logs/bagel_gen_images"
+# Renamed from the old bagel_gen_images root: BAGEL was an earlier WM backend and
+# the path outlived it, so the directory name said nothing about what is in it.
+# Only the flat per-run default moved; METHOD_NAME still routes to
+# .logs/main_comparisons/<task_key>/<method_name>/, where the comparison data lives.
+DEFAULT_ROLLOUT_ROOT = "/home/weiduoyuan/Desktop/psi/.logs/psix_rollouts"
 DEFAULT_WM_DUMP_DIR = os.path.join(
-    DEFAULT_BAGEL_IMAGE_ROOT, datetime.now().strftime("%Y%m%d-%H%M%S")
+    DEFAULT_ROLLOUT_ROOT, datetime.now().strftime("%Y%m%d-%H%M%S")
 )
 
 # FSQ configuration (must match g1_sonic_client / encoder)
@@ -167,7 +171,7 @@ def apply_runtime_flags(args):
     global USE_SUBTASK_PROMPT, SHOW_GOAL_WINDOW
     global NECK_RESET, NECK_RESET_YAW, NECK_RESET_PITCH
     global NECK_RESET_HOLD, NECK_RESET_TOL, NECK_RESET_ON_FAIL, NECK_RESET_SETTLE
-    global FROZEN_ACTION
+    global FROZEN_ACTION, WM_COLLAPSE_GATE_ENABLED
     USE_SUBTASK_PROMPT = bool(args.subtask_prompt)
     SHOW_GOAL_WINDOW = bool(args.show_goal)
     NECK_RESET = bool(args.neck_reset)
@@ -178,6 +182,7 @@ def apply_runtime_flags(args):
     NECK_RESET_ON_FAIL = str(args.neck_reset_on_fail)
     NECK_RESET_SETTLE = float(args.neck_reset_settle)
     FROZEN_ACTION = bool(args.frozen_action)
+    WM_COLLAPSE_GATE_ENABLED = bool(args.wm_collapse_gate)
     if SHOW_GOAL_WINDOW and not display_available():
         SHOW_GOAL_WINDOW = False
         print("[goal-window] --show-goal ignored: no DISPLAY/WAYLAND_DISPLAY. Run from a "
@@ -188,6 +193,10 @@ def apply_runtime_flags(args):
              else "'Task: <task>' (subtask clause off, the default)"), flush=True)
     if SHOW_GOAL_WINDOW:
         print("[goal-window] enabled", flush=True)
+    print("[wm-gate] collapse reject "
+          + ("ON" if WM_COLLAPSE_GATE_ENABLED
+             else "OFF (default; metrics still logged as collapse_suppressed)"),
+          flush=True)
 
 
 def show_goal_window(rgb, caption=""):
@@ -741,6 +750,24 @@ WM_STAYPUT_CONSECUTIVE = 3
 WM_COLLAPSE_OBS_MOTION_MAX = 15.0
 WM_COLLAPSE_GOAL_VS_OBS_MIN = 48.0
 WM_COLLAPSE_GOAL_JUMP_MIN = 30.0
+# Whether collapse_like actually REJECTS. Off by default; --wm-collapse-gate
+# turns it back on. The metrics are computed and logged either way, so a run with
+# the gate off still records how often it would have fired
+# (gate.collapse_suppressed) -- turning it off costs no observability.
+#
+# Default is off because the thresholds above do not scale with wm_period while
+# the metrics do: obs_motion and goal_jump are differences between CONSECUTIVE
+# REQUESTS. Measured over the 2026-08-18 futureonly runs:
+#     period 1.6  obs_motion p50 24.4 (28% under the 15.0 bar) ->  3% rejected
+#     period 0.8  obs_motion p50 10.7 (65% under the 15.0 bar) -> 46% rejected
+# Halving the period halves how far the robot moves between requests, dropping
+# obs_motion straight into the collapse box, while goal_vs_obs rises with the
+# longer horizon (42.2 -> 55.5). That produced up to 11 consecutive rejections
+# and left the VLA's goal frozen for 8.3 s -- on goals the header above already
+# warns look like "plausible walking false positives" (gvo 61-63 at low motion).
+# Re-calibrate against the current period / horizon / output size before
+# relying on it again, as that same header instructs.
+WM_COLLAPSE_GATE_ENABLED = False
 WM_COLLAPSE_IMMEDIATE_RETRIES = 3
 # A stay-put trial is HELD (not installed as the VLA condition) and resampled
 # with a fresh seed; after this many consecutive holds the newest proposal is
@@ -930,9 +957,11 @@ class WmSubgoalProvider:
             "goal_vs_obs": goal_vs_obs,
             "goal_jump": goal_jump,
             "collapse_like": bool(collapse_like),
+            "collapse_suppressed": bool(
+                collapse_like and not WM_COLLAPSE_GATE_ENABLED),
             "reject_streak": 0,
         }
-        if collapse_like:
+        if collapse_like and WM_COLLAPSE_GATE_ENABLED:
             self._collapse_rejects += 1
             self._bump_reroll_seed_locked()
             metrics["reject_streak"] = self._collapse_rejects
@@ -1067,6 +1096,7 @@ class WmSubgoalProvider:
                     "collapse_obs_motion_max": WM_COLLAPSE_OBS_MOTION_MAX,
                     "collapse_goal_vs_obs_min": WM_COLLAPSE_GOAL_VS_OBS_MIN,
                     "collapse_goal_jump_min": WM_COLLAPSE_GOAL_JUMP_MIN,
+                    "collapse_gate_enabled": WM_COLLAPSE_GATE_ENABLED,
                     "collapse_immediate_retries": WM_COLLAPSE_IMMEDIATE_RETRIES,
                     "stayput_immediate_retries": WM_STAYPUT_IMMEDIATE_RETRIES,
                 },
@@ -3937,6 +3967,17 @@ if __name__ == "__main__":
         help="Stop/hold only when the current prompt's last-good WM goal exceeds "
              "this age; 0 disables (default: 30s)"
     )
+    parser.add_argument("--wm-collapse-gate", dest="wm_collapse_gate",
+                        action="store_true", default=False,
+                        help="Let the collapse detector REJECT a WM goal (keeping the "
+                             "previous one) instead of only scoring it. Off by default: "
+                             "its thresholds are fixed while obs_motion/goal_jump scale "
+                             "with --wm-period, so at 0.8s it rejected 46%% of goals and "
+                             "froze the VLA's goal for up to 8.3s. Re-calibrate before "
+                             "turning this on.")
+    parser.add_argument("--no-wm-collapse-gate", dest="wm_collapse_gate",
+                        action="store_false",
+                        help="Explicitly score-only, never reject (already the default).")
     parser.add_argument("--wm-dump-dir", type=str, default=DEFAULT_WM_DUMP_DIR,
                         help="Exact directory for all BAGEL response images; default has a run timestamp")
     parser.add_argument("--no-rollout-record", action="store_true",

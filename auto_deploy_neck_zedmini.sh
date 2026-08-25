@@ -4,17 +4,123 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+# Reference episodes used by --episode. Default is the ZED-mini pick-cloth
+# rollout set; --ref-dir points at any other directory of .mp4 references
+# (e.g. data/0709_mp4_refs/.../observation.images.egocentric).
+REF_DIR="${REF_DIR:-$SCRIPT_DIR/zed_recordings/40k_clothes}"
+
 # --- Arguments ------------------------------------------------------------------
-# --overlay <file.mp4>  blend the video's first frame over the live viewer window
-#                       (e.g. to line the camera up with a recorded episode)
+# --episode <N>         overlay reference episode N from REF_DIR (see --list)
+# --ref-dir <dir>       directory the --episode index resolves against
+# --overlay <file.mp4>  overlay this exact file; wins over --episode
+# --list                print the episodes available in REF_DIR and exit
+#
+# The overlay blends the video's first frame over the live viewer window, so the
+# camera can be lined up with how a recorded episode started.
 OVERLAY=""
+EPISODE=""
+LIST_ONLY=0
+# Ego view only by default. The stereo pane is a second window fed by the reply's
+# slot 1; without --show-stereo the viewer does not even decode it.
+SHOW_STEREO=0
+# --no-viewer brings up only the camera server and holds it, for running this in
+# tmux on a headless host (the viewer needs an X display and aborts without one).
+# The viewer is then started by hand on a machine that has a display.
+NO_VIEWER=0
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [--episode N | --overlay FILE] [--ref-dir DIR] [--stereo]
+                        [--no-viewer] [--list]
+
+  --episode N     overlay reference episode N from REF_DIR
+  --ref-dir DIR   where --episode looks (default: $REF_DIR)
+  --overlay FILE  overlay an exact .mp4; takes precedence over --episode
+  --stereo        also open the stereo window (default: ego only)
+  --no-viewer     server only: don't start the viewer on this host, just print
+                  the command to run it elsewhere (for headless / tmux use)
+  --list          list the episodes available in REF_DIR and exit
+
+With no overlay argument the viewer starts clean (no reference frame).
+EOF
+}
 while [ $# -gt 0 ]; do
     case "$1" in
+        --episode)   EPISODE="${2:?--episode needs an index}"; shift 2 ;;
+        --episode=*) EPISODE="${1#--episode=}"; shift ;;
+        --ref-dir)   REF_DIR="${2:?--ref-dir needs a directory}"; shift 2 ;;
+        --ref-dir=*) REF_DIR="${1#--ref-dir=}"; shift ;;
         --overlay)   OVERLAY="${2:?--overlay needs a file}"; shift 2 ;;
         --overlay=*) OVERLAY="${1#--overlay=}"; shift ;;
-        *) echo "Unknown argument: $1 (supported: --overlay <file.mp4>)" >&2; exit 1 ;;
+        --stereo|--show-stereo) SHOW_STEREO=1; shift ;;
+        --no-viewer|--server-only|--headless) NO_VIEWER=1; shift ;;
+        --list|--list-episodes) LIST_ONLY=1; shift ;;
+        -h|--help)   usage; exit 0 ;;
+        *) echo "Unknown argument: $1" >&2; usage >&2; exit 1 ;;
     esac
 done
+
+# All .mp4 in REF_DIR, sorted. Empty array instead of an error when absent, so
+# --episode can report the situation itself.
+list_refs() {
+    [ -d "$REF_DIR" ] || return 0
+    find "$REF_DIR" -maxdepth 1 -name '*.mp4' -printf '%f\n' 2>/dev/null | sort
+}
+
+if [ "$LIST_ONLY" = "1" ]; then
+    echo "Reference dir: $REF_DIR"
+    if [ ! -d "$REF_DIR" ]; then
+        echo "  (directory does not exist)"
+        exit 1
+    fi
+    refs="$(list_refs)"
+    if [ -z "$refs" ]; then
+        echo "  (no .mp4 files)"
+        exit 1
+    fi
+    echo "$refs" | nl -ba -w4 -s'  '
+    exit 0
+fi
+
+# Resolve --episode to a file. Names are tried first so an index means the same
+# episode regardless of what else sits in the directory; the positional fallback
+# covers reference sets that use some other convention, and always announces
+# what it picked rather than resolving silently.
+if [ -n "$EPISODE" ]; then
+    if [ -n "$OVERLAY" ]; then
+        echo "Note: --overlay given, ignoring --episode $EPISODE." >&2
+    else
+        case "$EPISODE" in
+            ''|*[!0-9]*) echo "Error: --episode must be a non-negative integer, got '$EPISODE'" >&2; exit 1 ;;
+        esac
+        [ -d "$REF_DIR" ] || { echo "Error: reference dir not found: $REF_DIR" >&2; exit 1; }
+        for cand in \
+            "$(printf 'ego_%03d.mp4' "$EPISODE")" \
+            "$(printf 'episode_%06d.mp4' "$EPISODE")" \
+            "$(printf 'ego_%d.mp4' "$EPISODE")" \
+            "$(printf 'episode_%d.mp4' "$EPISODE")"; do
+            if [ -f "$REF_DIR/$cand" ]; then
+                OVERLAY="$REF_DIR/$cand"
+                break
+            fi
+        done
+        if [ -z "$OVERLAY" ]; then
+            nth="$(list_refs | sed -n "${EPISODE}p")"
+            if [ -n "$nth" ]; then
+                OVERLAY="$REF_DIR/$nth"
+                echo "No ego_/episode_ file for index $EPISODE; using the ${EPISODE}th .mp4: $nth"
+            else
+                echo "Error: no reference episode $EPISODE in $REF_DIR" >&2
+                echo "Available (use --list for the full set):" >&2
+                list_refs | head -20 >&2
+                exit 1
+            fi
+        fi
+        echo "Reference episode $EPISODE -> $OVERLAY"
+    fi
+fi
+
 if [ -n "$OVERLAY" ] && [ ! -f "$OVERLAY" ]; then
     echo "Error: overlay file not found: $OVERLAY" >&2
     exit 1
@@ -28,8 +134,8 @@ ROS_SETUP="/opt/ros/noetic/setup.bash"   # ROS env to source on the board (noeti
 ZMQ_BIND_PORT="5558"   # port realsense_server binds on (--zmq-bind)
 POSE_ZMQ_PORT="5570"   # host pose stream port (--pose-zmq)
 VIEWER_PORT="5559"     # port the host viewer connects to (--port)
-VIEWER_ENV="psi_deploy"   # conda env for the host viewer
-HOST_CONDA="$HOME/miniconda3"   # conda installation path on this host
+VIEWER_ENV="${VIEWER_ENV:-sonic}"   # conda env for the host viewer (needs cv2/zmq/numpy)
+HOST_CONDA="${HOST_CONDA:-$HOME/miniforge3}"   # conda installation path on this host
 BOARD_CONDA="/home/unitree/miniforge3"   # conda installation path on the G1 board
 BOARD_CONDA_ENV="sonic"   # conda env to activate on the G1 board
 OVERLAY_ALPHA="0.5"       # overlay opacity 0..1 (higher = overlay more visible)
@@ -141,31 +247,83 @@ if [ "$NECK_OK" != "1" ]; then
     echo "-----------------------" >&2
 fi
 
-# Start the client image viewer on the host. It runs in the background so this
-# terminal can take neck-reset commands.
+# Build the viewer command line. With --no-viewer it is only printed, so the
+# viewer can be started by hand on a machine that has a display. The host conda
+# env is activated either way: reset_neck.py below runs from it too.
 cd "$(dirname "$0")"
 source "$HOST_CONDA/etc/profile.d/conda.sh"
 conda activate "$VIEWER_ENV"
-echo "Starting viewer (conda env: $VIEWER_ENV) ..."
-VIEWER_ARGS=(--server "$IP" --port "$VIEWER_PORT" --show-stereo)
+VIEWER_ARGS=(--server "$IP" --port "$VIEWER_PORT")
+if [ "$SHOW_STEREO" = "1" ]; then
+    VIEWER_ARGS+=(--show-stereo)
+fi
 if [ -n "$OVERLAY" ]; then
-    echo "Overlaying first frame of: $OVERLAY (alpha $OVERLAY_ALPHA)"
+    echo "Overlay: first frame of $OVERLAY (alpha $OVERLAY_ALPHA)"
     VIEWER_ARGS+=(--overlay "$OVERLAY" --overlay-alpha "$OVERLAY_ALPHA")
     if [ "$OVERLAY_SWAP" = "1" ]; then
         VIEWER_ARGS+=(--overlay-swap-channels)
     fi
 fi
-python test_viewer.py "${VIEWER_ARGS[@]}" &
-VIEWER_PID=$!
+
+if [ "$NO_VIEWER" = "1" ]; then
+    echo
+    echo "Server only (--no-viewer): no viewer started on this host."
+    echo "To watch the stream, run this on a machine with a display, in the repo"
+    echo "and in the '$VIEWER_ENV' env:"
+    printf '    python test_viewer.py'
+    printf ' %q' "${VIEWER_ARGS[@]}"
+    echo
+else
+    echo "Starting viewer (conda env: $VIEWER_ENV) ..."
+    python test_viewer.py "${VIEWER_ARGS[@]}" &
+    VIEWER_PID=$!
+fi
 
 # Neck reset from this terminal, same UX as auto_deploy_neck_realsense.sh: type
 # r+Enter to ease the neck back to (0, 0). reset_neck.py binds the pose PUB
 # port itself, which is free here because this script runs no pose publisher
 # (if one is running, reset_neck.py fails with a clear message and we go on).
 echo
-echo "Viewer running (pid $VIEWER_PID)."
+if [ "$NO_VIEWER" = "1" ]; then
+    echo "Camera server up on $IP:$VIEWER_PORT (pid $SERVER_PID)."
+else
+    echo "Viewer running (pid $VIEWER_PID)."
+fi
 echo "Type r+Enter to reset the neck to (0, 0); q+Enter or Ctrl+C to quit."
-while kill -0 "$VIEWER_PID" 2>/dev/null; do
+
+server_alive() {
+    sshpass -p "$PASSWORD" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+        "${USERNAME}@${IP}" "kill -0 $SERVER_PID" 2>/dev/null
+}
+
+# Stay up as long as what we babysit lives: the viewer normally, the remote
+# server with --no-viewer — polled over ssh every $HEALTH_EVERY ticks so a
+# crashed server ends the session instead of leaving a terminal that looks fine.
+HEALTH_EVERY=30
+ticks=0
+while :; do
+    if [ "$NO_VIEWER" = "1" ]; then
+        ticks=$((ticks + 1))
+        if [ "$((ticks % HEALTH_EVERY))" = "0" ] && ! server_alive; then
+            sleep 2   # retry once: a single ssh hiccup is not a dead server
+            if ! server_alive; then
+                echo "Camera server (pid $SERVER_PID) died on $IP." >&2
+                echo "--- server log tail ---" >&2
+                sshpass -p "$PASSWORD" ssh -o StrictHostKeyChecking=no \
+                    "${USERNAME}@${IP}" "tail -20 ~/realsense_server.log" >&2 || true
+                echo "-----------------------" >&2
+                break
+            fi
+        fi
+    else
+        kill -0 "$VIEWER_PID" 2>/dev/null || break
+    fi
+    # No tty (nohup, piped stdin): read hits EOF at once and would spin, so tick
+    # on sleep instead and skip the r/q commands there is nobody to type.
+    if [ ! -t 0 ]; then
+        sleep 1
+        continue
+    fi
     if read -r -t 1 line; then
         case "${line,,}" in
             r)

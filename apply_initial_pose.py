@@ -62,13 +62,18 @@ def load_initial_pose(data_path):
     state = first_frame['states']
     action = first_frame['actions']
 
-    # Use STATES for qpos/hand (actual robot position), ACTION for neck (command format)
-    # states.neck is motor feedback, actions.neck is the command format needed
+    # Use STATES everywhere: they are the robot's actual position. The first
+    # frames' actions.neck can be pre-engagement teleop garbage (e.g. pitch
+    # -4.64 rad), so derive the neck command from states.neck instead.
+    # states.neck is motor-frame feedback; realsense_server applies
+    # NECK_PITCH_SIGN=-1 on write but not on readback, so command frame is
+    # [yaw, -pitch] of the feedback.
+    state_neck = np.array(state['neck'], dtype=np.float32)
     initial_pose = {
         'qpos': np.array(state['qpos'], dtype=np.float32),  # (29,) - actual position
         'quat': np.array(state['quat'], dtype=np.float32),  # (4,) wxyz - only in state
         'hand_joints': np.array(state['hand_joints'], dtype=np.float32),  # (14,) - actual position
-        'neck': np.array(action['neck'], dtype=np.float32),  # (2,) - command format!
+        'neck': np.array([state_neck[0], -state_neck[1]], dtype=np.float32),  # (2,) command frame
     }
 
     return initial_pose
@@ -234,6 +239,9 @@ def main():
                        help=f"Neck PUB bind host (default: {DEFAULT_NECK_PUB_HOST})")
     parser.add_argument("--neck-pub-port", type=int, default=DEFAULT_NECK_PUB_PORT,
                        help=f"Neck PUB port (default: {DEFAULT_NECK_PUB_PORT})")
+    parser.add_argument("--distance", type=str, default="",
+                       help="shortcut for --data data_<distance>.json, "
+                            "e.g. --distance far")
 
     args = parser.parse_args()
 

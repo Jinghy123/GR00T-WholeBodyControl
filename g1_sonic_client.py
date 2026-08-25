@@ -112,12 +112,62 @@ TOKEN_DIM = 64
 # Image buffer
 IMAGE_BUFFER_SIZE = 100
 
-# TASK_PROMPT = "grasp the coke and place it into the white basket"
-# TASK_PROMPT = "pick up the coke and place it into the white basket"
-# TASK_PROMPT = "grasp the yellow bottle and pour the water into the pink pot"
-# TASK_PROMPT = "pick up the white dumpling and place it into the basket"
-TASK_PROMPT = "pick up the yellow banana and place it into the wooden box"
 # TASK_PROMPT = "pick up the gray hippo toy and place it into the orange bowl"
+# TASK_PROMPT = "pick up the green grapes and place it into the green bowl"
+# TASK_PROMPT = "pick up the banana and place it into the wooden box"
+# TASK_PROMPT = "pick up the eggplant and place it into the transparent box"
+# TASK_PROMPT = "hold the dustpan and sweep the white paper scraps into it with the brush"
+# TASK_PROMPT = "hold the dustpan and sweep the yellow and green bottle caps into it with the brush"
+# TASK_PROMPT = "hold the dustpan and sweep the black plastic pieces into it with the brush"
+# TASK_PROMPT = "grasp the backrest of the chair and push it straight under the table"
+# TASK_PROMPT = "grasp the backrest of the chair, turn left, and push it under the table"
+# TASK_PROMPT = "grasp the backrest of the chair, turn right, and push it under the table"
+# TASK_PROMPT = "pick up the foil bag and turn left and throw it into the trash can"
+# TASK_PROMPT = "pick up the red snack box and turn left and throw it into the trash can"
+# TASK_PROMPT = "pick up the paper ball and turn left and throw it into the trash can"
+# TASK_PROMPT = "pick up the snack bag and turn left and throw it into the trash can"
+# TASK_PROMPT = "pick up the paper ball and turn right and throw it into the trash can"
+# TASK_PROMPT = "pick up the snack bag and turn right and throw it into the trash can"
+# TASK_PROMPT = "grasp the yellow bottle, open the top drawer of the kitchen island, place the bottle inside, and close the drawer"
+# TASK_PROMPT = "grasp the transparent bottle, open the top drawer of the kitchen island, place the bottle inside, and close the drawer"
+TASK_PROMPT = "grasp the silver can, open the top drawer of the kitchen island, place the can inside, and close the drawer"
+# TASK_PROMPT = "grasp the green drink bottle, open the top drawer of the kitchen island, place the bottle inside, and close the drawer"
+# TASK_PROMPT = "open the top-right door of the cabinet, grab the purple flower, turn left, and place it at the top-right corner of the table"
+# TASK_PROMPT = "open the top-left door of the cabinet, grab the white flower, close the cabinet door, turn left, and place it at the top-right corner of the table"
+# TASK_PROMPT = "open the top-left door of the cabinet, grab the pink flower, close the cabinet door, turn left, and place it at the top-right corner of the table"
+# TASK_PROMPT = "open the top-left door of the cabinet, grab the purple flower, close the cabinet door, turn left, and place it at the top-right corner of the table"
+# TASK_PROMPT = "open the top-left door of the cabinet, grab the orange flower, close the cabinet door, turn left, and place it at the top-right corner of the table"
+# TASK_PROMPT = "gather up the yellow shirt and turn right and put it into the laundry basket"
+# TASK_PROMPT = "gather up the gray shirt and turn right and put it into the laundry basket"
+# TASK_PROMPT = "gather up the white shirt and turn right and put it into the laundry basket"
+# TASK_PROMPT = "gather up the black trousers and yellow shirt and turn right and put them into the laundry basket"
+# TASK_PROMPT = "gather up the yellow shirt and turn right and put it into the laundry basket"
+# TASK_PROMPT = "gather up the yellow shirt with right hand and turn right and put it into the laundry basket"
+# TASK_PROMPT = "gather up the black trousers and turn right and put it into the laundry basket"
+# TASK_PROMPT = "gather up the yellow shirt and gray shirt and turn right and put them into the laundry basket"
+# TASK_PROMPT = "gather up the gray shirt with right hand and turn right and put it into the laundry basket"
+# TASK_PROMPT = "open the top-right door of the cabinet, grab the orange flower, turn left, and place it at the top-right corner of the table"
+# TASK_PROMPT = "open the top-right door of the cabinet, grab the white flower, turn left, and place it at the top-right corner of the table"
+# TASK_PROMPT = "open the top-right door of the cabinet, grab the pink flower, turn left, and place it at the top-right corner of the table"
+# TASK_PROMPT = "pick up the foil bag and turn right and throw it into the trash can"
+# TASK_PROMPT = "pick up the red snack box and turn right and throw it into the trash can"
+# TASK_PROMPT = "grasp the transparent water bottle and pour the water into the yellow kettle"
+# TASK_PROMPT = "hold the pink watering can by the handle and water the white flower"
+# TASK_PROMPT = "pick up the snack bag and turn left and throw it into the trash can"
+# TASK_PROMPT = "kneel down and scoop up the beige pillow near the bed and put it at the head of the bed"
+# TASK_PROMPT = "open the top-right door of the cabinet, grab the purple flower, turn left, and place it at the top-right corner of the table"
+# TASK_PROMPT = "kneel down, hook the beige shoes on the first tier of the shoe rack, turn around, kneel down again, and place them at the foot of the bed"
+# TASK_PROMPT = "kneel down, hook the purple shoes on the first tier of the shoe rack, turn around, kneel down again, and place them at the foot of the bed"
+# TASK_PROMPT = "kneel down, hook the white shoes on the first tier of the shoe rack, turn around, kneel down again, and place them at the foot of the bed"
+# TASK_PROMPT = "kneel down, hook the blue shoes on the first tier of the shoe rack, turn around, kneel down again, and place them at the foot of the bed"
+# TASK_PROMPT = "kneel down and scoop up the white pillow near the bed and put it at the head of the bed"
+# TASK_PROMPT = "kneel down and scoop up the beige pillow near the bed and put it at the head of the bed"
+# TASK_PROMPT = "kneel down and scoop up the white pillow near the kitchen island and turn left and put it at the head of the bed"
+# TASK_PROMPT = "kneel down and scoop up the beige pillow near the kitchen island and turn left and put it at the head of the bed"
+# TASK_PROMPT = "kneel down and scoop up the white pillow near the shoe rack and turn around and put it at the head of the bed"
+# TASK_PROMPT = "kneel down and scoop up the beige pillow near the shoe rack and turn around and put it at the head of the bed"
+# TASK_PROMPT = "kneel down and scoop up the white pillow near the laundry basket and turn around and put it at the head of the bed"
+# TASK_PROMPT = "kneel down and scoop up the beige pillow near the laundry basket and turn around and put it at the head of the bed"
 
 def fsq_quantize(continuous_value, fsq_min=FSQ_MIN, fsq_max=FSQ_MAX, fsq_step=FSQ_STEP):
     clipped = np.clip(continuous_value, fsq_min, fsq_max)
@@ -128,6 +178,36 @@ def fsq_quantize(continuous_value, fsq_min=FSQ_MIN, fsq_max=FSQ_MAX, fsq_step=FS
 
     return quantized
 
+
+def fit_to_policy_resolution(rgb, target_wh, mode="pad"):
+    """Bring a raw camera frame to the policy resolution (W, H).
+    mode="pad": black-border padding (bottom/right), matches the LeRobot conversion.
+    mode="resize": plain cv2.resize stretch (legacy behaviour)."""
+    if mode == "resize":
+        return cv2.resize(rgb, target_wh)
+    if mode == "pad":
+        return pad_to_policy_resolution(rgb, target_wh)
+    raise ValueError(f"unknown image fit mode: {mode}")
+
+
+def pad_to_policy_resolution(rgb, target_wh):
+    """Match the LeRobot conversion: pad the raw ZED frame with black rows/cols
+    (bottom/right) up to target (W, H) instead of stretching. 376x672 -> 384x672
+    adds 8 black rows at the bottom. The policy server's own eval transform
+    (CenterCrop + Resize) still runs afterwards, so target must be the LeRobot
+    frame size (672x384), not the model input size. Oversized inputs raise
+    instead of being cropped (that would not match the training pipeline)."""
+    tw, th = target_wh
+    h, w = rgb.shape[:2]
+    if h > th or w > tw:
+        raise ValueError(
+            f"Input image {w}x{h} exceeds expected LeRobot resolution {tw}x{th}; "
+            f"refusing to crop silently."
+        )
+    pad_h, pad_w = th - h, tw - w
+    if pad_h == 0 and pad_w == 0:
+        return rgb
+    return cv2.copyMakeBorder(rgb, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=(0, 0, 0))
 
 
 class RSCamera:
@@ -565,8 +645,21 @@ class TokenPolicyClient:
                  neck_state_zmq,
                  action_only=False,
                  include_neck=False,
-                 use_realsense=False):
+                 use_realsense=False,
+                 action_horizon=ACTION_HORIZON,
+                 image_fit="pad"):
         self._include_neck = include_neck
+        self._image_fit = image_fit
+        # Chunk length requested from the server; the server's --horizon-out must
+        # return exactly this many steps. The image buffer fills one frame per
+        # executed step, so the frame-stack offsets scale with it: 4 frames at
+        # the start / 1/3 / 2/3 / end of the just-executed chunk window
+        # (the [-24, -17, -9, -1] of the original horizon-24 client).
+        self._action_horizon = action_horizon
+        self._relative_offsets = [-(action_horizon - 1) - 1,
+                                  -(2 * action_horizon // 3) - 1,
+                                  -(action_horizon // 3) - 1,
+                                  -1]
         # Neck-mounted RealSense outputs 640x480 natively; keep that size instead
         # of stretching to the ZED-era 672x384 (must match the training data).
         self._img_resolution = (640, 480) if use_realsense else POLICY_IMAGE_RESOLUTION
@@ -652,11 +745,13 @@ class TokenPolicyClient:
         # Resize images to match policy server's expected resolution (672x384,
         # or 640x480 RealSense-native with --use-realsense).
         # Only needed in include_neck mode; no-neck frames are sent raw.
+        # --image-fit pad: black rows at the bottom (matches LeRobot conversion);
+        # --image-fit resize: stretch (legacy).
         if self._include_neck:
             if selected.ndim == 4:  # (T, H, W, 3)
-                selected = np.stack([cv2.resize(frame, self._img_resolution) for frame in selected], axis=0)
+                selected = np.stack([fit_to_policy_resolution(frame, self._img_resolution, self._image_fit) for frame in selected], axis=0)
             elif selected.ndim == 3:  # (H, W, 3)
-                selected = cv2.resize(selected, self._img_resolution)
+                selected = fit_to_policy_resolution(selected, self._img_resolution, self._image_fit)
 
         if len(frame_indices) == 1:
             selected = selected[0]  # (H, W, 3)
@@ -678,7 +773,7 @@ class TokenPolicyClient:
         """Pretty-print action shape, range, and timing."""
         assert isinstance(actions, np.ndarray), f"Expected numpy array, got {type(actions)}"
         assert actions.ndim == 2, f"Expected 2D array, got shape {actions.shape}"
-        assert actions.shape[0] == ACTION_HORIZON, f"Expected {ACTION_HORIZON} actions, got {actions.shape[0]}"
+        assert actions.shape[0] == self._action_horizon, f"Expected {self._action_horizon} actions, got {actions.shape[0]}"
 
         print(
             f"  Action shape: {actions.shape}, "
@@ -712,10 +807,10 @@ class TokenPolicyClient:
                     self._get_image() # append first image into image buffer
 
                 else:
-                    frame_indices = RELATIVE_OFFSETS # get previous 4 frames relative to current step
+                    frame_indices = self._relative_offsets # get previous 4 frames relative to current step
                     with self.image_buffer_lock:
                         len_image_buffer = len(self.image_buffer)
-                    assert len_image_buffer == ACTION_HORIZON, f"Expected {ACTION_HORIZON} frames in image buffer, got {len_image_buffer}"
+                    assert len_image_buffer == self._action_horizon, f"Expected {self._action_horizon} frames in image buffer, got {len_image_buffer}"
                 
                 t0 = time.time()
                 chunk = self._get_policy_chunk(frame_indices)
@@ -912,6 +1007,9 @@ def main():
     parser.add_argument("--neck-state-zmq", type=str, default=DEFAULT_NECK_STATE_ZMQ,
                        help=f"Neck-state SUB address (realsense_server.py's neck "
                             f"present-position PUB, default: {DEFAULT_NECK_STATE_ZMQ})")
+    parser.add_argument("--action-horizon", type=int, default=ACTION_HORIZON,
+                        help="action chunk length; must match the policy server's --horizon-out "
+                             f"(default: {ACTION_HORIZON})")
     parser.add_argument("--action-only", action="store_true",
                        help="Enable action-only inference (skip video denoising for faster speed)")
     parser.add_argument("--include-neck", action="store_true",
@@ -923,6 +1021,11 @@ def main():
                        help="Neck camera is a RealSense (640x480 native): resize the "
                             "include-neck egocentric frame to 640x480 instead of the "
                             "ZED-era 672x384. Use with checkpoints trained on RealSense data.")
+
+    parser.add_argument("--image-fit", type=str, default="resize", choices=["pad", "resize"],
+                       help="How to bring the ZED 672x376 frame to 672x384: 'pad' adds black "
+                            "rows at the bottom (matches the LeRobot conversion); "
+                            "'resize' stretches (legacy behaviour, default).")
 
     args = parser.parse_args()
 
@@ -951,6 +1054,8 @@ def main():
         action_only=args.action_only,
         include_neck=args.include_neck,
         use_realsense=args.use_realsense,
+        action_horizon=args.action_horizon,
+        image_fit=args.image_fit,
     )
 
     try:

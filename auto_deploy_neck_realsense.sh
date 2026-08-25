@@ -37,7 +37,7 @@ VIEWER_ENV="realsense"          # conda env for the host image viewer
 VIEWER_SCALE="2"                # viewer window scale (2 = twice as wide and tall)
 OVERLAY_ALPHA="0.5"             # overlay opacity 0..1 (higher = overlay more visible)
 OVERLAY_SWAP="1"                # 1 = swap overlay B<->R channels (false color) for contrast
-HOST_CONDA="$HOME/miniconda3"   # conda installation path on this host
+HOST_CONDA="$HOME/miniforge3"   # conda installation path on this host
 
 # --- Offline provisioning of the board's `realsense` conda env -----------------
 # The board has no internet, so the env is created from its local conda pkg cache

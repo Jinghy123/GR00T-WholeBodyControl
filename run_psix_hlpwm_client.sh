@@ -79,11 +79,11 @@ INPUT_PROMPT="${INPUT_PROMPT:-}"
 # goaldrop_80k, generalist_40k). Purely a label: embedded in run_manifest.json
 # and the init-frame sidecar, and (when set) routes WM_DUMP_DIR under
 # .logs/main_comparisons/<task_key>/<method_name>/ instead of the flat
-# .logs/bagel_gen_images/ default -- see the WM_DUMP_DIR auto-routing below.
+# .logs/psix_rollouts/ default -- see the WM_DUMP_DIR auto-routing below.
 METHOD_NAME="${METHOD_NAME:-}"
 CAMERA_ADDRESS="${CAMERA_ADDRESS:-tcp://192.168.123.164:5558}"
 SUBGOAL_LOG_DIR="${SUBGOAL_LOG_DIR:-/home/weiduoyuan/Desktop/psi/.logs/HLP_WM_logs}"
-WM_DUMP_DIR="${WM_DUMP_DIR:-/home/weiduoyuan/Desktop/psi/.logs/bagel_gen_images/$(date +%Y%m%d-%H%M%S)}"
+WM_DUMP_DIR="${WM_DUMP_DIR:-/home/weiduoyuan/Desktop/psi/.logs/psix_rollouts/$(date +%Y%m%d-%H%M%S)}"
 NECK_PUB_HOST="${NECK_PUB_HOST:-*}"
 NECK_PUB_PORT="${NECK_PUB_PORT:-5570}"
 NECK_STATE_ZMQ="${NECK_STATE_ZMQ:-tcp://192.168.123.164:5560}"
@@ -328,7 +328,7 @@ Usage: $(basename "$0") [--dry-run|--real|--check-only] [client options...]
                 embedded in run_manifest.json and the init-frame sidecar. When
                 set and WM_DUMP_DIR is not pinned, also routes rollout
                 telemetry to .logs/main_comparisons/<task_key>/<method_name>/
-                instead of the flat .logs/bagel_gen_images/ default -- use
+                instead of the flat .logs/psix_rollouts/ default -- use
                 this for quantitative cross-method comparison runs. Env:
                 METHOD_NAME.
   --list-tasks  Print every task key found in data/*/prompts.json, then exit.
@@ -549,7 +549,7 @@ if [[ "$HLP_MODE" == "off" ]]; then
     fi
     # Quantitative comparison runs: route telemetry to
     # .logs/main_comparisons/<task_key>/<method_name>/<timestamp> instead of
-    # the flat .logs/bagel_gen_images/<timestamp> default, so rollouts group
+    # the flat .logs/psix_rollouts/<timestamp> default, so rollouts group
     # by task and by the method/checkpoint under test. Only when the operator
     # set METHOD_NAME and did not pin WM_DUMP_DIR themselves -- an explicit
     # WM_DUMP_DIR always wins.

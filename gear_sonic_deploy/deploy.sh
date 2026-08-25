@@ -9,11 +9,11 @@ set -e
 #
 # Usage: ./deploy.sh [sim|real|<interface_name>|<ip_address>]
 #   sim   - Use loopback interface for simulation (MuJoCo)
-#   real  - Auto-detect robot network interface (192.168.123.x)
+#   real  - Require the production g1 TELEOP interface (enp4s0)
 #   <interface_name> - Use specific interface (e.g., enP8p1s0, eth0)
 #   <ip_address> - Use interface with specific IP
 #
-# Default: real
+# Default: enp4s0, with a fail-closed g1 TELEOP preflight
 # ============================================================================
 
 # Colors for output
@@ -146,27 +146,9 @@ resolve_interface() {
         return 0
     
     elif [[ "$interface" == "real" ]]; then
-        # Try to find interface with 192.168.123.x IP (Unitree robot network)
-        local real_interface
-        real_interface=$(find_interface_by_ip_prefix "192.168.123.")
-        
-        if [[ -n "$real_interface" ]]; then
-            TARGET="$real_interface"
-        else
-            # Fallback to common interface names
-            # Try to find any non-loopback interface
-            local fallback_interface
-            fallback_interface=$(get_network_interfaces | grep -v "127.0.0.1" | head -1 | cut -d: -f1)
-            
-            if [[ -n "$fallback_interface" ]]; then
-                TARGET="$fallback_interface"
-                echo -e "${YELLOW}⚠️  Could not find 192.168.123.x interface, using: $TARGET${NC}" >&2
-            else
-                # Ultimate fallback
-                TARGET="enP8p1s0"
-                echo -e "${YELLOW}⚠️  Could not auto-detect interface, using default: $TARGET${NC}" >&2
-            fi
-        fi
+        # Production is intentionally pinned. Never fall back to Wi-Fi,
+        # Tailscale, or an arbitrary non-loopback interface.
+        TARGET="enp4s0"
         ENV_TYPE="real"
         return 0
     
@@ -216,15 +198,15 @@ show_usage() {
     echo ""
     echo "Interface modes:"
     echo "  sim              Use loopback interface for simulation (MuJoCo)"
-    echo "  real             Auto-detect robot network (192.168.123.x)"
+    echo "  real             Require enp4s0 + active 'g1 TELEOP'"
     echo "  <interface>      Use specific interface (e.g., enP8p1s0, eth0)"
     echo "  <ip_address>     Use interface by IP address"
     echo ""
-    echo "Default: real"
+    echo "Default: enp4s0 (active 'g1 TELEOP' wired profile)"
     echo ""
     echo "Examples:"
     echo "  $0 sim           # Run in simulation mode"
-    echo "  $0 real          # Auto-detect real robot interface"
+    echo "  $0 real          # Fixed production G1 interface"
     echo "  $0 enP8p1s0      # Use specific interface"
     echo "  $0 192.168.x.x # Use interface with this IP"
     echo "  $0 --cp policy/checkpoints/custom/model_step_123456 real  # Use custom checkpoint"
@@ -233,8 +215,9 @@ show_usage() {
     echo "  $0 --motion-data reference/custom_motion/ sim  # Use custom motion data"
 }
 
-# Default interface mode
-INTERFACE_MODE="real"
+# Default to the dedicated G1 wired interface. This launcher only passes the
+# interface name to DDS; it never changes interface addresses, routes, or DNS.
+INTERFACE_MODE="enp4s0"
 
 # Default configuration values (can be overridden by command line)
 CHECKPOINT_DEFAULT="policy/release/model"
@@ -361,6 +344,20 @@ echo -e "${BLUE}[Interface Resolution]${NC}"
 echo "Requested mode: $INTERFACE_MODE"
 
 resolve_interface "$INTERFACE_MODE"
+
+if [[ "$ENV_TYPE" == "real" ]]; then
+    if [[ "$TARGET" != "enp4s0" ]]; then
+        echo -e "${RED}❌ Real deployment is pinned to enp4s0; got '$TARGET'.${NC}" >&2
+        echo "   Use sim for off-robot tests. Production never falls back to another interface." >&2
+        exit 1
+    fi
+    NETWORK_CHECK="$SCRIPT_DIR/../g1_teleop_network.sh"
+    [[ -x "$NETWORK_CHECK" ]] || {
+        echo -e "${RED}❌ Missing network preflight: $NETWORK_CHECK${NC}" >&2
+        exit 1
+    }
+    "$NETWORK_CHECK" check
+fi
 
 echo -e "Resolved interface: ${GREEN}$TARGET${NC}"
 echo -e "Environment type:   ${GREEN}$ENV_TYPE${NC}"
@@ -547,7 +544,7 @@ echo -e "${CYAN}═════════════════════�
 echo ""
 echo -e "${YELLOW}The following command will be executed:${NC}"
 echo ""
-echo -e "${BLUE}just run g1_deploy_onnx_ref $TARGET $CHECKPOINT_DECODER $MOTION_DATA \\${NC}"
+echo -e "${BLUE}./target/release/g1_deploy_onnx_ref $TARGET $CHECKPOINT_DECODER $MOTION_DATA \\${NC}"
 echo -e "${BLUE}    --obs-config $OBS_CONFIG \\${NC}"
 echo -e "${BLUE}    --encoder-file $CHECKPOINT_ENCODER \\${NC}"
 echo -e "${BLUE}    --planner-file $PLANNER \\${NC}"
@@ -574,11 +571,18 @@ read -p "$(echo -e ${GREEN}Proceed with deployment? [Y/n]: ${NC})" confirm
 if [[ "$confirm" =~ ^[Yy]$ ]] || [[ -z "$confirm" ]]; then
     echo ""
     echo -e "${GREEN}🚀 Starting deployment...${NC}"
+    echo -e "${YELLOW}📋 Ctrl-C is disabled from here on; stop the robot with the 'o' key.${NC}"
     echo ""
-    
-    # Build the command with optional extra args
+
+    # Ignore SIGINT so an accidental Ctrl-C in this terminal cannot kill the
+    # control loop. Stopping is done via the 'o' key or an external `kill`.
+    trap '' INT
+
+    # Run the binary directly instead of via `just run`: just installs its own
+    # SIGINT handling and kills the recipe on Ctrl-C, defeating the trap above.
+    # The command is otherwise identical (the `run` recipe is a plain passthrough).
     if [[ -n "$EXTRA_ARGS" ]]; then
-        just run g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \
+        ./target/release/g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \
             --obs-config "$OBS_CONFIG" \
             --encoder-file "$CHECKPOINT_ENCODER" \
             --planner-file "$PLANNER" \
@@ -588,7 +592,7 @@ if [[ "$confirm" =~ ^[Yy]$ ]] || [[ -z "$confirm" ]]; then
             --default-motion "$DEFAULT_MOTION_NAME" \
             $EXTRA_ARGS
     else
-        just run g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \
+        ./target/release/g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \
             --obs-config "$OBS_CONFIG" \
             --encoder-file "$CHECKPOINT_ENCODER" \
             --planner-file "$PLANNER" \

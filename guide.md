@@ -46,6 +46,16 @@ source scripts/setup_env.sh
 ./deploy.sh --input-type zmq real
 ```
 
+v1.1:
+
+```bash
+cd gear_sonic_deploy
+source scripts/setup_env.sh
+./deploy.sh --cp policy/sonic_v1_1/model \
+    --obs-config policy/sonic_v1_1/observation_config.yaml \
+    --input-type zmq real
+```
+
 设置环境变量并启动身体/手/脖子 server（Pico + Manus）：
 
 ```bash

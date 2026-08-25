@@ -1,0 +1,478 @@
+================================================================================
+imgwm (Cosmos WM) client 连通性排查 + 分辨率链路分析
+日期: 2026-07-28
+对象: psix_rtc_sonic_wm_client.py  <->  http://192.168.123.240:8016
+================================================================================
+
+## 0. TL;DR
+
+1. WM server 工作正常，能返回合法的 subgoal image (320x240, ~1.75s 延迟)，
+   预测内容也是对的（dummy 图里 WM 生成了机械手伸过去抓物体的未来帧）。
+
+2. 但生产 client 在 future 模式（默认）下会把**每一张** goal 都丢掉。
+   这是纯 client 侧 bug，server 无责。已修复并验证。
+
+3. VLA 的输入分辨率训练时就是 320x240。WM server 的 output_size 设成 320x240
+   是为了对齐 VLA，让 goal image 进 VLA 时 resize 成为 no-op。
+   WM 自己的原生生成分辨率是 512x384。
+
+
+================================================================================
+## 1. client 是怎么连上 WM server 的
+================================================================================
+
+代码位置: psix_rtc_sonic_wm_client.py -> class WmSubgoalProvider (:476)
+
+连接方式:
+  - 直连 G1 有线子网: http://192.168.123.240:8016  (--wm-host / --wm-port)
+  - 不走隧道。run_wm_tunnel.sh 已标记 LEGACY/DEBUG ONLY，
+    没有 PSIX_ENABLE_LEGACY_WM_TUNNEL=1 会直接拒绝启动。
+  - requests.Session 且 trust_env=False —— 绝不让私有 WiFi 流量走 HTTP(S)_PROXY
+
+端点:
+  GET  /ready   -> {"ready": true, "backend": "cosmos_psix_wm_future5"}
+  GET  /state   -> recipe / latency / checkpoint_info / uptime
+  POST /wm      -> 主推理端点
+
+线程模型:
+  - 后台单 worker 线程，串行请求，周期 --wm-period 3.0s，超时 --wm-timeout 15s
+  - ego 帧不是 worker 自己抓的。VLA 发送循环是唯一的相机读取者，
+    通过 update_latest_ego() 投喂不可变快照给 WM worker，
+    避免两个线程抢相机的 ZMQ REQ socket。
+
+请求体 (future 模式，即默认):
+  {
+    "transport": "jpeg",
+    "jpeg": true,
+    "ego_jpeg": "<base64 JPEG q90>",
+    "task": "Pick up the object and place it in the container.",
+    "req_id": <int, 自增>,
+    "robot_episode_session_id": "<uuid>",
+    "prompt_gen": <int, prompt epoch>,
+    "mode": "future",
+    "seconds": 3.2
+    // 可选 "seed": <int>，reroll 时才带
+  }
+
+  注意: future 模式**故意不发 subtask**。
+  _build_request_body (:1084-1093) 的注释写得很清楚:
+  "FUTURE mode takes NO subtask guidance: those checkpoints were trained with
+   the whole task text standing in for the subtask."
+  只有 subgoal 模式才发 subtask 字段。
+
+响应体 (实测):
+  {
+    "task": "...",
+    "subtask": null,                    <-- future 模式下必然是 null
+    "subtask_from_task": true,          <-- server 诚实地说明 caption 来自 task
+    "instruction_used": "<structured JSON caption>",
+    "robot_episode_session_id": "...",  <-- 回显，匹配
+    "req_id": 1,                        <-- 回显，匹配
+    "prompt_gen": 0,                    <-- 回显，匹配
+    "gen_id": 7,
+    "backend": "cosmos_psix_wm_future5",
+    "prompt_schema": "twopath_vid5_v4",
+    "seed": 0,
+    "preset": "fast",
+    "num_inference_steps": 8,
+    "guidance_scale": 6.0,
+    "output_size": "320x240",
+    "condition_size": "672x384",
+    "mode": "future",
+    "horizon_seconds": 3.2,
+    "seconds_requested": null,          <-- server 侧回显字段写错了，无害
+    "mrope_fps": 1.25,
+    "inference_time_ms": 1767.27,
+    "total_time_ms": 1768.57,
+    "subgoal_jpeg": "<base64 JPEG>"     <-- 8184 字节，解出 320x240 RGB
+  }
+
+server 构造的 caption (instruction_used，future 模式):
+  {"actions": [{"description": "Continuing the task: pick up the object and
+   place it in the container.", "time": "0:00-0:03.2"}],
+   "context": "Current subtask: pick up the object and place it in the container.",
+   "prediction": {"horizon_seconds": 3.2, "type": "future"},
+   "resolution": {"H": 384, "W": 512},
+   "temporal_caption": "In 3.2 seconds after the current frame, show how the
+   scene has evolved as the robot continues the task: ..."}
+  -> 即 subtask 位置直接用 task 文本填充，与训练一致。
+
+
+================================================================================
+## 2. Mock 方法
+================================================================================
+
+脚本: mock_wm_client.py  (当前在 scratchpad，可按需移入 repo)
+运行环境: conda env `sonic`  (/home/weiduoyuan/miniforge3/envs/sonic/bin/python)
+
+设计思路: 不重写一个假 client，而是**直接 import 生产代码里的 WmSubgoalProvider**，
+用 dummy 帧喂它。这样请求构造、响应校验、goal content gate 全部走真实代码路径，
+测出来的就是真机会遇到的行为。
+
+两个阶段:
+  Phase RAW  —— 手工构造一个与 _build_request_body 字节级一致的请求，
+                打印 server 返回的所有顶层字段，并逐条复放 client 的校验逻辑。
+  Phase LIVE —— 启动真实 WmSubgoalProvider，以 30Hz 投喂 dummy ego 帧
+                （模拟 VLA 发送循环），观察 goal 是否落地。
+
+Dummy 图设计: 640x480 RGB，含桌面 / 静止容器 / 一个横向移动的绿球 + 帧号。
+  必须让画面动起来 —— client 的 goal gate 依赖帧间运动量，
+  完全静止的 dummy 会被判成 stay-put/collapse，测不到 accept 路径。
+
+复现命令:
+  /home/weiduoyuan/miniforge3/envs/sonic/bin/python mock_wm_client.py \
+      --duration 16 --out-dir ./mock_wm_out
+  # 加 --patch-subtask-check 可在不改仓库文件的前提下验证修复效果
+
+
+================================================================================
+## 3. BUG: future 模式下所有 goal 被丢弃  [已修复]
+================================================================================
+
+### 现象
+
+用真实 WmSubgoalProvider 跑 16 秒 / 6 次请求，**0 张 goal 被接受**:
+
+  [wm] /wm failed (response subtask does not match the requested stage);
+       retaining last-good goal          x6
+
+  final status: goal_generation=0, goal_stale=true,
+                last_wm_error="response subtask does not match the requested stage"
+
+真机后果: client 永远拿不到 goal。配合 --wm-goal-hard-age 30，
+         30 秒后触发 hold/stop WBC。
+
+### 根因
+
+psix_rtc_sonic_wm_client.py:1122 (修复前):
+
+    if str(payload.get("subtask", "")) != request["subtask"]:
+        raise ValueError("response subtask does not match the requested stage")
+
+future 模式下 client 根本没把 subtask 发出去 -> server 无从得知 -> 回 null
+-> str(None) == "None" != "Grasp the object." -> 每个响应都被判为 stale 丢弃。
+
+矛盾完全在 client 内部，同一个文件里两处打架:
+  _build_request_body (:1084)  故意不发 subtask（还写了注释解释为什么）
+  _poll_once          (:1122)  却要求它回来
+
+### 为什么不是 server 的问题
+
+该字段从来没上过线，server 物理上无法回显。且 server 在其他所有维度都正确:
+
+  返回 subgoal_jpeg          OK  320x240 有效图像
+  回显 req_id                OK  匹配
+  回显 robot_episode_session_id  OK  匹配
+  回显 prompt_gen            OK  匹配
+  遵守 seconds               OK  发 1.0 -> horizon 1.0；发 3.2 -> 3.2
+  模式不匹配的处理           OK  干净的 HTTP 400 + 可操作的错误信息
+
+  实测 mode=subgoal 打到这台 future-only server:
+    HTTP 400
+    error = "this server serves mode='future'; client asked for 'subgoal'.
+             Use image_world_model_server_psix for subgoal mode."
+
+server 甚至用 "subtask": null + "subtask_from_task": true 诚实地说明了
+"我没收到 subtask，caption 是从 task 构造的" —— client 把这份诚实当成了错误。
+
+### 引入时间
+
+git log: 352e270 "cosmos wm client default future mode 3.2s" 把 future 设为默认时引入。
+（最新 commit 6052f70 "add new future mode standards"）
+从未对着真 Cosmos future server 跑通过，所以一直没暴露。
+
+影响范围: 仅 psix_rtc_sonic_wm_client.py。
+         psix_rtc_sonic_hlpwm_client.py 没有这条校验（:1550 直接解 subgoal_jpeg），不受影响。
+
+### 修复
+
+    # Only meaningful when we actually sent a subtask. Future mode builds
+    # the caption from `task` alone and omits the field, so the server has
+    # nothing to echo and answers `subtask: null` (`subtask_from_task:
+    # true`) — requiring an echo here rejected every future-mode goal.
+    # Staleness is still covered: req_id / prompt_gen / episode session are
+    # matched above, and the stage/epoch/subtask recheck below compares the
+    # request against current client state, not the server's echo.
+    if (self._mode != "future" and
+            str(payload.get("subtask", "")) != request["subtask"]):
+        raise ValueError("response subtask does not match the requested stage")
+
+### 为什么这个修复是安全的
+
+删掉这条校验不丢任何保护，因为真正的防串台逻辑在别处:
+
+  a) :1151 的 stale_response —— 在锁里拿"请求记录的 stage/epoch/subtask"
+     去比"client 当前状态"，完全不依赖 server 回显。这才是真正的 staleness 保护。
+  b) 传输层对应关系另有三道锁: req_id / prompt_gen / robot_episode_session_id，
+     实测全部通过。
+
+subtask 回显只是第四道冗余检查，而在 future 模式下它是一道
+**永远不可能通过**的检查。
+
+### 修复后验证 (用未打补丁的仓库文件)
+
+  [wm] goal landed stage=0 epoch=0 gen=1 latency=1779ms
+       gate[obs_motion=n/a goal_vs_obs=10.0 goal_jump=n/a]
+  [wm] goal landed stage=0 epoch=0 gen=2 latency=1753ms
+       gate[obs_motion=1.1 goal_vs_obs=5.1 goal_jump=10.0]
+  [wm] goal landed stage=0 epoch=0 gen=3 latency=1760ms
+       gate[obs_motion=1.4 goal_vs_obs=5.5 goal_jump=5.0]
+  [live] finished: 3 goal(s) accepted in 13s
+
+goal content gate、obs/goal 配对存盘、stay-put 重采样逻辑全部正常工作。
+
+
+================================================================================
+## 4. 分辨率链路
+================================================================================
+
+### 4.1 VLA 训练时就是 320x240
+
+证据 1 —— 训练脚本
+  /home/weiduoyuan/Desktop/psi/scripts/train/psix/finetune-real-sonic-psix-subtask.sh:112-113
+
+    --data.transform.model.resize.size 240 320
+    --data.transform.model.center_crop.size 240 320
+
+  顺序是 (H, W)。见 psi/src/psi/config/augmentation.py:8 的显式注释:
+    size: int | tuple[int, int] = (256, 480)  # H,W
+  所以 H=240, W=320，即 320x240 (WxH)。
+
+证据 2 —— ego 和 subgoal 走同一个 transform (训练端)
+  psi/src/psi/config/transform_psix.py:
+
+    t1 = v2.Compose([resizer, center_crop, color_jitter...])
+    images        = [t1(img) for img in obs_t]   # ego
+    subgoal_image = [t1(img) for img in sg_t]    # goal <- 同一个 t1
+
+证据 3 —— 推理端完全对齐
+  psi/src/psi/deploy/serve_psix.py:
+
+    :210  self._img_transform = v2.Compose([
+              self.model_transform.resize(),
+              self.model_transform.center_crop()])
+    :270  preprocess_image()  对每个相机 key 应用 _img_transform   <- ego
+    :344  goal_image = self._img_transform(...)                    <- goal
+
+  且 model_transform 是从 checkpoint 的 launch config 读出来的，
+  所以部署时自动继承训练设置，不会飘。
+
+  (serve_psi0_sonic_subgoal.py:272 同理，对 image_dict 所有 key 一视同仁)
+
+### 4.2 完整链路
+
+  环节                          分辨率      谁决定的
+  ---------------------------------------------------------------------------
+  相机 -> client ego            640x480     相机原生；client 全程不 resize
+  client -> WM (ego_jpeg)       640x480     原样转发，JPEG q90
+  WM server condition 输入      672x384     server recipe（内部）
+  Cosmos WM 原生生成            512x384     finetune-real-psix-wm-cosmos.sh:
+                                            COSMOS_HEIGHT=384 COSMOS_WIDTH=512
+  WM server -> client (goal)    320x240     server recipe output_width/height
+                                            ^^^ 出口降采样，为了对齐 VLA
+  client -> VLA (subgoal.ego)   320x240     原样转发，client 不 resize
+  client -> VLA (video.ego)     640x480     原样转发
+  VLA 内部 resize+crop          320x240     训练/推理共用的 model_transform
+
+  client 侧代码 (psix_rtc_sonic_wm_client.py:2894):
+    img_obs = {
+        "video.egocentric":   frame,           # 640x480
+        "subgoal.egocentric": subgoal_frame,   # 320x240
+    }
+  两者都原样进 VLA，缩放由 VLA server 的 repack 完成。
+
+### 4.3 为什么 WM server 设成 320x240
+
+因为那正好是 VLA 的输入分辨率。WM 把输出直接生成在 VLA 的 native 输入尺寸上，
+让 goal image 进 VLA 时 resize 变成 no-op，不引入额外的重采样。
+
+所以 320x240 是"WM 迁就 VLA"的产物，不是 WM 的天然尺寸 ——
+WM 自己在 512x384 上工作，返回的 caption JSON 里还留着
+"resolution": {"H": 384, "W": 512}。
+
+### 4.4 宽高比一致性
+
+  640x480 = 4:3
+  512x384 = 4:3
+  320x240 = 4:3
+  -> resize 干净，center_crop 是 no-op，没有裁掉任何视野。
+
+  只有 condition_size 672x384 = 1.75:1 不是 4:3，
+  但那是 WM server 内部条件编码的事（大概率是 Cosmos 的 patch/latent 对齐要求），
+  不影响输出。
+
+### 4.5 两点观察（不影响功能）
+
+  a) WM 路径的 goal 比 GT 路径多一次 server 侧降采样。
+     --goal-source episode 给的 GT goal 是 640x480（data/.../color_subgoal/*.jpg），
+     由 VLA 降到 320x240；WM 路径则是 512x384 -> 320x240 已在 server 侧降过。
+     最终都是 320x240，重采样次数其实一样，差别很小。
+     但注意: 你在 bagel_gen_images/ 里存下来的 WM goal 已经是 320x240 了，
+     做画质对比时要记得这一点。
+
+  b) 在 server 侧降采样是对的选择。
+     若让 WM 发 512x384 交给 VLA 降，画质基本等价，但每帧要多传约 2.5 倍字节。
+     现在这样更省带宽。
+
+
+================================================================================
+## 5. 附带发现
+================================================================================
+
+1) --wm-seconds 是真生效的
+   实测 (必须用不同 req_id):
+     seconds=1.0  -> horizon_seconds=1.0
+     seconds=3.2  -> horizon_seconds=3.2
+     不发 seconds -> horizon_seconds=3.2  (server 默认)
+
+2) server 按 (robot_episode_session_id, req_id) 做幂等缓存
+   复用同一对 key 会拿到缓存结果，不会重新推理。
+   第一次测 seconds 时被这个骗过一次 —— 三次不同 seconds 全返回了第一次的结果。
+   写测试脚本时注意 req_id 要递增。
+
+3) 响应里的 seconds_requested 永远是 null
+   server 侧回显字段写错了。horizon_seconds 是对的，所以无害。
+   但如果以后要靠这个字段做校验，得先让 server 修。
+
+4) server 状态 (2026-07-28 实测)
+   backend:      cosmos_psix_wm_future5
+   latency:      p50 1759.9ms / p95 1777.4ms / max 1852.0ms
+   recipe:       preset=fast, num_inference_steps=8, guidance_scale=6.0,
+                 flow_shift=10.0, num_frames=5, fps=0.25, mrope_fps=0.25,
+                 prompt_schema=twopath_vid5_v4
+   checkpoint:   dcp, weights_variant=regular, torch_compile=false
+
+5) WM 输出质量确认
+   dummy 图（桌面 + 绿球 + 蓝色容器）喂进去，WM 生成的未来帧里
+   多了一只机械手伸过去抓住绿球，容器位置保持不变，场景布局保留。
+   说明模型在真正做未来预测，不是返回噪声或原图。
+
+
+================================================================================
+## 6. client 侧强制 resize 到 320x240  [已实现]
+================================================================================
+
+### 需求
+
+不再依赖 WM server 的 output recipe —— 由 client 保证进 VLA 的 goal 一定是
+320x240。宽高比变形是接受的：训练时 v2.Resize((240,320)) 本来就是拉伸到精确
+尺寸，复现同样的变形才是与训练一致的做法。
+
+### 实现
+
+新增模块级常量与 helper（psix_rtc_sonic_wm_client.py）:
+
+    VLA_GOAL_HW = (240, 320)          # (H, W)
+
+    def resize_goal_for_vla(rgb):
+        if rgb.shape[:2] == VLA_GOAL_HW:
+            return rgb                # 尺寸已对 -> 直接短路，零拷贝
+        h, w = rgb.shape[:2]
+        interp = (cv2.INTER_AREA if h > VLA_GOAL_HW[0] or w > VLA_GOAL_HW[1]
+                  else cv2.INTER_LINEAR)
+        return np.ascontiguousarray(
+            cv2.resize(rgb, (VLA_GOAL_HW[1], VLA_GOAL_HW[0]), interpolation=interp))
+
+调用点: VLA 发送循环，goal 的 dtype/shape 校验之后、_condition_for_send() 之前。
+
+### 为什么放在这个位置
+
+  a) 在 condition 铸造之前 —— 被 hash 进 condition 的数组，
+     就是 VLA 真正消费的那个数组，两者恒等，不会出现
+     "hash 的是 A、发的是 B" 的错位。
+  b) 覆盖两条 goal 来源 —— WM provider (320x240) 和
+     episode/GT provider (640x480) 都会经过这里。
+  c) 稳态零开销 —— 尺寸已对时只有一次 tuple 比较就返回原对象，
+     30Hz 循环里几乎不可测。
+
+不改 _save_bagel_goal: 它落盘的是 server 返回的**原始 JPEG 字节**，
+保留审计价值（能看到 server 到底发了什么）。
+
+### 变形取舍
+
+  interpolation 选择: 缩小用 INTER_AREA，放大用 INTER_LINEAR。
+  今天 server 就发 320x240，所以这一步是 no-op，选什么都不影响；
+  只有 server recipe 改了才会真正触发。
+
+
+================================================================================
+## 7. 全链路验证结果 (2026-07-28)
+================================================================================
+
+脚本: verify_chain.py    配置: mode=future, seconds=3.2, period=3.0s, 时长 32s
+
+### 7.1 resize 契约静态检查
+
+    输入        输出        行为
+    ------------------------------------
+    320x240 ->  320x240    no-op      OK
+    512x384 ->  320x240    resized    OK
+    640x480 ->  320x240    resized    OK
+    424x240 ->  320x240    resized    OK    (非 4:3，按预期拉伸)
+    160x120 ->  320x240    resized    OK    (放大路径)
+
+### 7.2 实跑结果
+
+    goals accepted     : 8 in 32s
+    WM latency         : p50=1474ms  min=1468ms  max=1513ms
+    refresh period     : 3.0s -> 最坏延迟下仍有 1.49s 余量
+    goal-to-goal gap   : 2.95s, 3.02s, 7.43s, 3.01s, 2.98s, 7.42s, 3.01s
+    WM raw output      : 320x240
+    into VLA           : 320x240，8/8 全部通过
+    final wm error     : None
+    final goal_stale   : False
+
+### 7.3 horizon 确认
+
+    用 provider 自己构造的 body（_request_snapshot + _build_request_body）实发:
+      body: {..., 'mode': 'future', 'seconds': 3.2}
+      ->    horizon_seconds = 3.2   output_size = 320x240   rtt = 1485ms
+    确认 3.2s 的 horizon 在 live 路径上被服务端正确采纳。
+
+### 7.4 结论
+
+    链路完全通。1.47s 的推理延迟对 3.0s 的刷新周期有 2 倍余量，
+    即使延迟翻倍也不会挤掉刷新节奏。
+
+### 7.5 需要注意的一点
+
+    goal-to-goal 间隔里出现了两次 7.4s，不是延迟问题，是 stay-put gate 生效:
+    连续 3 次判定「画面没怎么动 且 goal 与 obs 差异小」-> HELD 不安装，
+    换 seed 重采样；3 次耗尽后强制安装最新提案。
+
+    这是 gate 的正常设计行为。本次 dummy 图运动量偏小（obs_motion≈1.4）
+    才频繁触发，真机上有真实运动时应显著减少。
+
+    即便如此 7.4s 仍远低于 --wm-goal-hard-age 30s，不会触发 hold/stop。
+    但如果真机上看到 goal 长时间不更新，先看是不是 stay-put 在 HELD，
+    而不是先怀疑 WM 慢。
+
+
+================================================================================
+## 8. 变更清单
+================================================================================
+
+已改（psix_rtc_sonic_wm_client.py，共 +45/-1 行）:
+
+  1) :1122 区域  future 模式豁免 subtask 回显校验
+                 -> 修复「所有 goal 被丢弃」
+
+  2) 模块级      新增 VLA_GOAL_HW = (240, 320) 常量
+                 新增 resize_goal_for_vla() helper
+
+  3) 发送循环    goal 校验后、_condition_for_send() 前插入
+                 subgoal_frame = resize_goal_for_vla(subgoal_frame)
+                 -> 保证进 VLA 恒为 320x240
+
+未改 / 待定:
+  mock_wm_client.py / verify_chain.py 目前在 scratchpad:
+    /tmp/claude-1007/-mnt-data-weiduo-heng-GR00T-WholeBodyControl/
+    748b3a25-d910-4657-be3c-995682d1e78f/scratchpad/
+  建议移入 repo（如 tools/）作为回归测试 ——
+  这次的 bug 正是那种"不连真 server 跑一次就发现不了"的类型。
+
+产物:
+  scratchpad/mock_wm_out/    31 个文件，accepted/stayput-held goal + 配对 obs + sidecar
+  scratchpad/verify_fix/     修复后用真实仓库文件的复验
+  scratchpad/chain_out/      全链路验证产物，含 vla_in_genNNN.jpg
+                             （即最终喂给 VLA 的 320x240 图）

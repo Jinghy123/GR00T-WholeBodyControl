@@ -1,0 +1,53 @@
+./run_psix_hlpwm_client.sh --real --task pick_place_1     --prompt "pick up the gray hippo toy and place it into the transparent box"
+[g1-network] OK: profile 'g1 TELEOP' is pinned and cannot supply DNS/default routes
+[g1-network] OK: enp4s0 has 192.168.123.222/16 and contributes no IPv4/IPv6 default route or DNS
+[g1-network] OK: G1 route is direct: dev enp4s0 src 192.168.123.222
+[g1-network] OK: WM route is direct: dev enp4s0 src 192.168.123.222
+[g1-network] OK: production G1-wired network contract passed
+[launcher] VLA ready: http://127.0.0.1:8014/health
+[launcher] VLA contract: embodiment=psix_g1_sonic_neck dims=45/80
+[launcher] HLP disabled: skipping HLP health/lease entirely
+[launcher] WM ready=true: http://192.168.123.240:8016/ready
+[launcher] prompt override: pick up the gray hippo toy and place it into the transparent box
+[launcher] (subtask stages still come from pick_place_1)
+[launcher] scene mode: HLP OFF; episode prompts + manual takeover
+[launcher] prompts: /mnt/data/weiduo/heng/GR00T-WholeBodyControl/data/zedmini10_pick_cloth/prompts.json [pick_place_1]
+[launcher] episode dir: /mnt/data/weiduo/heng/GR00T-WholeBodyControl/data/zedmini10_pick_cloth/pick_cloth_1
+[launcher] rollout telemetry: /home/weiduoyuan/Desktop/psi/.logs/bagel_gen_images/20260729-160513
+[launcher] controls: Enter=next | text/:ov TEXT=manual | :resume | :restart
+[launcher] starting REAL client
+[launcher] client/HLP logs: /home/weiduoyuan/Desktop/psi/.logs/HLP_WM_logs
+[launcher] client console log: /home/weiduoyuan/Desktop/psi/.logs/HLP_WM_logs/20260729-160514_client.log
+[MAIN] VLA embodiment=psix_g1_sonic_neck dims=45/80; client_layout=45/80 neck
+usage: psix_rtc_sonic_wm_client.py [-h] [--host HOST] [--port PORT]
+                                   [--embodiment-tag EMBODIMENT_TAG]
+                                   [--zmq-host ZMQ_HOST]
+                                   [--zmq-pub-port ZMQ_PUB_PORT]
+                                   [--zmq-sub-port ZMQ_SUB_PORT]
+                                   [--zmq-topic ZMQ_TOPIC]
+                                   [--zmq-sub-topic ZMQ_SUB_TOPIC]
+                                   [--camera-address CAMERA_ADDRESS]
+                                   [--camera-timeout-ms CAMERA_TIMEOUT_MS]
+                                   [--episode-dir EPISODE_DIR]
+                                   [--prompts-json PROMPTS_JSON]
+                                   [--task-key TASK_KEY]
+                                   [--instruction INSTRUCTION]
+                                   [--goal-source {wm,episode}]
+                                   [--wm-host WM_HOST] [--wm-port WM_PORT]
+                                   [--wm-period WM_PERIOD]
+                                   [--wm-timeout WM_TIMEOUT]
+                                   [--jpeg-quality JPEG_QUALITY]
+                                   [--wm-mode {future,subgoal}]
+                                   [--wm-seconds WM_SECONDS]
+                                   [--wm-stale-warn WM_STALE_WARN]
+                                   [--wm-goal-hard-age WM_GOAL_HARD_AGE]
+                                   [--wm-dump-dir WM_DUMP_DIR]
+                                   [--observation-stale-timeout OBSERVATION_STALE_TIMEOUT]
+                                   [--action-stale-timeout ACTION_STALE_TIMEOUT]
+                                   [--condition-promote-timeout CONDITION_PROMOTE_TIMEOUT]
+                                   [--dry-run]
+                                   [--include-neck | --no-include-neck]
+                                   [--neck-pub-host NECK_PUB_HOST]
+                                   [--neck-pub-port NECK_PUB_PORT]
+                                   [--neck-state-zmq NECK_STATE_ZMQ]
+psix_rtc_sonic_wm_client.py: error: task-key 'pick_place_1' not found in /mnt/data/weiduo/heng/GR00T-WholeBodyControl/data/zedmini10_pick_cloth/prompts.json; available: ['pick_cloth_1', 'pick_cloth_2']

@@ -3619,7 +3619,7 @@ class G1Deploy {
           }
         } else {
           // if (current_frame_ >= current_motion_->timesteps - saved_frame_for_observation_window_) {
-          constexpr int kStreamWindowCap = 10;
+          constexpr int kStreamWindowCap = 30;
           const int eff_window = std::min(saved_frame_for_observation_window_, kStreamWindowCap);
           if (current_frame_ >= current_motion_->timesteps - eff_window) {
             current_frame_ = current_frame_ - 1;

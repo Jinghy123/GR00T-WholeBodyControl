@@ -21,13 +21,18 @@ Options:
   --password <password>    WiFi password (required for secured networks)
   --interface <ifname>     WiFi interface (optional; auto-detect if omitted)
   --connection <name>      Connection profile name (optional; defaults to SSID)
-  --gateway <ip>           Gateway IP (optional; sets route/DNS)
+  --gateway <ip>           Gateway IP (optional; sets route only)
   --fallback-ssid <ssid>   Fallback SSID (optional)
   -h, --help               Show this help
 
 You can also set environment variables:
   WIFI_SSID, WIFI_PASSWORD, WIFI_INTERFACE, CONNECTION_NAME, FALLBACK_SSID, WIFI_GATEWAY,
   ROUTE_CLEANUP_GW
+
+This script contains no DNS setter, never writes /etc/resolv.conf, and never
+modifies a wired profile. It is a standalone WiFi repair tool and is not part
+of normal G1/WM deployment; NetworkManager still owns the selected WiFi
+profile's pre-existing DHCP/resolver policy.
 USAGE_EOF
 }
 
@@ -68,11 +73,11 @@ if [ -z "$WIFI_INTERFACE" ]; then
 fi
 
 # Network configuration
-# If WIFI_GATEWAY is set, routing and DNS will be configured to use it.
+# If WIFI_GATEWAY is set, routing will be configured to use it.
+# No explicit DNS setting and no wired-profile mutation occurs here.
 WIFI_GATEWAY="${WIFI_GATEWAY:-}"
 # Optional default gateway to remove from routing table.
 ROUTE_CLEANUP_GW="${ROUTE_CLEANUP_GW:-}"
-WIRED_CONNECTION="Wired connection 1"
 
 # Step 1: Unblock and enable WiFi
 echo "[1] Unblocking WiFi and enabling interface..."
@@ -145,10 +150,6 @@ if [ "$CONNECTION_SUCCESS" = "true" ]; then
     echo "    Setting WiFi connection priority to 100..."
     sudo nmcli connection modify "$CONNECTION_NAME" ipv4.route-metric 100
     
-    # Set wired connection to very low priority (high metric) 
-    echo "    Setting wired connection priority to 30000..."
-    sudo nmcli connection modify "$WIRED_CONNECTION" ipv4.route-metric 30000 2>/dev/null || true
-    
     # Remove any problematic default routes
     echo "    Cleaning up routing table..."
     if [ -n "$ROUTE_CLEANUP_GW" ]; then
@@ -159,13 +160,7 @@ if [ "$CONNECTION_SUCCESS" = "true" ]; then
     if [ -n "$WIFI_GATEWAY" ]; then
         sudo ip route add default via "$WIFI_GATEWAY" dev "$WIFI_INTERFACE" metric 50 2>/dev/null || true
         
-        # Configure DNS to use router and public DNS
-        echo "    Configuring DNS..."
-        sudo tee /etc/resolv.conf > /dev/null << DNS_EOF
-nameserver $WIFI_GATEWAY
-nameserver 8.8.8.8
-nameserver 1.1.1.1
-DNS_EOF
+        echo "    Leaving DNS unchanged (always)."
     fi
     
     echo "[✓] Network routing configured for WiFi priority"
@@ -233,7 +228,6 @@ if [ "$CONNECTION_SUCCESS" != "true" ] && [ -n "$FALLBACK_SSID" ]; then
             if [ -n "$ROUTE_CLEANUP_GW" ]; then
                 sudo ip route del default via "$ROUTE_CLEANUP_GW" 2>/dev/null || true
             fi
-            sudo nmcli connection modify "$WIRED_CONNECTION" ipv4.route-metric 30000 2>/dev/null || true
         else
             echo "[✗] Failed to connect to fallback network"
         fi

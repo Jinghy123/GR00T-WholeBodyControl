@@ -12,6 +12,10 @@ SESSION="sonic"
 G1_PASS="123"                       # g1 login + sudo password
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # repo root (this script's dir)
 
+# Read-only fail-closed preflight before any tmux pane is created. Activate the
+# profile explicitly beforehand with ./g1_teleop_network.sh activate.
+"$REPO_DIR/g1_teleop_network.sh" check
+
 # Send a command line into pane $1 of the main window (types it + Enter).
 send() { tmux send-keys -t "${SESSION}:main.$1" "$2" C-m; }
 
@@ -48,7 +52,7 @@ send 0 "python realsense_server.py \
 tmux select-pane -t "${SESSION}:main.1" -T "deploy (WBC)"
 send 1 "cd ${REPO_DIR}/gear_sonic_deploy"
 send 1 "source scripts/setup_env.sh"
-send 1 "./deploy.sh --input-type zmq real"
+send 1 "./deploy.sh --input-type zmq enp4s0"
 
 # ── Pane 2: Desktop — body/hand/neck server (SlimeVR + Manus) ──────────────
 tmux select-pane -t "${SESSION}:main.2" -T "manus (SlimeVR)"
