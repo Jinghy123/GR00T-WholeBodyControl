@@ -130,7 +130,7 @@ IMAGE_BUFFER_SIZE = 100
 # TASK_PROMPT = "pick up the snack bag and turn right and throw it into the trash can"
 # TASK_PROMPT = "grasp the yellow bottle, open the top drawer of the kitchen island, place the bottle inside, and close the drawer"
 # TASK_PROMPT = "grasp the transparent bottle, open the top drawer of the kitchen island, place the bottle inside, and close the drawer"
-TASK_PROMPT = "grasp the silver can, open the top drawer of the kitchen island, place the can inside, and close the drawer"
+# TASK_PROMPT = "grasp the silver can, open the top drawer of the kitchen island, place the can inside, and close the drawer"
 # TASK_PROMPT = "grasp the green drink bottle, open the top drawer of the kitchen island, place the bottle inside, and close the drawer"
 # TASK_PROMPT = "open the top-right door of the cabinet, grab the purple flower, turn left, and place it at the top-right corner of the table"
 # TASK_PROMPT = "open the top-left door of the cabinet, grab the white flower, close the cabinet door, turn left, and place it at the top-right corner of the table"
@@ -168,6 +168,27 @@ TASK_PROMPT = "grasp the silver can, open the top drawer of the kitchen island, 
 # TASK_PROMPT = "kneel down and scoop up the beige pillow near the shoe rack and turn around and put it at the head of the bed"
 # TASK_PROMPT = "kneel down and scoop up the white pillow near the laundry basket and turn around and put it at the head of the bed"
 # TASK_PROMPT = "kneel down and scoop up the beige pillow near the laundry basket and turn around and put it at the head of the bed"
+
+# L1 prompts
+# TASK_PROMPT="kneel down, hook the pink shoes on the first tier of the shoe rack, turn around, kneel down again, and place them at the foot of the bed"
+# TASK_PROMPT="kneel down, hook the white shoes on the first tier of the shoe rack, turn around, kneel down again, and place them at the foot of the bed"
+# TASK_PROMPT="gather up the yellow shirt and turn right and put it into the laundry basket"
+# TASK_PROMPT="gather up the gray shirt and turn right and put it into the laundry basket"
+# TASK_PROMPT="gather up the black trousers and turn right and put them into the laundry basket"
+# TASK_PROMPT="gather up the white shirt and turn right and put it into the laundry basket"
+# TASK_PROMPT="grasp the backrest of the chair and push it straight under the table"
+# TASK_PROMPT="grasp the backrest of the chair, turn left, and push it under the table"
+# TASK_PROMPT="grasp the backrest of the chair, turn right, and push it under the table"
+# TASK_PROMPT="kneel down and scoop up the white toy near the shoe rack and turn around and put it at the head of the bed"
+# TASK_PROMPT="kneel down and scoop up the green pillow near the bed and put it at the head of the bed"
+# TASK_PROMPT="kneel down and scoop up the white toy near the bed and put it at the head of the bed"
+# TASK_PROMPT="kneel down and scoop up the green pillow near the kitchen island, turn left, and put it at the head of the bed"
+# TASK_PROMPT="kneel down and scoop up the white toy near the kitchen island, turn left, and put it at the head of the bed"
+# TASK_PROMPT="kneel down and scoop up the green pillow near the shoe rack, turn around, and put it at the head of the bed"
+# TASK_PROMPT="kneel down and scoop up the white toy near the shoe rack, turn around, and put it at the head of the bed"
+# TASK_PROMPT="kneel down and scoop up the green pillow near the laundry basket, turn around, and put it at the head of the bed"
+TASK_PROMPT="kneel down and scoop up the white toy near the laundry basket, turn around, and put it at the head of the bed"
+
 
 def fsq_quantize(continuous_value, fsq_min=FSQ_MIN, fsq_max=FSQ_MAX, fsq_step=FSQ_STEP):
     clipped = np.clip(continuous_value, fsq_min, fsq_max)

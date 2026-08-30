@@ -18,6 +18,18 @@ Keyboard controls (single key, no Enter needed):
   d  → stop recording and discard
   Ctrl-C → quit
 
+After every save the episode is checked (episode_verify.py) for three bugs:
+  BUG1  actions.neck stuck at [0,0] mid-episode — command stream dropped
+  BUG2  states.neck frozen at one value — state stream dead
+  BUG3  states.neck beyond ±1.2 rad — bad read
+Any hit raises an alarm and asks:
+
+  y  → delete the episode just saved (its index is reused)
+  n  → keep it
+
+No other key is accepted while that question is open. Disable with --no-verify;
+tune with --neck-limit / --frozen-run / --zero-run.
+
 Topology: G1 connects to the desktop over Ethernet at the fixed IP
 192.168.123.164. The recorder and the SMPL-X publisher both run on the
 desktop; everything else runs on the robot.
@@ -73,6 +85,7 @@ import numpy as np
 import zmq
 
 from episode_writer import EpisodeWriter
+from episode_verify import verify_episode_dir
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Configuration
@@ -552,6 +565,10 @@ class DataCollector:
         wuji_reader: "WujiHandStateReader | None" = None,
         neck_reader: "NeckActionReader | None" = None,
         neck_state_reader: "NeckStateReader | None" = None,
+        verify: bool = True,
+        neck_limit: float = 1.2,
+        frozen_run: int = 150,
+        zero_run: int = 10,
     ):
         self._camera            = camera
         self._state             = state_reader
@@ -563,6 +580,16 @@ class DataCollector:
         self._wuji_reader       = wuji_reader
         self._neck_reader       = neck_reader
         self._neck_state_reader = neck_state_reader
+
+        self._verify     = verify
+        self._neck_limit = neck_limit
+        self._frozen_run = frozen_run
+        self._zero_run = zero_run
+        # Set to {"dir":..., "idx":...} when a save failed verification and we
+        # are waiting for the operator to answer y/n. While it is set the
+        # keyboard loop forwards only y/n, so a stray 's' cannot start a new
+        # episode on top of an unresolved question.
+        self._verify_pending = None
 
         self._ep_writer  = None
         self._ep_dir     = None
@@ -605,16 +632,77 @@ class DataCollector:
         self._phase = "RECORDING"
         _rprint(f"\033[92m[Collector] START episode {self._ep_idx} → {ep_dir}\033[0m")
 
-    def _save(self):
+    def _save(self, interactive: bool = True):
         if self._phase != "RECORDING":
             _rprint("[Collector] Not recording.")
             return
         self._phase = "IDLE"
+        ep_dir = self._ep_dir
+        ep_idx = self._ep_idx
         self._ep_writer.save_episode()
+        # close() joins the writer queue and worker, so data.json is on disk
+        # by the time it returns -- safe to read back for verification.
         self._ep_writer.close()
         self._ep_writer = None
-        _rprint(f"\033[92m[Collector] SAVED episode {self._ep_idx}\033[0m")
+        _rprint(f"\033[92m[Collector] SAVED episode {ep_idx}\033[0m")
         self._ep_idx += 1
+
+        if self._verify:
+            self._run_verify(ep_dir, ep_idx, interactive=interactive)
+
+    # ── post-save verification ─────────────────────────────────────────────────
+
+    def _run_verify(self, ep_dir, ep_idx, interactive: bool = True):
+        """Check the just-saved episode and, on failure, offer to delete it."""
+        try:
+            rep = verify_episode_dir(
+                ep_dir,
+                neck_limit=self._neck_limit,
+                frozen_run=self._frozen_run,
+                zero_run=self._zero_run,
+            )
+        except Exception as e:                    # never let a check kill a session
+            _rprint(f"\033[93m[verify] check failed to run: {e!r} "
+                    f"(episode kept)\033[0m")
+            return
+
+        for line in rep.lines():
+            _rprint(line)
+        if rep.ok:
+            return
+
+        _rprint("")
+        _rprint("\033[91m" + "!" * 66 + "\033[0m")
+        _rprint(f"\033[91m!!  EPISODE {ep_idx} FAILED VERIFICATION\033[0m")
+        for bug, msg in rep.problems:
+            _rprint(f"\033[91m!!  {bug}  {msg}\033[0m")
+        _rprint("\033[91m" + "!" * 66 + "\033[0m")
+
+        if not interactive:
+            # Remote save, or the save-on-exit path: nobody is at the keyboard,
+            # so keep the data rather than silently destroying it.
+            _rprint(f"\033[93m[verify] non-interactive save -- episode {ep_idx} KEPT. "
+                    f"Review {ep_dir} by hand.\033[0m")
+            return
+
+        self._verify_pending = {"dir": ep_dir, "idx": ep_idx}
+        _rprint("\033[93m[verify] delete this episode?  y = delete   n = keep\033[0m")
+
+    def _resolve_verify(self, answer: str):
+        pend = self._verify_pending
+        self._verify_pending = None
+        if pend is None:
+            return
+        ep_dir, ep_idx = pend["dir"], pend["idx"]
+        if answer == "y":
+            if ep_dir and os.path.exists(ep_dir):
+                shutil.rmtree(ep_dir, ignore_errors=True)
+            # reuse the number, matching what _discard() leaves behind
+            self._ep_idx = ep_idx
+            _rprint(f"\033[91m[verify] DELETED episode {ep_idx} -- "
+                    f"next recording reuses index {ep_idx}\033[0m")
+        else:
+            _rprint(f"\033[92m[verify] kept episode {ep_idx} ({ep_dir})\033[0m")
 
     def _discard(self):
         if self._phase != "RECORDING":
@@ -641,6 +729,15 @@ class DataCollector:
                     if ch == "\x03":        # Ctrl-C
                         self._stop.set()
                         break
+                    if self._verify_pending is not None:
+                        # A failed episode is awaiting a verdict; take only y/n
+                        # so a stray key cannot start recording over it.
+                        if ch in ("y", "Y", "n", "N"):
+                            self._cmd_queue.put(ch.lower())
+                        else:
+                            _rprint("\033[93m[verify] answer the pending question "
+                                    "first: y = delete, n = keep\033[0m")
+                        continue
                     if ch in ("s", "q", "d"):
                         self._cmd_queue.put(ch)
         finally:
@@ -672,7 +769,13 @@ class DataCollector:
                         ch, session_id = cmd_item
                     else:
                         ch, session_id = cmd_item, None
-                    if ch == "s":
+                    if ch in ("y", "n"):
+                        self._resolve_verify(ch)
+                    elif self._verify_pending is not None:
+                        # Remote commands can arrive while a verdict is pending.
+                        _rprint("\033[93m[verify] a failed episode is awaiting "
+                                "y/n; ignoring command until it is answered\033[0m")
+                    elif ch == "s":
                         self._start(session_id=session_id)
                     elif ch == "q":
                         self._save()
@@ -765,7 +868,9 @@ class DataCollector:
             self._cmd_server.close()
             if self._phase == "RECORDING":
                 _rprint("[Collector] Saving episode on exit...")
-                self._save()
+                # The keyboard thread is gone by now, so there is nobody to
+                # answer a y/n prompt -- report and keep.
+                self._save(interactive=False)
             _rprint("[Collector] Done.")
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -800,6 +905,16 @@ if __name__ == "__main__":
                         "When set, the measured [yaw, pitch] is recorded "
                         "into data.json under states['neck']."
                     ))
+    ap.add_argument("--no-verify", action="store_true",
+                    help="skip the post-save neck sanity check")
+    ap.add_argument("--neck-limit", type=float, default=1.2,
+                    help=("alarm when |neck| exceeds this many radians (default: 1.2 — "
+                          "normal teleop overshoot reaches 1.06, real faults start at 1.44)"))
+    ap.add_argument("--frozen-run", type=int, default=150,
+                    help=("alarm when neck holds one constant value for this many "
+                          "consecutive frames (default: 150, ~5 s at 30 Hz)"))
+    ap.add_argument("--zero-run", type=int, default=10,
+                    help="alarm on a mid-episode [0,0] neck command run this long (default: 10)")
     args = ap.parse_args()
 
     camera             = None if args.no_camera else RealSenseClient()
@@ -817,6 +932,10 @@ if __name__ == "__main__":
         wuji_reader       = wuji_reader,
         neck_reader       = neck_reader,
         neck_state_reader = neck_state_reader,
+        verify            = not args.no_verify,
+        neck_limit        = args.neck_limit,
+        frozen_run        = args.frozen_run,
+        zero_run          = args.zero_run,
     )
 
     try:

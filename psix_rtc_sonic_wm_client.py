@@ -2197,6 +2197,66 @@ running.set()
 
 
 # ---------------- RTCWebSocketClient ----------------
+
+class NoGoalProvider(EpisodeSubgoalProvider):
+    """Task-instruction-only rollouts: no goal image, no subtask clause.
+
+    Reproduces the share of training where the goal was dropped
+    (`subgoal_prob < 1`). Because those checkpoints set
+    `couple_subtask_to_goal=true`, dropping the goal drops the subtask clause
+    with it, so the VLA sees `Task: <task>` alone and the server fills the goal
+    slot with a zeroed copy of the observation (its `goal_slot_placeholder`
+    path). One stage, so Enter is a no-op -- there is nothing to advance
+    through when the whole episode is one instruction.
+    """
+
+    def __init__(self, task=""):
+        self._episode_dir = None
+        self._subtasks = [""]
+        self._task = task
+        self._images = [None]
+        self.paths = [None]
+        self._goal_records = []
+        self._prompt_stage = 0
+        self._prompt_epoch = 0
+        self._goal_generation = 1
+        self._goal_updated_at = time.monotonic()
+        self._lock = threading.Lock()
+        # Same per-run identity the GT provider stamps on its sidecars; the
+        # rollout logger and the condition handshake both read it.
+        self._episode_session_id = str(uuid.uuid4())
+
+    def start(self):
+        # The GT provider's start() logs the first goal's path/sha; there is no
+        # goal here, so announce the mode instead of indexing an empty list.
+        print(f"[no-goal] task-only rollout: {self._task!r} "
+              f"(no goal image, no subtask clause)", flush=True)
+
+    def stop(self):
+        pass
+
+    def provenance(self):
+        return {"source": "no_goal", "episode_dir": None, "goals": []}
+
+    def snapshot(self):
+        snap = super().snapshot()
+        snap["goal_source"] = "no_goal"
+        return snap
+
+    def advance_prompt(self):
+        # Single stage by construction; keep the callback signature but do
+        # nothing rather than wrapping back to a stage that does not exist.
+        print("[no-goal] single-stage mode: Enter does nothing", flush=True)
+
+    def restart(self):
+        with self._lock:
+            self._prompt_epoch += 1
+            self._goal_generation += 1
+            self._goal_updated_at = time.monotonic()
+        print("[no-goal] restarted (new prompt epoch)", flush=True)
+
+
+
 class RTCWebSocketClient:
     def __init__(self, server_url, state_subscriber, camera, token_publisher, wm_provider,
                  task_instruction, dry_run=False, observation_stale_timeout=0.5,
@@ -2541,7 +2601,12 @@ class RTCWebSocketClient:
             candidate = {
                 "sid": self._vla_session_id,
                 "cid": cid,
-                "hash": condition_hash(instruction, goal),
+                # Same sentinel the server uses when a request carries no goal
+                # (serve_psix: `goal_arr if goal_arr is not None else zeros((0,0,3))`),
+                # so the two peers hash identically in no-goal mode.
+                "hash": condition_hash(
+                    instruction,
+                    goal if goal is not None else np.zeros((0, 0, 3), np.uint8)),
                 "prompt_epoch": key[0],
                 "goal_generation": key[1],
                 "prompt_stage": int(wm["prompt_stage"]),
@@ -3315,7 +3380,12 @@ class RTCWebSocketClient:
 
                 wm = self._wm.snapshot()
                 subgoal_frame = wm["goal"]
-                if subgoal_frame is None or wm["goal_stale"] or wm["goal_expired"]:
+                # no-goal mode has no goal by construction, so "goal is None" is
+                # the steady state here, not a reason to hold. The staleness and
+                # expiry checks still apply to the sources that do produce goals.
+                _no_goal_mode = wm.get("goal_source") == "no_goal"
+                if ((subgoal_frame is None and not _no_goal_mode)
+                        or wm["goal_stale"] or wm["goal_expired"]):
                     if wm["goal_expired"]:
                         hold_reason = (
                             f"WM last-good goal expired ({wm['goal_age_s']:.1f}s > "
@@ -3337,7 +3407,8 @@ class RTCWebSocketClient:
                         )
                     time.sleep(max(0.0, OBS_SEND_INTERVAL - (time.monotonic() - tick_started)))
                     continue
-                if (subgoal_frame.dtype != np.uint8 or subgoal_frame.ndim != 3 or
+                if subgoal_frame is not None and (
+                        subgoal_frame.dtype != np.uint8 or subgoal_frame.ndim != 3 or
                         subgoal_frame.shape[2] != 3):
                     raise ValueError(
                         f"WM goal must be RGB uint8 HxWx3, got "
@@ -3351,7 +3422,8 @@ class RTCWebSocketClient:
                 # (or on which provider produced the goal — the episode/GT source
                 # serves 640x480). A correctly sized goal short-circuits, so the
                 # steady state costs one tuple compare per tick.
-                subgoal_frame = resize_goal_for_vla(subgoal_frame)
+                if subgoal_frame is not None:
+                    subgoal_frame = resize_goal_for_vla(subgoal_frame)
 
                 if wm["goal_generation"] != self._dbg_last_generation:
                     self._dbg_last_generation = wm["goal_generation"]
@@ -3401,10 +3473,12 @@ class RTCWebSocketClient:
                 # Build observation payload. Image keys MUST match the server's repack:
                 #   ego image  -> repack.image_keys[0]  == "video.egocentric"
                 #   goal image -> repack.subgoal_key[0] == "subgoal.egocentric"
-                img_obs = {
-                    "video.egocentric": frame,
-                    "subgoal.egocentric": subgoal_frame,
-                }
+                img_obs = {"video.egocentric": frame}
+                if subgoal_frame is not None:
+                    img_obs["subgoal.egocentric"] = subgoal_frame
+                # else: no-goal mode ships no goal key at all. The server's
+                # _goal_slot() then puts a copy of the observation in the slot and
+                # flags goal_dropped, reproducing training's placeholder path.
                 state_obs = {"states": states}
                 init_prev_in_payload = False
 
@@ -3581,7 +3655,11 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
                f"publisher bound on {neck_pub_host}:{neck_pub_port}")
         )
 
-    if goal_source == "episode":
+    if goal_source == "none":
+        wm_provider = NoGoalProvider(task=task_instruction)
+        print("[MAIN] no-goal provider: task instruction only, "
+              "no goal image / no subtask; WM disabled")
+    elif goal_source == "episode":
         wm_provider = EpisodeSubgoalProvider(
             episode_dir=episode_dir,
             subtasks=subtasks,
@@ -3765,7 +3843,10 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
     )
 
     def stdin_listener():
-        if goal_source == "episode":
+        if goal_source == "none":
+            print("[MAIN] no-goal mode: single stage | :restart: new epoch | "
+                  ":mark LABEL: flight-recorder dump")
+        elif goal_source == "episode":
             print(
                 "[MAIN] Enter: next GT goal | :restart: stage 0 | "
                 ":mark LABEL: flight-recorder dump"
@@ -3926,9 +4007,12 @@ if __name__ == "__main__":
                              "cross-method comparison; purely a label, does not affect "
                              "serving or control.")
     parser.add_argument(
-        "--goal-source", choices=("wm", "episode"), default="wm",
-        help="Goal image source: remote WM (default), or fixed "
-             "episode-dir/color_subgoal GT images with no WM requests",
+        "--goal-source", choices=("wm", "episode", "none"), default="wm",
+        help="Goal image source: remote WM (default); fixed "
+             "episode-dir/color_subgoal GT images with no WM requests; or "
+             "'none' = task instruction only, no goal image and no subtask "
+             "clause (the server fills the goal slot with a zeroed copy of the "
+             "observation, matching the dropped-goal share of training)",
     )
     parser.add_argument("--wm-host", type=str, default="192.168.123.240",
                         help="WM server address on the direct G1-wired subnet")

@@ -207,3 +207,8 @@ eval-*
 .data
 .rollout
 .logs
+
+# Large local artifacts accidentally committed once; keep out of git
+zed_recordings.zip
+GMR/
+gear_sonic_deploy/policy/sonic_v1_1/last.pt

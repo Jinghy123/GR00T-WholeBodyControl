@@ -20,7 +20,7 @@ Usage:
 # DEFAULT_EPISODE_DIR    = "/home/xiawei/hongyi/Unitree_Robotics/Humanoid-Teleop/teleop/data/g1_1001/Basic/Pick_bottle_and_turn_and_pour_into_cup/episode_16"
 # DEFAULT_EPISODE_DIR    = "/home/xiawei/hongyi/Unitree_Robotics/Humanoid-Teleop/teleop/data/g1_1001/Basic/Spray_the_bowl_and_wipe_it_and_stack_it_up/episode_1"
 # DEFAULT_EPISODE_DIR    = "/home/xiawei/data/unfold_a_tablet_cover_h1/episode_0"
-DEFAULT_EPISODE_DIR    = "/data/Unifolm/token_check/G1_WBT_Inspire_Put_Clothes_into_Washing_Machine__episode_000_tokv1"
+DEFAULT_EPISODE_DIR    = "/mnt/data/weiduo/heng/GR00T-WholeBodyControl/data/pnp_multi_object/episode_15"
 DEFAULT_ZMQ_HOST        = "*"
 DEFAULT_ZMQ_PUB_PORT    = 5556
 DEFAULT_ZMQ_TOPIC      = "pose"
@@ -225,7 +225,7 @@ def load_episode(episode_dir):
 
     print(f"[ReplayToken] Loaded {len(frames)} frames at {frequency} Hz from {json_path}")
     return frames, frequency
-
+<>?
 
 # ── Replay logic ──────────────────────────────────────────────────────────────
 
@@ -326,6 +326,7 @@ def replay(episode_dir, zmq_host, zmq_pub_port, zmq_topic,
                 if neck_publisher is not None:
                     neck_publisher.publish_last()
                 sleep_t = dt - (time.perf_counter() - t0)
+
                 if sleep_t > 0:
                     time.sleep(sleep_t)
         except KeyboardInterrupt:

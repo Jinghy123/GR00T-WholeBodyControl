@@ -1196,6 +1196,87 @@ def _start_neck_reset_listener(streamer, log_prefix="PoseServer"):
     return t
 
 
+class WBCStreamingWatcher(threading.Thread):
+    """Tracks the WBC's `zmq_streaming_active` flag off the g1_debug stream.
+
+    SUB to g1_deploy_onnx_ref's state publisher (default port 5557) and
+    remember the latest `zmq_streaming_active` value. The neck publisher holds
+    (0, 0) until this reports True, so the head only starts tracking once the
+    operator pressed Enter on the WBC AND the streamed pose is actually being
+    consumed — the same edge that starts the EntrySmooth token blend, keeping
+    episode initial frames consistent.
+
+    Fail-safe: a stale or absent g1_debug stream reads as "hold". A WBC binary
+    that predates the flag (key missing from the payload) falls back to the
+    legacy always-follow behavior after a one-time warning, so an old robot
+    build never silently freezes the neck.
+    """
+
+    STALE_S = 1.0
+
+    def __init__(self, host, port=5557, topic="g1_debug", log_prefix="NeckGate"):
+        super().__init__(daemon=True, name="wbc-streaming-watcher")
+        self.log_prefix = log_prefix
+        self._topic = topic.encode("utf-8")
+        self._addr = f"tcp://{host}:{port}"
+        self._lock = threading.Lock()
+        self._streaming = False
+        self._flag_missing = False
+        self._last_seen = 0.0
+        self._warned_missing = False
+        # Last value follow_allowed() reported, for transition logging only.
+        # Read/written from the single publisher thread, no lock needed.
+        self._last_report = None
+
+    def run(self):
+        ctx = zmq.Context()
+        sock = ctx.socket(zmq.SUB)
+        sock.setsockopt(zmq.SUBSCRIBE, self._topic)
+        sock.setsockopt(zmq.CONFLATE, 1)
+        sock.setsockopt(zmq.RCVTIMEO, 500)
+        sock.setsockopt(zmq.LINGER, 0)
+        sock.connect(self._addr)
+        print(f"[{self.log_prefix}] Neck gate SUB connected to {self._addr} "
+              "(neck holds (0, 0) until the WBC reports ZMQ streaming active)")
+        while True:
+            try:
+                msg = sock.recv()
+            except zmq.Again:
+                continue
+            except zmq.ZMQError:
+                break
+            try:
+                payload = msgpack.unpackb(bytes(msg[len(self._topic):]), raw=False)
+            except Exception:
+                continue
+            with self._lock:
+                self._last_seen = time.time()
+                if "zmq_streaming_active" in payload:
+                    self._streaming = bool(payload["zmq_streaming_active"])
+                    self._flag_missing = False
+                else:
+                    self._flag_missing = True
+            if self._flag_missing and not self._warned_missing:
+                self._warned_missing = True
+                print(f"[{self.log_prefix}] g1_debug has no zmq_streaming_active field "
+                      "(old deploy binary?) — neck follows head tracking unconditionally.")
+
+    def follow_allowed(self):
+        """True when the neck may track the head. Called from the publish path."""
+        now = time.time()
+        with self._lock:
+            fresh = (now - self._last_seen) <= self.STALE_S
+            allowed = fresh and (self._flag_missing or self._streaming)
+        if allowed != self._last_report:
+            if allowed:
+                print(f"[{self.log_prefix}] WBC streaming ON — neck follows head tracking.")
+            else:
+                reason = "stale/absent g1_debug" if not fresh else "WBC streaming OFF"
+                print(f"[{self.log_prefix}] {reason} — neck holding (0, 0).")
+            self._last_report = allowed
+        return allowed
+
+
 def _pose_stream_common(
     socket,
     buffer_size: int,
@@ -1216,6 +1297,9 @@ def _pose_stream_common(
     neck_pub_port: int = 5570,
     neck_retarget_scale: float = 1.5,
     use_pico_hand: bool = False,
+    neck_gate: bool = True,
+    zmq_feedback_host: str = "localhost",
+    zmq_feedback_port: int = 5557,
 ):
     """Shared pose streaming loop used by run_pico."""
     if xrt is None:
@@ -1267,6 +1351,13 @@ def _pose_stream_common(
     elif enable_neck_pub and _human_head_to_robot_neck is None:
         print(f"[{log_prefix}] Neck publishing requested but general_motion_retargeting not importable; skipping.")
 
+    wbc_watcher = None
+    if neck_pub is not None and neck_gate:
+        wbc_watcher = WBCStreamingWatcher(
+            zmq_feedback_host, zmq_feedback_port, log_prefix=log_prefix
+        )
+        wbc_watcher.start()
+
     streamer = PoseStreamer(
         socket=socket,
         reader=reader,
@@ -1285,6 +1376,7 @@ def _pose_stream_common(
         use_pico_hand=use_pico_hand,
         left_hand_solver=left_hand_solver,
         right_hand_solver=right_hand_solver,
+        wbc_watcher=wbc_watcher,
     )
 
     if neck_pub is not None:
@@ -1629,6 +1721,7 @@ class PoseStreamer:
         use_pico_hand: bool = False,
         left_hand_solver=None,
         right_hand_solver=None,
+        wbc_watcher=None,
     ):
         self.socket = socket
         self.reader = reader
@@ -1651,6 +1744,7 @@ class PoseStreamer:
         self.neck_retarget_scale = float(neck_retarget_scale)
         self._last_neck_publish_time = 0.0
         self.neck_reset_active = False      # r+Enter toggle: hold neck at (0, 0)
+        self.wbc_watcher = wbc_watcher      # WBCStreamingWatcher gating the neck (or None)
 
         self.device = (
             torch.device("cuda") if use_cuda and torch.cuda.is_available() else torch.device("cpu")
@@ -1726,6 +1820,16 @@ class PoseStreamer:
         self.buffer_cleared = True
         self.step = 0
 
+    def neck_hold_active(self):
+        """True while the neck must hold (0, 0) instead of tracking the head:
+        manual reset (r+Enter), or the WBC neck gate reporting ZMQ streaming
+        off / stale (fail-safe)."""
+        if self.neck_reset_active:
+            return True
+        if self.wbc_watcher is not None:
+            return not self.wbc_watcher.follow_allowed()
+        return False
+
     def publish_neck_once(self, body_poses_np, current_time=None):
         """Rate-limited (50 Hz) publish of `[yaw, pitch]` JSON on self.neck_pub.
 
@@ -1739,10 +1843,10 @@ class PoseStreamer:
             current_time = time.time()
         if current_time - self._last_neck_publish_time < (1.0 / 50.0):
             return
-        if self.neck_reset_active:
-            # Reset mode (r+Enter): hold the neck at its initial position.
-            # Skips head retargeting entirely so it keeps publishing even
-            # when body tracking data is unavailable.
+        if self.neck_hold_active():
+            # Hold mode (r+Enter reset, or WBC streaming off/stale): keep the
+            # neck at its initial position. Skips head retargeting entirely so
+            # it keeps publishing even when body tracking data is unavailable.
             try:
                 self.neck_pub.send(json.dumps([0.0, 0.0]).encode("utf-8"))
             except Exception:
@@ -1795,8 +1899,8 @@ class PoseStreamer:
                         self._wuji_success_printed = True
 
         if sample is None:
-            # Keep the neck reset stream alive even without body tracking data.
-            if self.neck_reset_active:
+            # Keep the neck hold stream alive even without body tracking data.
+            if self.neck_hold_active():
                 self.publish_neck_once(None, current_time=current_time)
             time.sleep(0.005)
             return
@@ -2054,6 +2158,9 @@ def run_pico(
     neck_pub_port: int = 5570,
     neck_retarget_scale: float = 1.5,
     use_pico_hand: bool = False,
+    neck_gate: bool = True,
+    zmq_feedback_host: str = "localhost",
+    zmq_feedback_port: int = 5557,
 ):
     """Run Pico body tracking with real-time visualization and ZMQ streaming."""
     if xrt is None:
@@ -2108,6 +2215,9 @@ def run_pico(
             neck_pub_port=neck_pub_port,
             neck_retarget_scale=neck_retarget_scale,
             use_pico_hand=use_pico_hand,
+            neck_gate=neck_gate,
+            zmq_feedback_host=zmq_feedback_host,
+            zmq_feedback_port=zmq_feedback_port,
         )
     finally:
         socket.close()
@@ -2397,6 +2507,7 @@ def run_pico_manager(
     neck_pub_port: int = 5570,
     neck_retarget_scale: float = 1.5,
     use_pico_hand: bool = False,
+    neck_gate: bool = True,
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
@@ -2489,6 +2600,13 @@ def run_pico_manager(
     elif enable_neck_pub and _human_head_to_robot_neck is None:
         print("[Manager] Neck publishing requested but general_motion_retargeting not importable; skipping.")
 
+    wbc_watcher = None
+    if neck_pub is not None and neck_gate:
+        wbc_watcher = WBCStreamingWatcher(
+            zmq_feedback_host, zmq_feedback_port, log_prefix="Manager"
+        )
+        wbc_watcher.start()
+
     pose_streamer = PoseStreamer(
         socket=socket,
         reader=reader,
@@ -2507,6 +2625,7 @@ def run_pico_manager(
         use_pico_hand=use_pico_hand,
         left_hand_solver=left_hand_solver,
         right_hand_solver=right_hand_solver,
+        wbc_watcher=wbc_watcher,
     )
     planner_streamer = PlannerStreamer(
         socket=socket,
@@ -2694,7 +2813,7 @@ def run_pico_manager(
             # tracking the operator while the user is in PLANNER, etc.
             if pose_streamer.neck_pub is not None:
                 latest_sample = pose_streamer.reader.get_latest()
-                if latest_sample is not None or pose_streamer.neck_reset_active:
+                if latest_sample is not None or pose_streamer.neck_hold_active():
                     pose_streamer.publish_neck_once(
                         latest_sample["body_poses_np"] if latest_sample is not None else None,
                         current_time=current_time,
@@ -2897,6 +3016,21 @@ if __name__ == "__main__":
         "--neck_retarget_scale", type=float, default=1.5,
         help="Multiplier on (yaw, pitch) before publishing (default: 1.5, matches pose_publisher.py)",
     )
+    # Neck gate — hold the neck at (0, 0) until the WBC reports ZMQ streaming
+    # active (the Enter toggle in g1_deploy_onnx_ref), read off the g1_debug
+    # stream at --zmq_feedback_host:--zmq_feedback_port. Keeps episode initial
+    # frames consistent: the head only starts tracking on the same edge that
+    # starts the WBC's EntrySmooth token blend. r+Enter still works as a
+    # manual hold on top.
+    parser.set_defaults(neck_gate=True)
+    parser.add_argument(
+        "--neck_gate", dest="neck_gate", action="store_true",
+        help="Hold the neck at (0, 0) until the WBC reports ZMQ streaming active (default on)",
+    )
+    parser.add_argument(
+        "--no_neck_gate", dest="neck_gate", action="store_false",
+        help="Neck follows head tracking regardless of WBC streaming state (legacy behavior)",
+    )
     args = parser.parse_args()
 
     # Pico-trigger hand gesture (pinch vs grasp) + half-open thumb. No-op unless
@@ -2952,6 +3086,7 @@ if __name__ == "__main__":
             neck_pub_port=args.neck_pub_port,
             neck_retarget_scale=args.neck_retarget_scale,
             use_pico_hand=args.use_pico_hand,
+            neck_gate=args.neck_gate,
         )
     else:
         # Run legacy single-thread pose streaming
@@ -2974,4 +3109,7 @@ if __name__ == "__main__":
             neck_pub_port=args.neck_pub_port,
             neck_retarget_scale=args.neck_retarget_scale,
             use_pico_hand=args.use_pico_hand,
+            neck_gate=args.neck_gate,
+            zmq_feedback_host=args.zmq_feedback_host,
+            zmq_feedback_port=args.zmq_feedback_port,
         )

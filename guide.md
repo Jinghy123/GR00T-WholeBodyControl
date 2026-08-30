@@ -25,10 +25,11 @@ cd ~/GR00T-WholeBodyControl     # 机器人上按实际路径调整
 python realsense_server.py \
     --zed-only \
     --zmq-bind tcp://0.0.0.0:5558 \
-    --enable-pico --pico-ip 192.168.0.242 \
+    --enable-pico --pico-ip 192.168.0.44 \
     --enable-neck-motor \
     --pose-zmq tcp://192.168.123.222:5570
 ```
+
 
 ### 1.2 桌面端
 

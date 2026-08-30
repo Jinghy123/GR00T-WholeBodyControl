@@ -510,7 +510,7 @@ case "$HLP_MODE" in
     *) echo "[launcher] ERROR: invalid HLP_MODE=$HLP_MODE" >&2; exit 2 ;;
 esac
 case "$GOAL_SOURCE" in
-    wm|episode) ;;
+    wm|episode|none) ;;
     *) echo "[launcher] ERROR: invalid GOAL_SOURCE=$GOAL_SOURCE" >&2; exit 2 ;;
 esac
 if ((${#WM_CLIENT_ARGS[@]})) && [[ "$HLP_MODE" != "off" ]]; then
@@ -519,8 +519,8 @@ if ((${#WM_CLIENT_ARGS[@]})) && [[ "$HLP_MODE" != "off" ]]; then
     exit 2
 fi
 
-if [[ "$GOAL_SOURCE" == "episode" && "$HLP_MODE" != "off" ]]; then
-    echo "[launcher] ERROR: episode GT goals require HLP_MODE=off" >&2
+if [[ ( "$GOAL_SOURCE" == "episode" || "$GOAL_SOURCE" == "none" ) && "$HLP_MODE" != "off" ]]; then
+    echo "[launcher] ERROR: $GOAL_SOURCE goals require HLP_MODE=off" >&2
     exit 2
 fi
 [[ -n "$EMBODIMENT_TAG" ]] || {
@@ -672,12 +672,13 @@ VLA_HEALTH_URL="http://${VLA_HOST}:${VLA_PORT}/health"
 HLP_HEALTH_URL="http://${HLP_HOST}:${HLP_PORT}/health"
 WM_READY_URL="http://${WM_HOST}:${WM_PORT}/ready"
 
-if [[ "$GOAL_SOURCE" == "episode" ]]; then
-    # Goals come off local disk, so the WM machine is not part of this run at all:
+if [[ "$GOAL_SOURCE" == "episode" || "$GOAL_SOURCE" == "none" ]]; then
+    # No goal comes from the WM machine (episode = local disk, none = no goal at
+    # all), so its route leg is skipped too, not just the /ready probe.
     # skip its route leg too, not just the /ready probe. The robot leg is still
     # checked -- camera and neck come over the same wire.
     "$ROOT/g1_teleop_network.sh" check --no-wm
-    echo "[launcher] GT goal source: skipping WM route, endpoint contract and health"
+    echo "[launcher] goal-source=$GOAL_SOURCE: skipping WM route, endpoint contract and health"
 elif [[ "$WM_HOST" == "192.168.123.240" ]]; then
     "$ROOT/g1_teleop_network.sh" check
 elif [[ "$MODE" == "dry-run" && "$PSIX_ALLOW_NON_G1_WM" == "1" ]]; then
