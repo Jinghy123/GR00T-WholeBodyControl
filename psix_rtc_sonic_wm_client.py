@@ -2831,10 +2831,12 @@ class RTCWebSocketClient:
         action = self._validated_action(action)[0]
 
         hand_joints = action[:HAND_DIM]
+        # Raw policy token passed straight through: the model trained on FSQ-grid
+        # tokens, so its output is already near-grid, and the sonic decoder takes
+        # continuous floats. No fsq_quantize (and no [-0.625, 0.625] clip) here.
         token_ori = action[HAND_DIM:HAND_DIM + TOKEN_DIM]
-        token_qtz = fsq_quantize(token_ori)
 
-        action_out = np.concatenate([token_qtz, hand_joints])  # [token(64), LH(7), RH(7)]
+        action_out = np.concatenate([token_ori, hand_joints])  # [token(64), LH(7), RH(7)]
         if action_out.shape != (ACTION_DIM_DEFAULT,) or not np.isfinite(action_out).all():
             raise ValueError("reordered publish action is not a finite 78-D vector")
         if self._dry_run:
