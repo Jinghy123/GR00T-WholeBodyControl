@@ -344,7 +344,7 @@ Usage: $(basename "$0") [--dry-run|--real|--check-only] [client options...]
   --list-tasks  Print every task key found in data/*/prompts.json, then exit.
 
 With --hlp-mode off, prompts come from PROMPTS_JSON/TASK_KEY. Enter advances to
-the next episode prompt/goal. Manual text and ':resume' are available only for
+the next task prompt in TASK_PROMPT_CYCLE (:next = next episode prompt/goal). Manual text and ':resume' are available only for
 WM goals; fixed episode GT mode has no matching image for arbitrary text.
 
 Other client arguments are appended to the selected Python client. Service
@@ -827,9 +827,9 @@ if [[ "$HLP_MODE" == "off" ]]; then
     echo "[launcher] episode dir: $EPISODE_DIR"
     echo "[launcher] rollout telemetry: $WM_DUMP_DIR"
     if [[ "$GOAL_SOURCE" == "episode" ]]; then
-        echo "[launcher] controls: Enter=next GT goal | :restart | :mark LABEL"
+        echo "[launcher] controls: Enter=next task prompt (4-entry cycle, sticks on last) | :next=next GT goal | :restart | :mark LABEL"
     else
-        echo "[launcher] controls: Enter=next | text/:ov TEXT=manual | :resume | :restart"
+        echo "[launcher] controls: Enter=next task prompt (4-entry cycle, sticks on last) | :next=next stage | text/:ov TEXT=manual | :resume | :restart"
     fi
 else
     CLIENT_PROGRAM="psix_rtc_sonic_hlpwm_client.py"

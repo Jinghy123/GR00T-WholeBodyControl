@@ -126,6 +126,69 @@ VLA_GOAL_HW = (270, 480)
 # clause. The per-stage subtask still drives stage advance and the WM request --
 # only the VLA-facing instruction changes. Default off: --subtask-prompt opts in.
 USE_SUBTASK_PROMPT = False
+
+# Enter cycles the served task instruction through these prompts, in order. The
+# run starts on --instruction / prompts.json; the first Enter switches to entry
+# 0, each later Enter moves one forward, and once the last entry is active any
+# further Enter is ignored (it stays on the last prompt). Both the VLA "Task:"
+# text and the WM request "task" field switch together under one prompt epoch.
+# The old Enter behaviour (advance the subtask stage) is reachable as ":next".
+TASK_PROMPT_CYCLE = [
+    "Pick the table cloth from the cabinet, put on the black cart, "
+    "push cart near kitchen island.",
+    "Pick up the table cloth, walk to the kitchen island, pick up the cup, "
+    "clean the surface, put down the cup.",
+    "Serve the basket and iced tea at the kitchen island beside the cup.",
+    "Turn right to the bed, place the yellow shirt and blue shirt into the "
+    "laundry basket.",
+]
+
+
+class TaskPromptCycler:
+    """Operator Enter handler: step the task instruction through TASK_PROMPT_CYCLE.
+
+    The switch runs inside ``client.apply_prompt_transition`` so the client
+    ``_task`` and the provider task change atomically with the epoch bump; every
+    in-flight condition from the previous prompt is discarded the same way a
+    manual ``:ov`` takeover discards it.
+    """
+
+    def __init__(self, client, wm_provider, prompts=None):
+        self._client = client
+        self._wm = wm_provider
+        self._prompts = [str(p).strip() for p in (prompts or TASK_PROMPT_CYCLE)]
+        self._index = -1  # -1 = still on the startup instruction
+
+    @property
+    def index(self):
+        return self._index
+
+    def on_enter(self):
+        last = len(self._prompts) - 1
+        if self._index >= last:
+            print(
+                f"[MAIN] already on the last task prompt "
+                f"[{self._index}/{last}] {self._prompts[last]!r}; Enter ignored",
+                flush=True,
+            )
+            return False
+        self._index += 1
+        text = self._prompts[self._index]
+
+        def transition():
+            self._wm.set_task(text)
+            self._client._task = text
+
+        changed = self._client.apply_prompt_transition(
+            f"task[{self._index}]", transition
+        )
+        print(
+            f"[MAIN] task prompt -> [{self._index}/{last}] {text!r}",
+            flush=True,
+        )
+        log_event("task_prompt_cycle", index=self._index, task=text)
+        return changed
+
 # SHOW_GOAL_WINDOW opens a live cv2 window on the goal actually sent to the VLA
 # (post-resize, i.e. exactly the pixels the model sees).
 SHOW_GOAL_WINDOW = False
@@ -1262,6 +1325,18 @@ class WmSubgoalProvider:
         self._wake_evt.set()
         return changed
 
+    def set_task(self, text):
+        """Replace the task instruction sent to the WM; regenerate under a new epoch."""
+        text = str(text).strip()
+        if not text:
+            raise ValueError("task prompt must not be empty")
+        with self._lock:
+            self._task = text
+            self._invalidate_goal_locked()
+        print(f"[wm] task -> {text!r}; gated until its WM goal lands", flush=True)
+        self._wake_evt.set()
+        return True
+
     def restart(self):
         """Return to stage 0 and gate until a new epoch's first goal arrives."""
         with self._lock:
@@ -1856,6 +1931,19 @@ class EpisodeSubgoalProvider:
         )
         return True
 
+    def set_task(self, text):
+        """Replace the task instruction; same goal image, new epoch/generation."""
+        text = str(text).strip()
+        if not text:
+            raise ValueError("task prompt must not be empty")
+        with self._lock:
+            self._task = text
+            self._prompt_epoch += 1
+            self._goal_generation += 1
+            self._goal_updated_at = time.monotonic()
+        print(f"[gt] task -> {text!r} (new prompt epoch)", flush=True)
+        return True
+
     def restart(self):
         with self._lock:
             self._prompt_stage = 0
@@ -2247,6 +2335,18 @@ class NoGoalProvider(EpisodeSubgoalProvider):
         # Single stage by construction; keep the callback signature but do
         # nothing rather than wrapping back to a stage that does not exist.
         print("[no-goal] single-stage mode: Enter does nothing", flush=True)
+
+    def set_task(self, text):
+        text = str(text).strip()
+        if not text:
+            raise ValueError("task prompt must not be empty")
+        with self._lock:
+            self._task = text
+            self._prompt_epoch += 1
+            self._goal_generation += 1
+            self._goal_updated_at = time.monotonic()
+        print(f"[no-goal] task -> {text!r} (new prompt epoch)", flush=True)
+        return True
 
     def restart(self):
         with self._lock:
@@ -3844,18 +3944,25 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
         incident_recorder=incident_recorder,
     )
 
+    task_cycler = TaskPromptCycler(client, wm_provider)
+
     def stdin_listener():
+        print(
+            f"[MAIN] Enter: next task prompt ({len(TASK_PROMPT_CYCLE)} in cycle, "
+            "sticks on the last one) | :next: "
+            + ("next GT goal" if goal_source == "episode" else "next episode prompt")
+        )
         if goal_source == "none":
             print("[MAIN] no-goal mode: single stage | :restart: new epoch | "
                   ":mark LABEL: flight-recorder dump")
         elif goal_source == "episode":
             print(
-                "[MAIN] Enter: next GT goal | :restart: stage 0 | "
+                "[MAIN] :restart: stage 0 | "
                 ":mark LABEL: flight-recorder dump"
             )
         else:
             print(
-                "[MAIN] Enter: next episode prompt | text/:ov TEXT: manual prompt | "
+                "[MAIN] text/:ov TEXT: manual prompt | "
                 ":resume: current episode prompt | :restart: stage 0 | "
                 ":sec X: future horizon seconds (':sec server' = server default) | "
                 ":mark LABEL: flight-recorder dump "
@@ -3870,6 +3977,8 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
                 break
             command = line.strip()
             if command == "":
+                task_cycler.on_enter()
+            elif command == ":next":
                 client.apply_prompt_transition(
                     "next", wm_provider.advance_prompt
                 )

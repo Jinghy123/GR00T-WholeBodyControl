@@ -962,18 +962,25 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
         http_timeout=http_timeout,
     )
 
+    task_cycler = base.TaskPromptCycler(client, wm_provider)
+
     def stdin_listener():
+        print(
+            f"[MAIN] Enter: next task prompt ({len(base.TASK_PROMPT_CYCLE)} in cycle, "
+            "sticks on the last one) | :next: "
+            + ("next GT goal" if goal_source == "episode" else "next episode prompt")
+        )
         if goal_source == "none":
             print("[MAIN] no-goal mode: single stage | :restart: new epoch | "
                   ":mark LABEL: flight-recorder dump")
         elif goal_source == "episode":
             print(
-                "[MAIN] Enter: next GT goal | :restart: stage 0 | "
+                "[MAIN] :restart: stage 0 | "
                 ":mark LABEL: flight-recorder dump"
             )
         else:
             print(
-                "[MAIN] Enter: next episode prompt | text/:ov TEXT: manual prompt | "
+                "[MAIN] text/:ov TEXT: manual prompt | "
                 ":resume: current episode prompt | :restart: stage 0 | "
                 ":sec X: future horizon seconds (':sec server' = server default) | "
                 ":mark LABEL: flight-recorder dump "
@@ -988,6 +995,8 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
                 break
             command = line.strip()
             if command == "":
+                task_cycler.on_enter()
+            elif command == ":next":
                 client.apply_prompt_transition("next", wm_provider.advance_prompt)
             elif command == ":restart":
                 client.apply_prompt_transition("restart", wm_provider.restart)
