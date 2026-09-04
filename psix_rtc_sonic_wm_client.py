@@ -3953,11 +3953,16 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
     print("[MAIN] Shutdown complete.")
 
 
-if __name__ == "__main__":
+DEFAULT_CLIENT_DESCRIPTION = "RTC VLA client with remote-WM or fixed episode GT goals"
+
+
+def build_arg_parser(description=DEFAULT_CLIENT_DESCRIPTION):
+    """The full client CLI. Shared with the HTTP chunk client so both accept
+    exactly the same flags (the launcher forwards them unchanged)."""
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="RTC VLA client with remote-WM or fixed episode GT goals",
+        description=description,
         # No abbreviations. With them on, a launcher flag that leaked through the
         # "--" passthrough binds to a longer option and wins, because EXTRA_ARGS is
         # appended last: --prompt -> --prompts-json (seen in the field: the task
@@ -4147,10 +4152,11 @@ if __name__ == "__main__":
                              "NeckMotor's on-board EMA is still smoothing the last command "
                              "out, so without this the first observations come from a head "
                              "that is still drifting. 0 disables the wait.")
-    args = parser.parse_args()
+    return parser
 
-    apply_runtime_flags(args)
 
+def validate_args(parser, args):
+    """Range/consistency checks; every failure is a parser.error."""
     if args.camera_timeout_ms <= 0:
         parser.error("--camera-timeout-ms must be positive")
     if args.wm_period <= 0 or args.wm_timeout <= 0:
@@ -4178,18 +4184,9 @@ if __name__ == "__main__":
                 f"--goal-source episode requires color_subgoal/: {goal_dir}"
             )
 
-    try:
-        served_tag, state_dim, action_dim, include_neck = resolve_vla_embodiment(
-            args.host, args.port, requested_tag=args.embodiment_tag,
-            include_neck_override=args.include_neck)
-    except RuntimeError as exc:
-        parser.error(str(exc))
-    print(
-        f"[MAIN] VLA embodiment={served_tag} dims={state_dim}/{action_dim}; "
-        f"client_layout={'45/80 neck' if include_neck else '43/78'}",
-        flush=True,
-    )
 
+def resolve_task_prompts(parser, args):
+    """Task instruction + per-stage subtasks from prompts.json[--task-key]."""
     # Resolve task instruction + per-stage subtasks from prompts.json (--task-key).
     task_instruction = args.instruction
     subtasks = []
@@ -4218,6 +4215,29 @@ if __name__ == "__main__":
         parser.error(
             f"task-key {args.task_key!r} has no subtasks; goal orchestration needs at least one"
         )
+    return task_instruction, subtasks
+
+
+if __name__ == "__main__":
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
+    apply_runtime_flags(args)
+    validate_args(parser, args)
+
+    try:
+        served_tag, state_dim, action_dim, include_neck = resolve_vla_embodiment(
+            args.host, args.port, requested_tag=args.embodiment_tag,
+            include_neck_override=args.include_neck)
+    except RuntimeError as exc:
+        parser.error(str(exc))
+    print(
+        f"[MAIN] VLA embodiment={served_tag} dims={state_dim}/{action_dim}; "
+        f"client_layout={'45/80 neck' if include_neck else '43/78'}",
+        flush=True,
+    )
+
+    task_instruction, subtasks = resolve_task_prompts(parser, args)
 
     server_url = f"ws://{args.host}:{args.port}/ws"
     main(

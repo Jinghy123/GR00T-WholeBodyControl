@@ -124,7 +124,7 @@ IMAGE_BUFFER_SIZE = 100
 # TASK_PROMPT = "grasp the backrest of the chair, turn right, and push it under the table"
 # TASK_PROMPT = "pick up the foil bag and turn left and throw it into the trash can"
 # TASK_PROMPT = "pick up the red snack box and turn left and throw it into the trash can"
-# TASK_PROMPT = "pick up the paper ball and turn left and throw it into the trash can"
+TASK_PROMPT = "pick up the paper ball and turn left and throw it into the trash can"
 # TASK_PROMPT = "pick up the snack bag and turn left and throw it into the trash can"
 # TASK_PROMPT = "pick up the paper ball and turn right and throw it into the trash can"
 # TASK_PROMPT = "pick up the snack bag and turn right and throw it into the trash can"
@@ -187,7 +187,13 @@ IMAGE_BUFFER_SIZE = 100
 # TASK_PROMPT="kneel down and scoop up the green pillow near the shoe rack, turn around, and put it at the head of the bed"
 # TASK_PROMPT="kneel down and scoop up the white toy near the shoe rack, turn around, and put it at the head of the bed"
 # TASK_PROMPT="kneel down and scoop up the green pillow near the laundry basket, turn around, and put it at the head of the bed"
-TASK_PROMPT="kneel down and scoop up the white toy near the laundry basket, turn around, and put it at the head of the bed"
+# TASK_PROMPT="kneel down and scoop up the white toy near the laundry basket, turn around, and put it at the head of the bed"
+
+# L2 prompts
+# TASK_PROMPT="grasp the chip box and place it into the grocery bag"
+# TASK_PROMPT="kneel down, gather up the yellow trousers, turn around and put it into the laundry basket"
+# TASK_PROMPT="open the top-left door of the cabinet, pick up the medicine bottle, close the cabinet door, turn left, and place it in the basket"
+# TASK_PROMPT="open the top-left door of the cabinet, pick up the paper box, close the cabinet door, turn left and throw it into the trash can"
 
 
 def fsq_quantize(continuous_value, fsq_min=FSQ_MIN, fsq_max=FSQ_MAX, fsq_step=FSQ_STEP):

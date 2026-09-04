@@ -31,5 +31,5 @@ REC_PID=$!
 # }
 # trap cleanup EXIT
 
-"$PY" g1_sonic_client.py --include-neck --image-fit "$IMAGE_FIT"
+"$PY" g1_sonic_client.py --action-only --include-neck --image-fit "$IMAGE_FIT"
 # --action-only

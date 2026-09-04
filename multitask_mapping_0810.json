@@ -1,0 +1,85 @@
+{
+    "pick_place_1": "pick up the gray hippo toy and place it into the orange bowl",
+    "pick_place_2": "pick up the green grapes and place it into the green bowl",
+    "pick_place_3": "pick up the banana and place it into the wooden box",
+    "pick_place_4": "pick up the eggplant and place it into the transparent box",
+
+    "pick_place_new_1": "pick up the gray hippo toy and place it into the orange bowl",
+    "pick_place_new_2": "pick up the green grapes and place it into the green bowl",
+    "pick_place_new_3": "pick up the banana and place it into the wooden box",
+    "pick_place_new_4": "pick up the eggplant and place it into the transparent box",
+
+    "pick_cloth_1": "gather up the yellow shirt and turn right and put it into the laundry basket",
+    "pick_cloth_2": "gather up the black trousers and turn right and put it into the laundry basket",
+    "pick_cloth_3": "gather up the white shirt and turn right and put it into the laundry basket",
+    "pick_cloth_4": "gather up the gray shirt and turn right and put it into the laundry basket",
+    "pick_cloth_5": "gather up the yellow shirt and gray shirt and turn right and put them into the laundry basket",
+    "pick_cloth_6": "gather up the black trousers and yellow shirt and turn right and put them into the laundry basket",
+
+    "pick_cloth_new_1": "gather up the yellow shirt with right hand and turn right and put it into the laundry basket",
+    "pick_cloth_new_4": "gather up the gray shirt with right hand and turn right and put it into the laundry basket",
+
+    "pick_pillow_1": "kneel down and scoop up the white pillow near the bed and put it at the head of the bed",
+    "pick_pillow_2": "kneel down and scoop up the beige pillow near the bed and put it at the head of the bed",
+    "pick_pillow_3": "kneel down and scoop up the white pillow near the kitchen island and turn left and put it at the head of the bed",
+    "pick_pillow_4": "kneel down and scoop up the beige pillow near the kitchen island and turn left and put it at the head of the bed",
+    "pick_pillow_5": "kneel down and scoop up the white pillow near the shoe rack and turn around and put it at the head of the bed",
+    "pick_pillow_6": "kneel down and scoop up the beige pillow near the shoe rack and turn around and put it at the head of the bed",
+    "pick_pillow_7": "kneel down and scoop up the white pillow near the laundry basket and turn around and put it at the head of the bed",
+    "pick_pillow_8": "kneel down and scoop up the beige pillow near the laundry basket and turn around and put it at the head of the bed",
+
+    "pick_pillow_new_1": "kneel down and scoop up the white pillow near the bed and put it at the head of the bed",
+    "pick_pillow_new_2": "kneel down and scoop up the beige pillow near the bed and put it at the head of the bed",
+    "pick_pillow_new_3": "kneel down and scoop up the white pillow near the kitchen island and turn left and put it at the head of the bed",
+    "pick_pillow_new_4": "kneel down and scoop up the beige pillow near the kitchen island and turn left and put it at the head of the bed",
+    "pick_pillow_new_5": "kneel down and scoop up the white pillow near the shoe rack and turn around and put it at the head of the bed",
+    "pick_pillow_new_6": "kneel down and scoop up the beige pillow near the shoe rack and turn around and put it at the head of the bed",
+    "pick_pillow_new_7": "kneel down and scoop up the white pillow near the laundry basket and turn around and put it at the head of the bed",
+    "pick_pillow_new_8": "kneel down and scoop up the beige pillow near the laundry basket and turn around and put it at the head of the bed",
+
+    "throw_rubbish_new_1": "pick up the foil bag and turn left and throw it into the trash can",
+    "throw_rubbish_new_2": "pick up the paper ball and turn left and throw it into the trash can",
+    "throw_rubbish_new_3": "pick up the red snack box and turn left and throw it into the trash can",
+    "throw_rubbish_new_4": "pick up the snack bag and turn left and throw it into the trash can",
+    "throw_rubbish_new_5": "pick up the foil bag and turn right and throw it into the trash can",
+    "throw_rubbish_new_6": "pick up the paper ball and turn right and throw it into the trash can",
+    "throw_rubbish_new_7": "pick up the red snack box and turn right and throw it into the trash can",
+    "throw_rubbish_new_8": "pick up the snack bag and turn right and throw it into the trash can",
+
+    "throw_flipper_clean_1": "kneel down, hook the beige shoes on the first tier of the shoe rack, turn around, kneel down again, and place them at the foot of the bed",
+    "throw_flipper_clean_2": "kneel down, hook the purple shoes on the first tier of the shoe rack, turn around, kneel down again, and place them at the foot of the bed",
+    "throw_flipper_clean_6": "kneel down, hook the white shoes on the first tier of the shoe rack, turn around, kneel down again, and place them at the foot of the bed",
+    "throw_flipper_clean_7": "kneel down, hook the blue shoes on the first tier of the shoe rack, turn around, kneel down again, and place them at the foot of the bed",
+
+    "throw_flipper_new_1": "kneel down, hook the beige shoes on the first tier of the shoe rack, turn around, kneel down again, and place them at the foot of the bed",
+    "throw_flipper_new_2": "kneel down, hook the purple shoes on the first tier of the shoe rack, turn around, kneel down again, and place them at the foot of the bed",
+    "throw_flipper_new_6": "kneel down, hook the white shoes on the first tier of the shoe rack, turn around, kneel down again, and place them at the foot of the bed",
+    "throw_flipper_new_7": "kneel down, hook the blue shoes on the first tier of the shoe rack, turn around, kneel down again, and place them at the foot of the bed",
+
+    "clean_clean_1": "hold the dustpan and sweep the white paper scraps into it with the brush",
+    "clean_clean_2": "hold the dustpan and sweep the yellow and green bottle caps into it with the brush",
+    "clean_clean_3": "hold the dustpan and sweep the black plastic pieces into it with the brush",
+
+    "clean_new_1": "hold the dustpan and sweep the white paper scraps into it with the brush",
+    "clean_new_2": "hold the dustpan and sweep the yellow and green bottle caps into it with the brush",
+    "clean_new_3": "hold the dustpan and sweep the black plastic pieces into it with the brush",
+
+    "push_chair_1": "grasp the backrest of the chair and push it straight under the table",
+    "push_chair_2": "grasp the backrest of the chair, turn left, and push it under the table",
+    "push_chair_3": "grasp the backrest of the chair, turn right, and push it under the table",
+
+    "storage_clean_1": "grasp the yellow bottle, open the top drawer of the kitchen island, place the bottle inside, and close the drawer",
+    "storage_clean_2": "grasp the transparent bottle, open the top drawer of the kitchen island, place the bottle inside, and close the drawer",
+    "storage_clean_3": "grasp the silver can, open the top drawer of the kitchen island, place the can inside, and close the drawer",
+    "storage_clean_4": "grasp the green drink bottle, open the top drawer of the kitchen island, place the bottle inside, and close the drawer",
+
+    "cabinat_1": "open the top-right door of the cabinet, grab the purple flower, turn left, and place it at the top-right corner of the table",
+    "cabinat_2": "open the top-right door of the cabinet, grab the white flower, turn left, and place it at the top-right corner of the table",
+    "cabinat_3": "open the top-right door of the cabinet, grab the orange flower, turn left, and place it at the top-right corner of the table",
+    "cabinat_4": "open the top-right door of the cabinet, grab the pink flower, turn left, and place it at the top-right corner of the table",
+    "cabinat_5": "open the top-left door of the cabinet, grab the purple flower, close the cabinet door, turn left, and place it at the top-right corner of the table",
+    "cabinat_6": "open the top-left door of the cabinet, grab the white flower, close the cabinet door, turn left, and place it at the top-right corner of the table",
+    "cabinat_7": "open the top-left door of the cabinet, grab the orange flower, close the cabinet door, turn left, and place it at the top-right corner of the table",
+    "cabinat_8": "open the top-left door of the cabinet, grab the pink flower, close the cabinet door, turn left, and place it at the top-right corner of the table"
+
+}

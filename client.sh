@@ -32,7 +32,7 @@ trap cleanup EXIT
 # TASK_PROMPT="pick up the banana and place it into the wooden box"
 # TASK_PROMPT="pick up the eggplant and place it into the transparent box"
 # TASK_PROMPT="hold the dustpan and sweep the white paper scraps into it with the brush"
-# TASK_PROMPT="hold the dustpan and sweep the yellow and green bottle caps into it with the brush"
+# TASK_PROMPT="hold the dustpan and sweep the yellow and green bottle caps into it with the brown brush"
 # TASK_PROMPT="hold the dustpan and sweep the black plastic pieces into it with the brush"
 # TASK_PROMPT="grasp the backrest of the chair and push it straight under the table"
 # TASK_PROMPT="grasp the backrest of the chair, turn left, and push it under the table"
@@ -109,7 +109,10 @@ trap cleanup EXIT
 # TASK_PROMPT="kneel down and scoop up the white toy near the laundry basket, turn around, and put it at the head of the bed"
 
 # L2 prompts
-# TASK_PROMPT="grasp the chip box and place it into the basket"
+# TASK_PROMPT="grasp the chip box and place it into the grocery bag"
+# TASK_PROMPT="kneel down, gather up the yellow trousers, turn around and put it into the laundry basket"
+# TASK_PROMPT="open the top-left door of the cabinet, pick up the medicine bottle, close the cabinet door, turn left, and place it in the basket"
+# TASK_PROMPT="open the top-left door of the cabinet, pick up the paper box, close the cabinet door, turn left and throw it into the trash can"
 # TASK_PROMPT="pick up the banana, open the top drawer of the kitchen island, place the ball inside, and close the drawer"
 # TASK_PROMPT="kneel down, gather up the yellow shirts, turn around and put it into the laundry basket"
 # TASK_PROMPT="gather up the white shirt with right hand and turn right and throw it into the trash can"
@@ -125,7 +128,11 @@ trap cleanup EXIT
 # TASK_PROMPT="hook the white shoes and turn left and throw it into the trash can"
 # TASK_PROMPT="open the top-left door of the cabinet, grab the pink flower, close the cabinet door, turn left, and throw it into the trash can"
 # TASK_PROMPT="kneel down, hook the white shoes on the first tier of the shoe rack, turn around, and put it into the laundry basket"
-TASK_PROMPT="kneel down, hook the white shoes on the first tier of the shoe rack, turn around, and throw it into the trash can"
+# TASK_PROMPT="kneel down, hook the white shoes on the first tier of the shoe rack, turn around, and throw it into the trash can"
+
+
+# TASK_PROMPT="hook the beige slippers from the floor, walk to the wooden shoe rack and place them on it, walk to the bed and gather up the yellow shirt, turn right and put it into the laundry basket, then kneel down and scoop up the beige pillow from the floor and place it at the head of the bed"
+TASK_PROMPT="pick up the green apple and red grapes and place them into the basket, hold the basket by its handle, pick up the snack bag, turn left and walk to the trash can, throw the snack bag into it, then turn left and walk to the cabinet, open the top-right door, place the basket inside, and close the door"
 
 "$PY" g1_sonic_client_rtc.py \
     --policy-host 127.0.0.1 --policy-port 5000 \

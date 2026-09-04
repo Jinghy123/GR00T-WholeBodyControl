@@ -19,6 +19,11 @@ EMBODIMENT_TAG="${EMBODIMENT_TAG:-}"
 HLP_HOST="${HLP_HOST:-127.0.0.1}"
 HLP_PORT="${HLP_PORT:-8015}"
 HLP_MODE="${HLP_MODE:-off}"
+# VLA transport. ws = the /ws RTC stream (psix_rtc_sonic_wm_client.py);
+# http = one POST /act per chunk, 30 Hz playback, hold-in-place between chunks
+# (psix_http_sonic_wm_client.py). http needs the VLA served with rtc_mode=off
+# and is only wired for HLP_MODE=off.
+TRANSPORT="${TRANSPORT:-ws}"
 # Default is the fixed GT goals under DATA_ROOT/<TASK_KEY>/color_subgoal, paired
 # 1:1 with the prompts.json subtasks. The pnp wmgoal checkpoint trains on both
 # goal kinds, and the GT arm is the reproducible one: no WM server in the loop,
@@ -302,6 +307,11 @@ Usage: $(basename "$0") [--dry-run|--real|--check-only] [client options...]
   --dry-run     Full goal/VLA flow, but publish no robot/neck commands (default).
   --real        Enable real robot command publication.
   --check-only  Verify G1 wired routing and required services, then exit.
+  --transport ws|http
+                ws (default): the /ws RTC action stream. http: POST /act once
+                per chunk, play it back at 30 Hz, hold in place (encoder token,
+                last hand/neck) until the next chunk lands. http requires the
+                VLA served with RTC_MODE=off and HLP_MODE=off. Env: TRANSPORT.
   --goal-source wm|episode
                 Fixed GT images from EPISODE_DIR/color_subgoal, no WM server
                 contacted (default), or remote WM goals.
@@ -354,6 +364,7 @@ Useful environment overrides:
   WM_HOST=$WM_HOST
   WM_PORT=$WM_PORT
   HLP_MODE=$HLP_MODE (default: off; active, shadow, or off)
+  TRANSPORT=$TRANSPORT (default: ws; ws or http)
   GOAL_SOURCE=$GOAL_SOURCE (default: episode; episode requires HLP_MODE=off)
   TASK_KEY=$TASK_KEY (default: pick_place_1, from $DATA_ROOT)
   EPISODE_KEY=${EPISODE_KEY:-<first episode>} (see --episode)
@@ -402,6 +413,15 @@ while (($#)); do
             shift
             ;;
         --hlp-mode=*) HLP_MODE="${1#*=}" ;;
+        --transport)
+            if (($# < 2)); then
+                echo "[launcher] ERROR: --transport needs ws or http" >&2
+                exit 2
+            fi
+            TRANSPORT="$2"
+            shift
+            ;;
+        --transport=*) TRANSPORT="${1#*=}" ;;
         --goal-source)
             if (($# < 2)); then
                 echo "[launcher] ERROR: --goal-source needs wm or episode" >&2
@@ -513,6 +533,14 @@ case "$GOAL_SOURCE" in
     wm|episode|none) ;;
     *) echo "[launcher] ERROR: invalid GOAL_SOURCE=$GOAL_SOURCE" >&2; exit 2 ;;
 esac
+case "$TRANSPORT" in
+    ws|http) ;;
+    *) echo "[launcher] ERROR: invalid TRANSPORT=$TRANSPORT (ws or http)" >&2; exit 2 ;;
+esac
+if [[ "$TRANSPORT" == "http" && "$HLP_MODE" != "off" ]]; then
+    echo "[launcher] ERROR: --transport http is only wired for HLP_MODE=off" >&2
+    exit 2
+fi
 if ((${#WM_CLIENT_ARGS[@]})) && [[ "$HLP_MODE" != "off" ]]; then
     echo "[launcher] ERROR: ${WM_CLIENT_ARGS[0]} is only available with --hlp-mode off;" >&2
     echo "[launcher] psix_rtc_sonic_hlpwm_client.py does not define it" >&2
@@ -614,9 +642,15 @@ check_vla_contract() {
     curl --noproxy '*' -fsS --max-time 3 "$url" \
         | python3 -c '
 import json, sys
-expected, mode = sys.argv[1:3]
+expected, mode, transport = sys.argv[1:4]
 info = json.load(sys.stdin)
 served = str(info.get("embodiment_tag", ""))
+rtc_mode = info.get("rtc_mode")
+if transport == "http" and rtc_mode != "off":
+    raise SystemExit(
+        f"[launcher] ERROR: --transport http needs the VLA served with rtc_mode=off, "
+        f"but /info reports rtc_mode={rtc_mode!r}; restart the server with "
+        "RTC_MODE=off bash scripts/deploy/serve_psix_rtc.sh")
 try:
     action_dim = int(info["wire"]["action_dim"])
     state_dim = int(info["wire"]["state_dim"])
@@ -636,8 +670,9 @@ if mode != "off" and (state_dim, action_dim) != (43, 78):
     raise SystemExit(
         "[launcher] ERROR: active/shadow combined client currently supports only 43/78; "
         "use HLP_MODE=off for this embodiment")
-print(f"[launcher] VLA contract: embodiment={served} dims={state_dim}/{action_dim}")
-' "$EMBODIMENT_TAG" "$HLP_MODE"
+print(f"[launcher] VLA contract: embodiment={served} dims={state_dim}/{action_dim} "
+      f"rtc_mode={rtc_mode} transport={transport}")
+' "$EMBODIMENT_TAG" "$HLP_MODE" "$TRANSPORT"
 }
 
 wait_http() {
@@ -717,8 +752,8 @@ if ! flock -n 9; then
     echo "[launcher] ERROR: another robot client owns $CLIENT_LOCK_FILE ($lock_owner)" >&2
     exit 1
 fi
-printf 'pid=%s mode=%s hlp=%s goal_source=%s started=%s\n' \
-    "$$" "$MODE" "$HLP_MODE" "$GOAL_SOURCE" \
+printf 'pid=%s mode=%s hlp=%s transport=%s goal_source=%s started=%s\n' \
+    "$$" "$MODE" "$HLP_MODE" "$TRANSPORT" "$GOAL_SOURCE" \
     "$(date --iso-8601=seconds)" >"$CLIENT_LOCK_FILE"
 
 # A client started outside this launcher will not own the lock. Report the
@@ -749,7 +784,14 @@ mkdir -p "$SUBGOAL_LOG_DIR"
 cd "$ROOT"
 
 if [[ "$HLP_MODE" == "off" ]]; then
-    CLIENT_PROGRAM="psix_rtc_sonic_wm_client.py"
+    if [[ "$TRANSPORT" == "http" ]]; then
+        # Same CLI as the RTC client (it imports that parser), plus --http-timeout.
+        CLIENT_PROGRAM="psix_http_sonic_wm_client.py"
+        echo "[launcher] transport: HTTP /act chunk playback (open loop, hold between chunks)"
+    else
+        CLIENT_PROGRAM="psix_rtc_sonic_wm_client.py"
+        echo "[launcher] transport: WebSocket /ws RTC stream"
+    fi
     CLIENT_ARGS=(
         --host "$VLA_HOST"
         --port "$VLA_PORT"
