@@ -1,17 +1,7 @@
-"""Continuous rollout recording: states, executed actions, and the ego video.
+"""Continuous states, executed actions, and ego video (MJPG/AVI by default).
 
-The existing IncidentRecorder keeps a ~20 s ring and only lands it when
-something trips, so a finished rollout retains just the world-model query images
--- not enough to find a stall afterwards, let alone see what was commanded
-during it. This writes the whole episode instead: state and action rows at
-control rate, and the ego camera as an mp4.
-
-Everything runs behind a bounded queue on one writer thread. The queue DROPS on
-overflow; telemetry is expendable and the 30 Hz control loop is not.
-
-Predicted chunks are NOT here: the wire carries one action row per tick, so the
-planned chunk only exists inside the server. Set PSIX_CHUNK_DUMP_DIR there
-(psi/src/psi/deploy/chunk_recorder.py) to capture it.
+A bounded writer queue keeps disk I/O off the control thread. Overflow is
+counted in metadata. HLP/WM requests are recorded by InferenceRecorder.
 """
 from __future__ import annotations
 
@@ -41,16 +31,15 @@ class RolloutRecorder:
         self.dir = out_dir
         os.makedirs(self.dir, exist_ok=True)
         self._q = queue.Queue(maxsize=_QUEUE)
+        self._enqueue_lock = threading.Lock()
         self._shard = int(shard)
         self._video_fps = float(video_fps)
         self._video_scale = float(video_scale)
         self._last_video_at = -float("inf")
         self.dropped = 0
+        self._failure = None
         self._t0 = time.monotonic()
-        # MJPG/AVI by default: every frame is independently decodable, so a
-        # truncated file loses only its tail. An mp4 without its trailer is not
-        # readable at all -- which is exactly what happened on 2026-08-23, when
-        # all 25 recorded episodes came back as unreadable files.
+        # MJPG frames remain recoverable if recording is interrupted.
         self._video_format = video_format
         self._closed = threading.Event()
         self._thread = threading.Thread(target=self._writer, name="rollout-recorder",
@@ -87,15 +76,19 @@ class RolloutRecorder:
 
     # -- producers (control threads) -----------------------------------------
     def _put(self, item):
-        try:
-            self._q.put_nowait(item)
-        except queue.Full:
-            self.dropped += 1
+        with self._enqueue_lock:
+            if self._closed.is_set():
+                return
+            try:
+                self._q.put_nowait(item)
+            except queue.Full:
+                self.dropped += 1
 
-    def record_action(self, mono, version, cid, chunk_id, chunk_tick,
-                      repeat_last, action):
+    def record_action(self, mono, version, chunk_id, chunk_tick, repeat_last, action):
+        """One published action. `chunk_id`/`chunk_tick` locate it inside the
+        server's chunk and `repeat_last` marks a run-out repeat, so a stalled
+        action stream is identifiable in the recording after the fact."""
         self._put(("action", (mono, int(version),
-                              -1 if cid is None else int(cid),
                               -1 if chunk_id is None else int(chunk_id),
                               -1 if chunk_tick is None else int(chunk_tick),
                               bool(repeat_last),
@@ -113,14 +106,17 @@ class RolloutRecorder:
         self._put(("frame", (mono, np.ascontiguousarray(frame_rgb).copy())))
 
     def close(self, timeout=15.0):
-        if self._closed.is_set():
-            return
-        self._closed.set()
-        try:
-            self._q.put_nowait(self._STOP)
-        except queue.Full:
-            pass
-        self._thread.join(timeout=timeout)
+        with self._enqueue_lock:
+            if not self._closed.is_set():
+                self._closed.set()
+                try:
+                    self._q.put_nowait(self._STOP)
+                except queue.Full:
+                    pass  # The writer also exits after draining a closed queue.
+        if self._thread is not threading.current_thread():
+            self._thread.join(timeout=timeout)
+            if self._thread.is_alive():
+                print("[rollout-recorder] WARNING: writer is still draining", flush=True)
 
     # -- consumer -------------------------------------------------------------
     def _flush_actions(self, buf, n):
@@ -130,11 +126,10 @@ class RolloutRecorder:
             os.path.join(self.dir, f"actions_{n:04d}.npz"),
             mono=np.array([b[0] for b in buf], np.float64),
             version=np.array([b[1] for b in buf], np.int64),
-            cid=np.array([b[2] for b in buf], np.int64),
-            chunk_id=np.array([b[3] for b in buf], np.int64),
-            chunk_tick=np.array([b[4] for b in buf], np.int64),
-            repeat_last=np.array([b[5] for b in buf], bool),
-            action=np.stack([b[6] for b in buf]))
+            chunk_id=np.array([b[2] for b in buf], np.int64),
+            chunk_tick=np.array([b[3] for b in buf], np.int64),
+            repeat_last=np.array([b[4] for b in buf], bool),
+            action=np.stack([b[5] for b in buf]))
 
     def _flush_states(self, buf, n):
         if not buf:
@@ -148,11 +143,13 @@ class RolloutRecorder:
         try:
             with open(os.path.join(self.dir, "rollout_meta.json"), "w") as f:
                 json.dump({"schema_version": "rollout-record/1",
-                           "partial": bool(partial),
+                           "partial": bool(partial or self._failure),
+                           "error": self._failure,
                            "written_at": datetime.now().isoformat(timespec="milliseconds"),
                            "duration_s": time.monotonic()-self._t0,
                            "action_shards": na, "state_shards": ns,
-                           "video": {"fps": self._video_fps, "frames": nframes,
+                           "video": {"file": f"ego.{self._video_format}",
+                                     "fps": self._video_fps, "frames": nframes,
                                      "scale": self._video_scale},
                            "video_mono": tstamps,
                            "dropped": self.dropped}, f)
@@ -172,6 +169,8 @@ class RolloutRecorder:
                 try:
                     item = self._q.get(timeout=1.0)
                 except queue.Empty:
+                    if self._closed.is_set():
+                        break
                     item = None
                 now = time.monotonic()
                 if now - last_flush >= _FLUSH_EVERY_S:
@@ -206,12 +205,16 @@ class RolloutRecorder:
                         vw = cv2.VideoWriter(vpath, cv2.VideoWriter_fourcc(*fourcc),
                                              self._video_fps, (w, h))
                         if not vw.isOpened():
+                            self._failure = "VideoWriter failed to open"
                             print("[rollout-recorder] WARNING: VideoWriter failed to open",
                                   flush=True)
                             vw = False
                     if vw:
                         vw.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
                         tstamps.append(mono); nframes += 1
+        except Exception as exc:
+            self._failure = f"{type(exc).__name__}: {exc}"
+            print(f"[rollout-recorder] WARNING: {self._failure}", flush=True)
         finally:
             if acts:
                 self._flush_actions(acts, na); na += 1
