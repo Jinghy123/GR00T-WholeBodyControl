@@ -29,20 +29,21 @@ set -u
 REPO="$(cd "$(dirname "$(dirname "$(readlink -f "$0")")")" && pwd)"
 SR="$REPO/sim_replay"
 EPISODE="${1:-$REPO/recordings/run1.pkl}"
+SIM_INIT_TIMEOUT="${SIM_INIT_TIMEOUT:-90}"
+WBC_INIT_TIMEOUT="${WBC_INIT_TIMEOUT:-240}"
 LOG_DIR="${LOG_DIR:-$REPO/.data/g1_sim_replay}"
 DROP_FLAG="${DROP_FLAG:-$REPO/.data/g1_sim_drop}"
 export DROP_FLAG
 mkdir -p "$LOG_DIR"
 
-# The startup stages take ~60 s and print nothing of their own (deploy/sim output
-# goes to $LOG_DIR), so each one drives a progress bar. `_wait_bar <label> <secs>
-# <test-cmd>` polls test-cmd once a second and returns as soon as it succeeds,
-# giving up after <secs>; <secs> also sets the bar's full width, so a stage that
-# finishes early just stops short. On a non-tty it degrades to a line every 10 s.
+
 _wait_bar() {
-  local label="$1" tot="$2" test_cmd="$3" w=30 i=0 filled empty
+  local label="$1" tot="$2" test_cmd="$3" abort_cmd="${4:-false}" w=30 i=0 filled empty
   while [ "$i" -lt "$tot" ]; do
     eval "$test_cmd" && break
+    # a stage whose process is already gone will never pass its test; stop now so
+    # the failure is reported in seconds rather than at the end of the timeout.
+    eval "$abort_cmd" && break
     sleep 1
     i=$((i + 1))
     if [ -t 2 ]; then
@@ -55,9 +56,12 @@ _wait_bar() {
       echo "[$label] ${i}s/${tot}s" >&2
     fi
   done
-  eval "$test_cmd" && local ok=0 || local ok=1
-  [ -t 2 ] && printf '\r[%s] %s after %ds%*s\n' \
-      "$label" "$([ $ok -eq 0 ] && echo done || echo TIMED OUT)" "$i" 20 '' >&2
+  local ok why
+  if eval "$test_cmd"; then ok=0; why=done
+  elif eval "$abort_cmd"; then ok=1; why="FAILED (process gone)"
+  else ok=1; why="TIMED OUT"
+  fi
+  [ -t 2 ] && printf '\r[%s] %s after %ds%*s\n' "$label" "$why" "$i" 20 '' >&2
   return $ok
 }
 
@@ -100,7 +104,26 @@ _stop_recording() {
   [ -s "$VIDEO" ] && echo "[record] saved $VIDEO ($(du -h "$VIDEO" | cut -f1))"
   return 0
 }
-trap _stop_recording EXIT INT TERM
+# Anything this script started is torn down when it leaves early. Only what *this*
+# run launched is killed: a sim that was already up when we arrived is left alone,
+# same as step 5 reuses rather than restarts it.
+STARTED_SIM=0
+STARTED_WBC=0
+_kill_started() {
+  [ "$STARTED_WBC" = "1" ] && pkill -f 'target/release/g1_deploy_onnx[_]ref' 2>/dev/null
+  [ "$STARTED_SIM" = "1" ] && pkill -f 'run_sim_loop_dropctl[.]py' 2>/dev/null
+  return 0
+}
+
+_on_exit() {
+  local rc=$?
+  _stop_recording
+  [ "$rc" -ne 0 ] && _kill_started
+  return 0
+}
+trap _on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # 1) sim (reuse a running one)
 if ! pgrep -f "run_sim_loop_dropctl.py" >/dev/null; then
@@ -113,7 +136,10 @@ if ! pgrep -f "run_sim_loop_dropctl.py" >/dev/null; then
   (cd "$REPO" && exec nohup .venv_sim/bin/python "$SR/run_sim_loop_dropctl.py" \
       > "$LOG_DIR/sim.log" 2>&1 &)
   # the sim is up once its 1 Hz pelvis trace starts; keep a few seconds of margin
-  _wait_bar "sim startup" 30 "grep -q '\[trace\]' '$LOG_DIR/sim.log' 2>/dev/null" || {
+  STARTED_SIM=1
+  _wait_bar "sim startup" "$SIM_INIT_TIMEOUT" \
+      "grep -q '\[trace\]' '$LOG_DIR/sim.log' 2>/dev/null" \
+      "! pgrep -f 'run_sim_loop_dropctl[.]py' >/dev/null" || {
     echo "sim failed to start, see $LOG_DIR/sim.log"; exit 1; }
   sleep 3
 fi
@@ -124,7 +150,11 @@ pkill -f target/release/g1_deploy_onnx_ref 2>/dev/null || true
 rm -f "$DROP_FLAG"; sleep 3
 : > "$LOG_DIR/deploy.log"       # ditto: a stale "Init Done" would end the wait early
 nohup "$SR/run_wbc_deploy.sh" > "$LOG_DIR/deploy.log" 2>&1 </dev/null &
-_wait_bar "WBC init" 80 "grep -q 'Init Done' '$LOG_DIR/deploy.log' 2>/dev/null" || {
+DEPLOY=$!
+STARTED_WBC=1
+_wait_bar "WBC init" "$WBC_INIT_TIMEOUT" \
+    "grep -q 'Init Done' '$LOG_DIR/deploy.log' 2>/dev/null" \
+    "! kill -0 $DEPLOY 2>/dev/null" || {
   echo "deploy failed to init, see $LOG_DIR/deploy.log"; exit 1; }
 
 # 3) start control, lower the robot onto its feet, let it settle. start_control's

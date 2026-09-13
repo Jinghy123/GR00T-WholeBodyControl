@@ -5,7 +5,7 @@
 # `just` and prompts for confirmation. It also assumes the binary's runtime deps
 # are on the default loader path, which on this host they are not - the binary
 # needs GLIBC >= 2.38 (system has 2.35) and libcudart.so.13 (system CUDA is
-# 11.8/12.8). Both exist elsewhere, so it is launched through the nix glibc
+# 11.8/12.8). Both exist elsewhere, so it is launched through a newer glibc
 # loader with an explicit library path. Override the paths below if your machine
 # resolves them normally, in which case you can call the binary directly.
 set -eu
@@ -13,8 +13,15 @@ set -eu
 REPO="$(cd "$(dirname "$(dirname "$(readlink -f "$0")")")" && pwd)"
 DEPLOY_DIR="$REPO/gear_sonic_deploy"
 
-# Newer glibc than the system one, needed by the prebuilt binary.
-GLIBC="${GLIBC_ROOT:-/nix/store/5m9amsvvh2z8sl7jrnc87hzy21glw6k1-glibc-2.40-66}"
+# Newer glibc than the system one, needed by the prebuilt binary. Its lib/ must
+# hold ld-linux-x86-64.so.2 + libc.so.6 (>= 2.38); on this host it also carries
+# libonnxruntime.so.1.16.3, which is not installed under /opt/onnxruntime.
+# Set GLIBC_ROOT to override.
+GLIBC="${GLIBC_ROOT:-$HOME/.local/opt/g1_deploy_runtime/glibc241}"
+[ -x "$GLIBC/lib/ld-linux-x86-64.so.2" ] || {
+  echo "run_wbc_deploy: no glibc >= 2.38 loader found; set GLIBC_ROOT to a tree with lib/ld-linux-x86-64.so.2" >&2
+  echo "  (e.g. unpack Debian libc6 >= 2.38 and onnxruntime 1.16.3 libs into ~/.local/opt/g1_deploy_runtime/glibc241/lib)" >&2
+  exit 1; }
 # libcudart.so.13 ships inside the venvs' nvidia/cu13 wheel.
 CUDA13="${CUDA13_LIB:-$REPO/.venv_sim/lib/python3.10/site-packages/nvidia/cu13/lib}"
 

@@ -71,7 +71,7 @@ from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
 # TASK_INSTRUCTION = "hold the dustpan and sweep the black plastic pieces into it with the brush"
 
 # TASK_INSTRUCTION = "grasp the backrest of the chair and push it straight under the table"
-# TASK_INSTRUCTION = "grasp the backrest of the chair, turn left, and push it under the table"
+TASK_INSTRUCTION = "grasp the backrest of the chair, turn left, and push it under the table"
 # TASK_INSTRUCTION = "grasp the backrest of the chair, turn right, and push it under the table"
 
 # TASK_INSTRUCTION = "pick up the foil bag and turn left and throw it into the trash can"
@@ -83,7 +83,7 @@ from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
 # TASK_INSTRUCTION = "pick up the foil bag and turn right and throw it into the trash can"
 # TASK_INSTRUCTION = "pick up the paper ball and turn right and throw it into the trash can"
 
-# TASK_INSTRUCTION = "kneel down, hook the beige shoes on the first tier of the shoe rack, turn around, kneel down again, and place them at the foot of the bed"
+# TASK_INSTRUCTION = "kneel down, hook the white shoes on the first tier of the shoe rack, turn around, kneel down again, and place them at the foot of the bed"
 # TASK_INSTRUCTION = "kneel down, hook the purple shoes on the first tier of the shoe rack, turn around, kneel down again, and place them at the foot of the bed"
 # TASK_INSTRUCTION = "kneel down, hook the white shoes on the first tier of the shoe rack, turn around, kneel down again, and place them at the foot of the bed"
 # TASK_INSTRUCTION = "kneel down, hook the blue shoes on the first tier of the shoe rack, turn around, kneel down again, and place them at the foot of the bed"
@@ -100,13 +100,13 @@ from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
 # TASK_INSTRUCTION = "gather up the yellow shirt and turn right and put it into the laundry basket"
 
 # TASK_INSTRUCTION = "kneel down and scoop up the white pillow near the bed and put it at the head of the bed"
-# TASK_INSTRUCTION = "kneel down and scoop up the beige pillow near the bed and put it at the head of the bed"
-# TASK_INSTRUCTION = "kneel down and scoop up the beige pillow near the kitchen island and turn left and put it at the head of the bed"
+# TASK_INSTRUCTION = "kneel down and scoop up the white toy near the bed and put it at the head of the bed"
+# TASK_INSTRUCTION = "kneel down and scoop up the white toy near the kitchen island and turn left and put it at the head of the bed"
 # TASK_INSTRUCTION = "kneel down and scoop up the white pillow near the kitchen island and turn left and put it at the head of the bed"
-# TASK_INSTRUCTION = "kneel down and scoop up the white pillow near the shoe rack and turn around and put it at the head of the bed"
+# TASK_INSTRUCTION = "kneel down and scoop up the green pillow near the shoe rack and turn around and put it at the head of the bed"
+# TASK_INSTRUCTION = "kneel down and scoop up the white toy near the shoe rack and turn around and put it at the head of the bed"
 # TASK_INSTRUCTION = "kneel down and scoop up the beige pillow near the shoe rack and turn around and put it at the head of the bed"
-# TASK_INSTRUCTION = "kneel down and scoop up the beige pillow near the shoe rack and turn around and put it at the head of the bed"
-# TASK_INSTRUCTION = "kneel down and scoop up the beige pillow near the laundry basket and turn around and put it at the head of the bed"
+# TASK_INSTRUCTION = "kneel down and scoop up the green pillow near the laundry basket and turn around and put it at the head of the bed"
 # TASK_INSTRUCTION = "kneel down and scoop up the white pillow near the laundry basket and turn around and put it at the head of the bed"
 
 # TASK_INSTRUCTION = "open the top-right door of the cabinet, grab the purple flower, turn left, and place it at the top-right corner of the table"
@@ -120,10 +120,16 @@ from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
 # TASK_INSTRUCTION = "open the top-left door of the cabinet, grab the orange flower, close the cabinet door, turn left, and place it at the top-right corner of the table"
 # TASK_INSTRUCTION = "open the top-left door of the cabinet, grab the orange flower, close the cabinet door, turn left, and place it at the top-right corner of the table"
 
+# TASK_INSTRUCTION = "grasp the green drink bottle, open the top drawer of the kitchen island, place the bottle inside, and close the drawer"
 
 # TASK_INSTRUCTION = "grasp the yellow bottle, open the top drawer of the kitchen island, place the bottle inside, and close the drawer"
 # TASK_INSTRUCTION = "grasp the green drink bottle, open the top drawer of the kitchen island, place the bottle inside, and close the drawer"
-TASK_INSTRUCTION = "grasp the silver can, open the top drawer of the kitchen island, place the bottle inside, and close the drawer"
+# TASK_INSTRUCTION = "grasp the silver can, open the top drawer of the kitchen island, place the bottle inside, and close the drawer"
+
+# TASK_INSTRUCTION = "grasp the chip box and place it into the grocery bag"
+# TASK_INSTRUCTION = "kneel down, gather up the yellow trousers, turn around and put it into the laundry basket"
+# TASK_INSTRUCTION = "open the top-left door of the cabinet, pick up the medicine bottle, close the cabinet door, turn left, and place it in the basket"
+# TASK_INSTRUCTION = "open the top-left door of the cabinet, pick up the paper box, close the cabinet door, turn left and throw it into the trash can"
 
 # cosmos3 embodiment domain -> action head + (de)normalization stats on the server.
 #   g1_sonic_neck_zedmini / g1_sonic_neck_realsense: 80-D, neck active, 45-D state

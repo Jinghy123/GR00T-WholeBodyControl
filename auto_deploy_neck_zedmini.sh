@@ -24,7 +24,7 @@ USERNAME="unitree"
 IP="192.168.123.164"
 PASSWORD="123"
 CAMERA_ID="f682"   # USB id substring that identifies the camera
-ROS_SETUP="/opt/ros/noetic/setup.bash"   # ROS env to source on the board (noetic)
+ROS_SETUP="/opt/ros/noetic/setup.bash"   # ROS env to source on the board, if present
 ZMQ_BIND_PORT="5558"   # port realsense_server binds on (--zmq-bind)
 POSE_ZMQ_PORT="5570"   # host pose stream port (--pose-zmq)
 VIEWER_PORT="5559"     # port the host viewer connects to (--port)
@@ -67,7 +67,8 @@ SERVER_PID="$(sshpass -p "$PASSWORD" ssh -o StrictHostKeyChecking=no \
         "${USERNAME}@${IP}" bash -s <<EOF | tail -1
 echo "$PASSWORD" | sudo -S chmod 777 /dev/ttyUSB0 2>/dev/null
 export LD_PRELOAD=/lib/aarch64-linux-gnu/libffi.so.7
-source "$ROS_SETUP"
+# The ZED path needs no ROS; source it only if this board has one installed.
+[ -f "$ROS_SETUP" ] && source "$ROS_SETUP"
 # Source conda on the board: prefer the configured path, then fall back to
 # common install locations (miniforge3 / miniconda3 / anaconda3).
 for conda_root in "$BOARD_CONDA" ~/miniforge3 ~/miniconda3 ~/anaconda3; do

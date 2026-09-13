@@ -67,8 +67,21 @@ _orig_check_fall = _base_sim.DefaultEnv.check_fall
 _last_trace = [0.0]
 
 
+# TRACE_FILE=<path>: also append "t x y z qw qx qy qz" of the pelvis at TRACE_HZ (default 50) to
+# that file, so a replay's base displacement can be measured off-line (the 1 Hz stdout trace
+# below is too coarse for that). Off unless the variable is set.
+_TRACE_FILE = os.environ.get("TRACE_FILE")
+_TRACE_DT = 1.0 / float(os.environ.get("TRACE_HZ", "50"))
+_last_file_trace = [0.0]
+
+
 def _check_fall(self):
     now = time.time()
+    if _TRACE_FILE and now - _last_file_trace[0] >= _TRACE_DT:
+        _last_file_trace[0] = now
+        q = self.mj_data.qpos
+        with open(_TRACE_FILE, "a") as f:
+            f.write(f"{now:.4f} {q[0]:.4f} {q[1]:.4f} {q[2]:.4f} {q[3]:.4f} {q[4]:.4f} {q[5]:.4f} {q[6]:.4f}\n")
     if now - _last_trace[0] > 1.0:
         _last_trace[0] = now
         q = self.mj_data.qpos

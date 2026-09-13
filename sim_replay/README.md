@@ -65,10 +65,12 @@ them is missing.
 
 ## Host-specific paths
 
-`run_wbc_deploy.sh` launches the prebuilt binary through a nix glibc loader: it
-needs GLIBC >= 2.38 (Ubuntu 22.04 has 2.35) and `libcudart.so.13` (system CUDA
-here is 11.8/12.8). Override `GLIBC_ROOT` / `CUDA13_LIB` / `TensorRT_ROOT`, or
-call the binary directly if your host resolves these normally.
+`run_wbc_deploy.sh` launches the prebuilt binary through a newer glibc loader
+(default `~/.local/opt/g1_deploy_runtime/glibc241`, a Debian libc6 2.41 tree
+that also holds the onnxruntime 1.16.3 libs): it needs GLIBC >= 2.38 (Ubuntu
+22.04 has 2.35) and `libcudart.so.13` (system CUDA here is 11.8/12.8). Override
+`GLIBC_ROOT` / `CUDA13_LIB` / `TensorRT_ROOT`, or call the binary directly if
+your host resolves these normally.
 
 `replay_lerobot.sh` shells out to `PYARROW_PY` for the parquet read because
 neither `.venv_sim` nor `.venv_teleop` has pyarrow.

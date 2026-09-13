@@ -31,6 +31,7 @@ to match the paths you want on the Hub.
 
 import os
 import re
+import sys
 import time
 import threading
 import json
@@ -72,7 +73,7 @@ from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
 # TASK_INSTRUCTION = "pick up the eggplant and place it into the transparent box"
 # TASK_INSTRUCTION = "pick up the gray hippo toy and place it into the orange bowl"
 # TASK_INSTRUCTION = "pick up the banana and place it into the wooden box"
-TASK_INSTRUCTION = "pick up the green grapes and place it into the green bowl"
+# TASK_INSTRUCTION = "pick up the green grapes and place it into the green bowl"
 
 # TASK_INSTRUCTION = "hold the dustpan and sweep the white paper scraps into it with the brush"
 # TASK_INSTRUCTION = "hold the dustpan and sweep the yellow and green bottle caps into it with the brush"
@@ -90,6 +91,8 @@ TASK_INSTRUCTION = "pick up the green grapes and place it into the green bowl"
 # TASK_INSTRUCTION = "pick up the red snack box and turn right and throw it into the trash can"
 # TASK_INSTRUCTION = "pick up the foil bag and turn right and throw it into the trash can"
 # TASK_INSTRUCTION = "pick up the paper ball and turn right and throw it into the trash can"
+
+TASK_INSTRUCTION = "Gather the fruits in the basket, grab the drink, turn right, and place them on the black cart on the right."
 
 # TASK_INSTRUCTION = "kneel down, hook the beige shoes on the first tier of the shoe rack, turn around, kneel down again, and place them at the foot of the bed"
 
@@ -151,7 +154,8 @@ TASK_INSTRUCTION = "pick up the green grapes and place it into the green bowl"
 # TASK_INSTRUCTION = "grasp the green drink bottle, open the top drawer of the kitchen island, place the bottle inside, and close the drawer"
 
 # Must match the served checkpoint's data.transform.repack.image_keys
-IMAGE_KEY = "observation.images.head"
+# IMAGE_KEY = "observation.images.head"
+IMAGE_KEY = "observation.images.egocentric"
 
 # Geometry of the frames the policy was finetuned on
 # (.runs/finetune/ff-dropout0.8.g1soni...2609031223 -> g1_sonic_lerobot_0810_merged_train).
@@ -543,6 +547,50 @@ class NeckPublisher:
 running = threading.Event()
 running.set()
 
+# Per-frame timing/action chatter. Off by default so [prompt] lines stay visible;
+# enable with --verbose.
+VERBOSE = False
+
+# Prompts sent AFTER the initial one (TASK_INSTRUCTION / --instruction / --task-key).
+# Pressing Enter in the terminal advances to the next one, in this order; once the
+# last one is active further Enters do nothing. 1 initial + 4 = 5 prompts total.
+FOLLOWUP_INSTRUCTIONS = [
+    "Pick the table cloth from the cabinet, put on the black cart, push cart near kitchen island.",
+    "Pick up the table cloth, walk to the kitchen island, pick up the cup, clean the surface, put down the cup.",
+    "Serve the basket and iced tea at the kitchen island beside the cup.",
+    "Turn right to the bed, place the yellow shirt and blue shirt into the laundry basket.",
+]
+
+
+class PromptSequence:
+    """Ordered prompts; `current()` is read by the send thread, `advance()` by the
+    stdin thread on Enter. Stays on the last prompt once it is reached."""
+
+    def __init__(self, prompts):
+        self._prompts = list(prompts)
+        self._idx = 0
+        self._lock = threading.Lock()
+
+    def current(self):
+        with self._lock:
+            return self._prompts[self._idx]
+
+    def advance(self):
+        with self._lock:
+            if self._idx + 1 >= len(self._prompts):
+                print(f"[prompt] already on the last prompt "
+                      f"({self._idx + 1}/{len(self._prompts)}): {self._prompts[self._idx]!r}")
+                return False
+            self._idx += 1
+            print(f"[prompt] -> {self._idx + 1}/{len(self._prompts)}: {self._prompts[self._idx]!r}")
+            return True
+
+    def __len__(self):
+        return len(self._prompts)
+
+
+PROMPTS = None  # set in main(): PromptSequence([TASK_INSTRUCTION] + FOLLOWUP_INSTRUCTIONS)
+
 
 # ---------------- RTCWebSocketClient ----------------
 class RTCWebSocketClient:
@@ -624,7 +672,8 @@ class RTCWebSocketClient:
     def _on_message(self, ws, message):
         interval = time.time() - self.start_time
         self.start_time = time.time()
-        print(f"[client] recv_action interval: {interval:.3f}s")
+        if VERBOSE:
+            print(f"[client] recv_action interval: {interval:.3f}s")
 
         try:
             data = json.loads(message)
@@ -635,7 +684,8 @@ class RTCWebSocketClient:
                 action = convert_numpy_in_dict(action_data, numpy_deserialize)
                 if isinstance(action, np.ndarray):
                     self.execute_action(action)
-                    print(f"[client] Received action, version={version}, shape={action.shape}")
+                    if VERBOSE:
+                        print(f"[client] Received action, version={version}, shape={action.shape}")
 
         except Exception as e:
             print(f"[client] Message processing error: {e}")
@@ -660,7 +710,8 @@ class RTCWebSocketClient:
                 # Get robot state (latest only, no history)
                 state = self._state_sub.get_state()
                 if state is None:
-                    print("[client] No robot state yet, waiting...")
+                    if VERBOSE:
+                        print("[client] No robot state yet, waiting...")
                     time.sleep(0.1)
                     continue
 
@@ -687,7 +738,7 @@ class RTCWebSocketClient:
                 # Get camera frame
                 frame = self._camera.get_frame()
                 # frame = pad_to_train_height(frame)    # what the policy was trained on
-                frame = to_train_geometry(frame)        # what the policy was trained on
+                # frame = to_train_geometry(frame)        # what the policy was trained on
 
                 if self._recorder is not None:
                     # Keep the BGR frame (pre-cvtColor: that is what cv2.imwrite wants) and
@@ -738,7 +789,7 @@ class RTCWebSocketClient:
                     "state": state_obs,
                     "gt_action": None,
                     "dataset_name": None,
-                    "instruction": TASK_INSTRUCTION,
+                    "instruction": PROMPTS.current(),
                     "history": None,
                     "condition": None,
                     "timestamp": None,
@@ -761,7 +812,8 @@ class RTCWebSocketClient:
             now = time.perf_counter()
             interval = now - prev_tick
             prev_tick = now
-            print(f"[client] send interval: {interval:.3f}s")
+            if VERBOSE:
+                print(f"[client] send interval: {interval:.3f}s")
 
         print("[client] Send thread stopped")
 
@@ -874,7 +926,26 @@ def main(server_url, zmq_host, zmq_pub_port, zmq_sub_port, zmq_topic, zmq_sub_to
     t_ws = threading.Thread(target=websocket_thread, daemon=True)
     t_ws.start()
 
-    print("[MAIN] Running. Ctrl+C to stop.")
+    global PROMPTS
+    PROMPTS = PromptSequence([TASK_INSTRUCTION] + FOLLOWUP_INSTRUCTIONS)
+    print(f"[prompt] 1/{len(PROMPTS)}: {PROMPTS.current()!r}")
+    print(f"[prompt] press Enter to switch to the next prompt "
+          f"({len(PROMPTS) - 1} more queued)")
+
+    def stdin_thread():
+        # Each Enter (any line) advances the prompt sequence. EOF ends the thread.
+        try:
+            for _ in sys.stdin:
+                if not running.is_set():
+                    break
+                PROMPTS.advance()
+        except Exception as e:
+            print(f"[prompt] stdin reader stopped: {e}")
+
+    t_stdin = threading.Thread(target=stdin_thread, daemon=True)
+    t_stdin.start()
+
+    print("[MAIN] Running. Enter = next prompt, Ctrl+C to stop.")
 
     # 8. Wait for shutdown
     def signal_handler(sig, frame):
@@ -937,6 +1008,8 @@ if __name__ == "__main__":
                         help="ZMQ topic for robot state subscription")
     parser.add_argument("--camera-address", type=str, default="tcp://192.168.123.164:5558",
                         help="Camera ZMQ address")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Print per-frame send/recv timing and action lines (very noisy)")
     parser.add_argument("--instruction", type=str, default=None,
                         help="Task instruction for VLA policy")
     parser.add_argument("--include-neck", action="store_true",
@@ -965,6 +1038,7 @@ if __name__ == "__main__":
                         help=f"Dataset to copy meta/stats*.json from (default: {DEFAULT_SRC_DATASET})")
 
     args = parser.parse_args()
+    VERBOSE = args.verbose
 
     if args.instruction:
         TASK_INSTRUCTION = args.instruction
